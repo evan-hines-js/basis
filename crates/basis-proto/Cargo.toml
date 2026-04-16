@@ -1,0 +1,15 @@
+[package]
+name = "basis-proto"
+version.workspace = true
+edition.workspace = true
+description = "gRPC protocol definitions for Basis agent-controller communication"
+
+[dependencies]
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+serde.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

@@ -1,0 +1,172 @@
+syntax = "proto3";
+package basis.v1;
+
+// CAPI-facing service — called by basis-capi-provider running in Kubernetes.
+service Basis {
+  rpc CreateMachine(CreateMachineRequest) returns (CreateMachineResponse);
+  rpc DeleteMachine(DeleteMachineRequest) returns (DeleteMachineResponse);
+  rpc GetMachine(GetMachineRequest) returns (Machine);
+  rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse);
+}
+
+// Agent-facing service — agents connect outbound and receive commands over
+// a bidirectional stream. This matches Lattice's outbound-only architecture:
+// agents need zero inbound firewall rules.
+service BasisAgent {
+  rpc StreamMessages(stream AgentMessage) returns (stream ControllerCommand);
+}
+
+// --- CAPI-facing messages ---
+
+message CreateMachineRequest {
+  string name = 1;
+  string cluster = 2;
+  uint32 cpu = 3;
+  uint32 memory_mib = 4;
+  uint32 disk_gib = 5;
+  string image = 6;
+  bytes bootstrap_data = 7;
+  uint32 gpus = 8;
+  GPUConstraints gpu_constraints = 9;
+  string ip_pool = 10;
+}
+
+message CreateMachineResponse {
+  string id = 1;
+  string provider_id = 2;
+  string ip_address = 3;
+  string host = 4;
+}
+
+message DeleteMachineRequest {
+  string id = 1;
+}
+
+message DeleteMachineResponse {}
+
+message GetMachineRequest {
+  string id = 1;
+}
+
+message ListMachinesRequest {
+  string cluster = 1;
+}
+
+message ListMachinesResponse {
+  repeated Machine machines = 1;
+}
+
+message Machine {
+  string id = 1;
+  string name = 2;
+  string cluster = 3;
+  string host = 4;
+  string provider_id = 5;
+  string ip_address = 6;
+  MachineState state = 7;
+  uint32 cpu = 8;
+  uint32 memory_mib = 9;
+  uint32 disk_gib = 10;
+  repeated GPUDevice gpus = 11;
+}
+
+enum MachineState {
+  PENDING = 0;
+  CREATING = 1;
+  RUNNING = 2;
+  STOPPING = 3;
+  STOPPED = 4;
+  FAILED = 5;
+}
+
+message GPUConstraints {
+  uint32 min_group_size = 1;
+}
+
+message GPUDevice {
+  string pci_address = 1;
+  string model = 2;
+  string iommu_group = 3;
+  uint32 nvlink_group = 4;
+}
+
+message IOMMUGroup {
+  uint32 id = 1;
+  repeated string pci_addresses = 2;
+}
+
+// --- Agent stream messages ---
+
+message AgentMessage {
+  oneof payload {
+    RegisterHostRequest register = 1;
+    HeartbeatRequest heartbeat = 2;
+    ReportVMStateRequest vm_state = 3;
+  }
+}
+
+message ControllerCommand {
+  string request_id = 1;
+  oneof command {
+    CreateVMCommand create_vm = 2;
+    DeleteVMCommand delete_vm = 3;
+    RegisterHostResponse register_ack = 4;
+  }
+}
+
+// Sent as the first command after the agent's RegisterHostRequest.
+// Tells the agent its controller-assigned host_id so heartbeats
+// and reconnections use the right identity.
+message RegisterHostResponse {
+  string host_id = 1;
+}
+
+// --- Agent registration ---
+
+message RegisterHostRequest {
+  string hostname = 1;
+  uint32 total_cpu = 2;
+  uint64 total_memory_mib = 3;
+  uint64 total_disk_gib = 4;
+  repeated GPUDevice gpus = 5;
+  repeated IOMMUGroup iommu_groups = 6;
+}
+
+message HeartbeatRequest {
+  string host_id = 1;
+  uint32 available_cpu = 2;
+  uint64 available_memory_mib = 3;
+  uint64 available_disk_gib = 4;
+  repeated string assigned_gpus = 5;
+}
+
+message ReportVMStateRequest {
+  string vm_id = 1;
+  MachineState state = 2;
+  string error_message = 3;
+}
+
+// --- Controller -> Agent commands ---
+
+message CreateVMCommand {
+  string vm_id = 1;
+  string name = 2;
+  uint32 cpu = 3;
+  uint32 memory_mib = 4;
+  uint32 disk_gib = 5;
+  string image = 6;
+  bytes bootstrap_data = 7;
+  string ip_address = 8;
+  string gateway = 9;
+  uint32 prefix_len = 10;
+  uint32 gpus = 11;
+  GPUConstraints gpu_constraints = 12;
+  repeated string dns_servers = 13;
+  // PCI addresses of GPUs selected by the scheduler. The agent binds
+  // these to vfio-pci and passes them to cloud-hypervisor.
+  repeated string gpu_pci_addresses = 14;
+}
+
+message DeleteVMCommand {
+  string vm_id = 1;
+}
