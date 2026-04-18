@@ -1,0 +1,21 @@
+[Unit]
+Description=Basis hypervisor agent
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+# VMs are spawned as independent systemd scopes; they survive agent
+# restarts, which is the whole point of the design.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/basis-agent --config /etc/basis/host.yaml
+# SIGHUP triggers a config reload. `systemctl reload basis-agent` after
+# editing /etc/basis/host.yaml.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+# Needs root for KVM, VFIO binding, bridge/tap management, and
+# systemd-run (to spawn cloud-hypervisor scopes).
+User=root
+
+[Install]
+WantedBy=multi-user.target

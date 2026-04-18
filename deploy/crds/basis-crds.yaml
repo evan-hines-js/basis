@@ -1,0 +1,317 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: basisclusters.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  names:
+    categories: []
+    kind: BasisCluster
+    plural: basisclusters
+    shortNames:
+    - bc
+    singular: basiscluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BasisClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Identifies a cluster that maps 1:1 to a Basis-side cluster. The
+              `ipPool` is the only real user input — everything else is written
+              by the reconciler once `CreateCluster` has run.
+            properties:
+              controlPlaneEndpoint:
+                description: |-
+                  Set by the BasisCluster reconciler after calling `Basis.CreateCluster`.
+                  CAPI requires this to be populated on `spec` so KubeadmControlPlane
+                  can use it as the cluster's apiserver endpoint.
+                nullable: true
+                properties:
+                  host:
+                    type: string
+                  port:
+                    format: uint16
+                    maximum: 65535.0
+                    minimum: 0.0
+                    type: integer
+                required:
+                - host
+                - port
+                type: object
+              ipPool:
+                description: Name of the Basis IP pool this cluster draws its VIP and VM IPs from.
+                type: string
+            required:
+            - ipPool
+            type: object
+          status:
+            nullable: true
+            properties:
+              basisClusterId:
+                description: |-
+                  Opaque cluster ID returned by `Basis.CreateCluster`. Written once
+                  and used on delete.
+                nullable: true
+                type: string
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - status
+                  - type
+                  type: object
+                type: array
+              initialization:
+                nullable: true
+                properties:
+                  provisioned:
+                    type: boolean
+                required:
+                - provisioned
+                type: object
+              ready:
+                default: false
+                type: boolean
+            type: object
+        required:
+        - spec
+        title: BasisCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: basismachinetemplates.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  names:
+    categories: []
+    kind: BasisMachineTemplate
+    plural: basismachinetemplates
+    shortNames:
+    - bmt
+    singular: basismachinetemplate
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BasisMachineTemplateSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              A template from which CAPI's MachineDeployment stamps out identical
+              BasisMachines.
+            properties:
+              template:
+                properties:
+                  spec:
+                    description: A single VM the Basis provider should create on behalf of CAPI.
+                    properties:
+                      cpu:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      diskGib:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      gpuConstraints:
+                        nullable: true
+                        properties:
+                          minGroupSize:
+                            default: 0
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                        type: object
+                      gpus:
+                        default: 0
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      image:
+                        type: string
+                      memoryMib:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      providerId:
+                        description: Set by the provider after CreateMachine succeeds.
+                        nullable: true
+                        type: string
+                    required:
+                    - cpu
+                    - diskGib
+                    - image
+                    - memoryMib
+                    type: object
+                required:
+                - spec
+                type: object
+            required:
+            - template
+            type: object
+        required:
+        - spec
+        title: BasisMachineTemplate
+        type: object
+    served: true
+    storage: true
+    subresources: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: basismachines.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  names:
+    categories: []
+    kind: BasisMachine
+    plural: basismachines
+    shortNames:
+    - bm
+    singular: basismachine
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BasisMachineSpec via `CustomResource`
+        properties:
+          spec:
+            description: A single VM the Basis provider should create on behalf of CAPI.
+            properties:
+              cpu:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              diskGib:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              gpuConstraints:
+                nullable: true
+                properties:
+                  minGroupSize:
+                    default: 0
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                type: object
+              gpus:
+                default: 0
+                format: uint32
+                minimum: 0.0
+                type: integer
+              image:
+                type: string
+              memoryMib:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              providerId:
+                description: Set by the provider after CreateMachine succeeds.
+                nullable: true
+                type: string
+            required:
+            - cpu
+            - diskGib
+            - image
+            - memoryMib
+            type: object
+          status:
+            nullable: true
+            properties:
+              addresses:
+                default: []
+                items:
+                  properties:
+                    Address:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - Address
+                  - type
+                  type: object
+                type: array
+              basisVmId:
+                description: Opaque Basis VM ID used on delete.
+                nullable: true
+                type: string
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - status
+                  - type
+                  type: object
+                type: array
+              failureMessage:
+                nullable: true
+                type: string
+              initialization:
+                nullable: true
+                properties:
+                  provisioned:
+                    type: boolean
+                required:
+                - provisioned
+                type: object
+              providerId:
+                nullable: true
+                type: string
+              ready:
+                default: false
+                type: boolean
+            type: object
+        required:
+        - spec
+        title: BasisMachine
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

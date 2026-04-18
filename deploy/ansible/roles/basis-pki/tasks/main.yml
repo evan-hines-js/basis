@@ -1,0 +1,60 @@
+---
+# Runs on the control node. Generates a CA and leaf certs for:
+#   - the controller (server cert, SAN = basis-controller)
+#   - each basis_agents host (client cert, CN = host name)
+#   - basis-capi-provider (client cert, CN = basis-capi-provider)
+#
+# Re-runs are idempotent: existing keys are kept and certs are only
+# regenerated if missing. The CA key NEVER leaves this directory.
+
+- name: Ensure local PKI directory exists
+  ansible.builtin.file:
+    path: "{{ basis_pki_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Generate CA private key
+  community.crypto.openssl_privatekey:
+    path: "{{ basis_pki_dir }}/ca.key"
+    size: 4096
+    mode: "0600"
+
+- name: Generate CA self-signed certificate
+  community.crypto.x509_certificate:
+    path: "{{ basis_pki_dir }}/ca.crt"
+    privatekey_path: "{{ basis_pki_dir }}/ca.key"
+    provider: selfsigned
+    selfsigned_not_after: "+{{ basis_ca_validity_days }}d"
+    selfsigned_digest: sha256
+    mode: "0644"
+    force: false
+  # CSR for the CA isn't strictly needed for selfsigned, but we set a
+  # recognizable subject so kubectl-style inspection is meaningful.
+  vars:
+    subject:
+      common_name: basis-test-ca
+
+- name: Issue controller server cert
+  ansible.builtin.include_tasks: issue_leaf.yml
+  vars:
+    leaf_name: controller
+    leaf_cn: "{{ basis_controller_san }}"
+    leaf_sans:
+      - "DNS:{{ basis_controller_san }}"
+
+- name: Issue per-agent client certs
+  ansible.builtin.include_tasks: issue_leaf.yml
+  loop: "{{ groups['basis_agents'] }}"
+  loop_control:
+    loop_var: agent_host
+  vars:
+    leaf_name: "agent-{{ agent_host }}"
+    leaf_cn: "{{ agent_host }}"
+    leaf_sans: []
+
+- name: Issue CAPI provider client cert
+  ansible.builtin.include_tasks: issue_leaf.yml
+  vars:
+    leaf_name: capi-provider
+    leaf_cn: basis-capi-provider
+    leaf_sans: []

@@ -1,0 +1,31 @@
+[package]
+name = "basis-capi-provider"
+version.workspace = true
+edition.workspace = true
+description = "Cluster API infrastructure provider for Basis"
+
+[dependencies]
+basis-proto.workspace = true
+basis-common.workspace = true
+
+tokio.workspace = true
+tonic.workspace = true
+
+rustls.workspace = true
+
+kube.workspace = true
+k8s-openapi.workspace = true
+schemars.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+
+thiserror.workspace = true
+anyhow.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+futures.workspace = true
+clap.workspace = true

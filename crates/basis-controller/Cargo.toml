@@ -6,6 +6,7 @@ description = "Basis hypervisor controller — scheduler, IP allocator, gRPC ser
 
 [dependencies]
 basis-proto.workspace = true
+basis-common.workspace = true
 
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -16,7 +17,7 @@ tonic.workspace = true
 rustls.workspace = true
 
 serde.workspace = true
-toml.workspace = true
+serde_yaml_ng.workspace = true
 
 thiserror.workspace = true
 anyhow.workspace = true
@@ -34,3 +35,7 @@ dashmap.workspace = true
 tower.workspace = true
 serde_json.workspace = true
 humantime.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile = "3"

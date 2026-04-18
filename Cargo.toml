@@ -2,8 +2,10 @@
 resolver = "2"
 members = [
     "crates/basis-proto",
+    "crates/basis-common",
     "crates/basis-controller",
     "crates/basis-agent",
+    "crates/basis-capi-provider",
 ]
 
 [workspace.package]
@@ -13,6 +15,7 @@ edition = "2021"
 [workspace.dependencies]
 # Internal crates
 basis-proto = { path = "crates/basis-proto" }
+basis-common = { path = "crates/basis-common" }
 basis-controller = { path = "crates/basis-controller" }
 
 # Async runtime
@@ -33,7 +36,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "1.1"
+serde_yaml_ng = "0.10"
 
 # Error handling
 thiserror = "2.0"
@@ -67,3 +70,14 @@ tower = { version = "0.5", features = ["util", "limit"] }
 # Misc
 humantime = "2"
 hostname = "0.4"
+
+# TLS peer cert parsing
+x509-parser = "0.18"
+
+# Test-only: self-signed cert generation
+rcgen = "0.13"
+
+# Kubernetes (basis-capi-provider only)
+kube = { version = "3.1", features = ["runtime", "derive", "client", "rustls-tls"], default-features = false }
+k8s-openapi = { version = "0.27", features = ["latest"] }
+schemars = "1"

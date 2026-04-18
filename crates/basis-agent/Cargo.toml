@@ -6,16 +6,18 @@ description = "Basis hypervisor agent — VM process management, disk images, ne
 
 [dependencies]
 basis-proto.workspace = true
+basis-common.workspace = true
 
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 
 tonic.workspace = true
 
 rustls.workspace = true
 
 serde.workspace = true
-toml.workspace = true
+serde_yaml_ng.workspace = true
 
 thiserror.workspace = true
 anyhow.workspace = true
@@ -27,6 +29,8 @@ futures.workspace = true
 
 clap.workspace = true
 serde_json.workspace = true
-hostname.workspace = true
 sqlx.workspace = true
 humantime.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

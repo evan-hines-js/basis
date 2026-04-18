@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 
 use basis_proto::CreateVmCommand;
 
-use crate::config::AgentConfig;
+use crate::config::HostSpec;
 use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
 use crate::network::NetworkManager;
@@ -31,19 +31,11 @@ pub struct ReconcileReport {
 ///      This shouldn't happen in normal operation but could if the agent DB was corrupted
 ///      or a previous cleanup was interrupted. We kill the orphan.
 ///
-/// The local agent DB is a crash-recovery cache, not the source of truth. The controller's
-/// SQLite is the global authority. After this local reconciliation, the agent connects to
-/// the controller and reports the state of every VM it has. The controller can then tell
-/// the agent to delete VMs it has forgotten or recreate VMs the agent has lost.
-///
-// TODO: post-register, controller should send its authoritative VM list for this host
-// and agent should reconcile (delete VMs controller has forgotten, recreate VMs controller
-// expects but agent has lost). Current code trusts local DB, which can drift if controller
-// makes changes while agent is offline. The agent DB should be re-derivable from the
-// controller — if it's corrupted or deleted, the agent asks "what VMs should I have?"
-// and rebuilds.
+/// Controller-side reconciliation happens later, once the agent connects and
+/// receives `RegisterHostResponse.expected_vm_ids` — any local VM not in that
+/// list is deleted by [`crate::handlers::reconcile_against_expected`].
 pub async fn reconcile_on_startup(
-    config: &AgentConfig,
+    config: &HostSpec,
     agent_db: &AgentDb,
     vm_mgr: &Arc<Mutex<VmManager>>,
     net_mgr: &NetworkManager,
@@ -128,7 +120,7 @@ enum RestartError {
 }
 
 async fn restart_vm(
-    config: &AgentConfig,
+    config: &HostSpec,
     vm_record: &LocalVmRow,
     vm_mgr: &Arc<Mutex<VmManager>>,
     net_mgr: &NetworkManager,

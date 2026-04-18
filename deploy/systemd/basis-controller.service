@@ -1,0 +1,18 @@
+[Unit]
+Description=Basis hypervisor controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/basis-controller --config /etc/basis/basiscontroller.yaml
+Restart=on-failure
+RestartSec=5s
+# Runs as root so it can read TLS material in /etc/basis/tls (mode 0700).
+# The controller binds a network port and writes sqlite under
+# /var/lib/basis — no other privileges required. Day-1 tradeoff:
+# trivially readable certs over a dynamic-user hardening dance.
+User=root
+
+[Install]
+WantedBy=multi-user.target

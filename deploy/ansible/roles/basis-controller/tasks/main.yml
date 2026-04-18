@@ -1,0 +1,63 @@
+---
+- name: Copy basis-controller binary
+  ansible.builtin.copy:
+    src: "{{ basis_binary_dir }}/basis-controller"
+    dest: "{{ basis_bin_dir }}/basis-controller"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart basis-controller
+
+- name: Install CA cert
+  ansible.builtin.copy:
+    src: "{{ basis_pki_dir }}/ca.crt"
+    dest: "{{ basis_tls_dir }}/ca.crt"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart basis-controller
+
+- name: Install controller server cert
+  ansible.builtin.copy:
+    src: "{{ basis_pki_dir }}/controller.crt"
+    dest: "{{ basis_tls_dir }}/controller.crt"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart basis-controller
+
+- name: Install controller server key
+  ansible.builtin.copy:
+    src: "{{ basis_pki_dir }}/controller.key"
+    dest: "{{ basis_tls_dir }}/controller.key"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: restart basis-controller
+
+- name: Write BasisController config
+  ansible.builtin.template:
+    src: basiscontroller.yaml.j2
+    dest: "{{ basis_config_dir }}/basiscontroller.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart basis-controller
+
+- name: Install systemd unit
+  ansible.builtin.copy:
+    src: "{{ basis_repo_root }}/deploy/systemd/basis-controller.service"
+    dest: /etc/systemd/system/basis-controller.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - daemon reload
+    - restart basis-controller
+
+- name: Enable and start basis-controller
+  ansible.builtin.systemd:
+    name: basis-controller
+    enabled: true
+    state: started
+    daemon_reload: true

@@ -1,0 +1,117 @@
+---
+# On Proxmox hosts, `pve-qemu-kvm` provides qemu-img and an apt-hook
+# refuses to let us install `qemu-utils` because it would remove the
+# Proxmox meta-package. Only install qemu-utils if qemu-img isn't
+# already on PATH from some other source.
+- name: Check whether qemu-img is already available
+  ansible.builtin.command: which qemu-img
+  register: qemu_img_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Install qemu-utils (unless qemu-img is already provided)
+  ansible.builtin.package:
+    name: qemu-utils
+    state: present
+  when: qemu_img_check.rc != 0
+
+- name: Install other host packages
+  ansible.builtin.package:
+    name:
+      - genisoimage         # cidata ISO generation
+      - iproute2            # ip(8) for bridge/tap management
+      - curl                # cloud-hypervisor HTTP API
+    state: present
+
+- name: Check installed cloud-hypervisor version
+  ansible.builtin.command: "{{ basis_bin_dir }}/cloud-hypervisor --version"
+  register: ch_version_check
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Download cloud-hypervisor static binary
+  ansible.builtin.get_url:
+    url: "{{ cloud_hypervisor_url }}"
+    dest: "{{ basis_bin_dir }}/cloud-hypervisor"
+    mode: "0755"
+    owner: root
+    group: root
+  # Skip if the binary is already present at the expected version.
+  # `cloud-hypervisor --version` prints `cloud-hypervisor v<N>.<N>.<N>`.
+  when: ch_version_check.rc != 0 or cloud_hypervisor_version not in (ch_version_check.stdout | default(''))
+
+- name: Ensure cloud-hypervisor firmware directory exists
+  ansible.builtin.file:
+    path: "{{ cloud_hypervisor_fw_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check installed cloud-hypervisor firmware version
+  ansible.builtin.stat:
+    path: "{{ cloud_hypervisor_fw_path }}"
+  register: ch_fw_check
+
+- name: Download cloud-hypervisor firmware blob
+  # rust-hypervisor-firmware is the minimal UEFI blob Cloud-Hypervisor uses
+  # to boot stock Linux cloud images (same pattern CAPMOX's Proxmox
+  # templates use — the image itself is unmodified).
+  ansible.builtin.get_url:
+    url: "{{ cloud_hypervisor_fw_url }}"
+    dest: "{{ cloud_hypervisor_fw_path }}"
+    mode: "0644"
+    owner: root
+    group: root
+  when: not ch_fw_check.stat.exists
+
+- name: Verify /dev/kvm exists (virtualization enabled in BIOS)
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: kvm_device
+  failed_when: not kvm_device.stat.exists
+
+- name: Load kernel modules at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/basis.conf
+    content: |
+      kvm
+      vfio-pci
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Load kernel modules now (best-effort; some are auto-loaded)
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - kvm
+    - vfio-pci
+  failed_when: false
+
+- name: Ensure data directory exists
+  ansible.builtin.file:
+    path: "{{ basis_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure config directory exists
+  ansible.builtin.file:
+    path: "{{ basis_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure TLS directory exists
+  ansible.builtin.file:
+    path: "{{ basis_tls_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"

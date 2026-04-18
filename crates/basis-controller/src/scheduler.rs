@@ -1,3 +1,4 @@
+use basis_common::gpu::GpuInfo;
 use basis_proto::{CreateMachineRequest, GpuDevice};
 
 use crate::db::HostRow;
@@ -6,15 +7,6 @@ use crate::db::HostRow;
 pub enum SchedulerError {
     #[error("no host can satisfy request: {0}")]
     NoCapacity(String),
-}
-
-/// Inventory of a single GPU parsed from the host's JSON gpu_inventory.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GpuInfo {
-    pub pci_address: String,
-    pub model: String,
-    pub iommu_group: String,
-    pub nvlink_group: u32,
 }
 
 pub struct ScheduleRequest {
@@ -41,7 +33,7 @@ impl From<&CreateMachineRequest> for ScheduleRequest {
     }
 }
 
-/// Pick the best host for a VM request. Returns (host_id, gpu_assignments_json).
+/// Pick the best host for a VM request and return the GPUs selected on that host.
 pub fn schedule(
     hosts: &[HostRow],
     assigned_vms: &std::collections::HashMap<String, Vec<String>>,
@@ -66,12 +58,9 @@ pub fn schedule(
 
         let available_gpus: Vec<GpuInfo> = inventory
             .into_iter()
-            .filter(|g| {
-                if let Some(assigned) = assigned_on_host {
-                    !assigned.contains(&g.pci_address)
-                } else {
-                    true
-                }
+            .filter(|g| match assigned_on_host {
+                Some(assigned) => !assigned.contains(&g.pci_address),
+                None => true,
             })
             .collect();
 
@@ -128,10 +117,14 @@ fn remaining_capacity(host: &HostRow, req: &ScheduleRequest) -> u64 {
     cpu_rem + mem_rem
 }
 
-/// Score GPU topology and return selected GPUs.
-/// Returns (score, selected_gpus). Empty selected_gpus means constraint not satisfiable.
+/// Score GPU topology and return the selected GPUs.
 ///
-/// Score: 3 = all GPUs share NVLink, 2 = same NUMA/PCIe switch, 1 = spread across host.
+/// Returns `(score, selected_gpus)`. An empty `selected_gpus` means the
+/// request cannot be satisfied on this host.
+///
+/// Score: 3 = all GPUs share NVLink, 1 = spread across groups (no NVLink affinity).
+/// A hard `min_group_size` constraint collapses this to "all in one NVLink group
+/// or nothing".
 fn gpu_topology_score(
     available: &[GpuInfo],
     count: u32,
@@ -139,44 +132,45 @@ fn gpu_topology_score(
 ) -> (i32, Vec<GpuInfo>) {
     let count = count as usize;
 
-    // Group by NVLink domain
+    // Group by NVLink domain. Group 0 means "not on NVLink" and is treated
+    // as distinct per-GPU (single-GPU groups) for the purpose of scoring —
+    // but here we still bucket them together because the hard constraint
+    // explicitly asks for a same-group guarantee.
     let mut nvlink_groups: std::collections::HashMap<u32, Vec<&GpuInfo>> =
         std::collections::HashMap::new();
     for gpu in available {
         nvlink_groups.entry(gpu.nvlink_group).or_default().push(gpu);
     }
 
-    // Try to find a single NVLink group that satisfies the request
+    // Hard constraint: need `min_group_size` GPUs in the same non-zero NVLink
+    // domain. Group 0 does not count as a real NVLink domain.
     if min_group_size > 0 {
-        // Hard constraint: need min_group_size GPUs in same NVLink domain
-        for (_group_id, gpus) in &nvlink_groups {
-            if gpus.len() >= count && gpus.len() >= min_group_size as usize {
+        for (group_id, gpus) in &nvlink_groups {
+            if *group_id != 0
+                && gpus.len() >= count
+                && gpus.len() >= min_group_size as usize
+            {
                 let selected: Vec<GpuInfo> = gpus[..count].iter().map(|g| (*g).clone()).collect();
                 return (3, selected);
             }
         }
-        // Constraint not satisfiable
         return (0, Vec::new());
     }
 
-    // Best-effort: try NVLink group first
-    let mut best: Option<(i32, Vec<GpuInfo>)> = None;
-
-    // Score 3: all in one NVLink group
-    for (_group_id, gpus) in &nvlink_groups {
-        if gpus.len() >= count {
+    // Best effort: prefer a single non-zero NVLink group that can satisfy the request.
+    for (group_id, gpus) in &nvlink_groups {
+        if *group_id != 0 && gpus.len() >= count {
             let selected: Vec<GpuInfo> = gpus[..count].iter().map(|g| (*g).clone()).collect();
             return (3, selected);
         }
     }
 
-    // Score 1: just pick the first N available
+    // Fallback: any N GPUs, no topological affinity.
     if available.len() >= count {
-        let selected: Vec<GpuInfo> = available[..count].to_vec();
-        best = Some((1, selected));
+        return (1, available[..count].to_vec());
     }
 
-    best.unwrap_or((0, Vec::new()))
+    (0, Vec::new())
 }
 
 #[cfg(test)]
@@ -200,6 +194,25 @@ mod tests {
         }
     }
 
+    fn gpu(pci: &str, nvlink_group: u32) -> GpuInfo {
+        GpuInfo {
+            pci_address: pci.to_string(),
+            model: "A100".to_string(),
+            iommu_group: pci.chars().last().unwrap_or('0').to_string(),
+            nvlink_group,
+        }
+    }
+
+    fn basic_req(gpus: u32, min_group: u32) -> ScheduleRequest {
+        ScheduleRequest {
+            cpu: 4,
+            memory_mib: 8192,
+            disk_gib: 100,
+            gpus,
+            min_group_size: min_group,
+        }
+    }
+
     #[test]
     fn test_schedule_basic() {
         let hosts = vec![
@@ -207,15 +220,7 @@ mod tests {
             make_host("h2", 4, 8192, 200, &[]),
         ];
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 0,
-            min_group_size: 0,
-        };
-
-        let (host_id, gpus) = schedule(&hosts, &assigned, &req).unwrap();
+        let (host_id, gpus) = schedule(&hosts, &assigned, &basic_req(0, 0)).unwrap();
         // h2 is a tighter fit (best-fit bin-packing prefers closest to full)
         assert_eq!(host_id, "h2");
         assert!(gpus.is_empty());
@@ -232,37 +237,16 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-
         assert!(schedule(&hosts, &assigned, &req).is_err());
     }
 
     #[test]
     fn test_schedule_with_gpus() {
-        let gpus = vec![
-            GpuInfo {
-                pci_address: "0000:41:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "10".to_string(),
-                nvlink_group: 1,
-            },
-            GpuInfo {
-                pci_address: "0000:42:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "11".to_string(),
-                nvlink_group: 1,
-            },
-        ];
+        let gpus = vec![gpu("0000:41:00.0", 1), gpu("0000:42:00.0", 1)];
         let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 2,
-            min_group_size: 2,
-        };
-
-        let (host_id, selected) = schedule(&hosts, &assigned, &req).unwrap();
+        let (host_id, selected) =
+            schedule(&hosts, &assigned, &basic_req(2, 2)).unwrap();
         assert_eq!(host_id, "h1");
         assert_eq!(selected.len(), 2);
     }
@@ -276,15 +260,7 @@ mod tests {
         hosts[0].healthy = false;
 
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 0,
-            min_group_size: 0,
-        };
-
-        let (host_id, _) = schedule(&hosts, &assigned, &req).unwrap();
+        let (host_id, _) = schedule(&hosts, &assigned, &basic_req(0, 0)).unwrap();
         assert_eq!(host_id, "h2");
     }
 
@@ -294,15 +270,7 @@ mod tests {
         hosts[0].healthy = false;
 
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 0,
-            min_group_size: 0,
-        };
-
-        assert!(schedule(&hosts, &assigned, &req).is_err());
+        assert!(schedule(&hosts, &assigned, &basic_req(0, 0)).is_err());
     }
 
     #[test]
@@ -316,210 +284,100 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-
         assert!(schedule(&hosts, &assigned, &req).is_err());
     }
 
     #[test]
     fn test_schedule_bin_packing_prefers_tightest_fit() {
-        // Three hosts with decreasing capacity. Scheduler should pick the
-        // one that's closest to full after placing the VM.
         let hosts = vec![
             make_host("big", 64, 262144, 2000, &[]),
             make_host("medium", 16, 32768, 500, &[]),
             make_host("small", 8, 16384, 200, &[]),
         ];
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 0,
-            min_group_size: 0,
-        };
-
-        let (host_id, _) = schedule(&hosts, &assigned, &req).unwrap();
+        let (host_id, _) = schedule(&hosts, &assigned, &basic_req(0, 0)).unwrap();
         assert_eq!(host_id, "small");
     }
 
     #[test]
     fn test_schedule_insufficient_disk_skips_host() {
         let hosts = vec![
-            make_host("h1", 16, 65536, 50, &[]),  // disk too small
+            make_host("h1", 16, 65536, 50, &[]),
             make_host("h2", 16, 65536, 200, &[]),
         ];
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 0,
-            min_group_size: 0,
-        };
-
-        let (host_id, _) = schedule(&hosts, &assigned, &req).unwrap();
+        let (host_id, _) = schedule(&hosts, &assigned, &basic_req(0, 0)).unwrap();
         assert_eq!(host_id, "h2");
     }
 
     #[test]
     fn test_schedule_gpu_not_enough_available() {
-        let gpus = vec![GpuInfo {
-            pci_address: "0000:41:00.0".to_string(),
-            model: "A100".to_string(),
-            iommu_group: "10".to_string(),
-            nvlink_group: 1,
-
-        }];
+        let gpus = vec![gpu("0000:41:00.0", 1)];
         let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
         let assigned = std::collections::HashMap::new();
-
-        // Asking for 2 GPUs but host only has 1
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 2,
-            min_group_size: 0,
-        };
-
-        assert!(schedule(&hosts, &assigned, &req).is_err());
+        assert!(schedule(&hosts, &assigned, &basic_req(2, 0)).is_err());
     }
 
     #[test]
     fn test_schedule_gpu_prefers_nvlink_group() {
-        // Host has 4 GPUs: 2 in NVLink group 1, 2 in NVLink group 2.
-        // Requesting 2 GPUs should pick from a single NVLink group.
+        // 4 GPUs: 2 in NVLink group 1, 2 in NVLink group 2. Request for 2
+        // should pick from a single NVLink group.
         let gpus = vec![
-            GpuInfo {
-                pci_address: "0000:41:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "10".to_string(),
-                nvlink_group: 1,
-            },
-            GpuInfo {
-                pci_address: "0000:42:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "11".to_string(),
-                nvlink_group: 1,
-            },
-            GpuInfo {
-                pci_address: "0000:81:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "20".to_string(),
-                nvlink_group: 2,
-            },
-            GpuInfo {
-                pci_address: "0000:82:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "21".to_string(),
-                nvlink_group: 2,
-            },
+            gpu("0000:41:00.0", 1),
+            gpu("0000:42:00.0", 1),
+            gpu("0000:81:00.0", 2),
+            gpu("0000:82:00.0", 2),
         ];
         let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 2,
-            min_group_size: 0,
-        };
-
-        let (_, selected) = schedule(&hosts, &assigned, &req).unwrap();
+        let (_, selected) = schedule(&hosts, &assigned, &basic_req(2, 0)).unwrap();
         assert_eq!(selected.len(), 2);
-        // Both GPUs should be from the same NVLink group
         assert_eq!(selected[0].nvlink_group, selected[1].nvlink_group);
     }
 
     #[test]
     fn test_schedule_gpu_hard_constraint_unsatisfiable() {
-        // 4 GPUs, 2 per NVLink group. Hard constraint min_group_size=4
-        // is unsatisfiable — no single group has 4.
+        // 4 GPUs, 2 per NVLink group. Hard constraint min_group_size=4 cannot
+        // be satisfied — no single group has 4 GPUs.
         let gpus = vec![
-            GpuInfo {
-                pci_address: "0000:41:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "10".to_string(),
-                nvlink_group: 1,
-            },
-            GpuInfo {
-                pci_address: "0000:42:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "11".to_string(),
-                nvlink_group: 1,
-            },
-            GpuInfo {
-                pci_address: "0000:81:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "20".to_string(),
-                nvlink_group: 2,
-            },
-            GpuInfo {
-                pci_address: "0000:82:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "21".to_string(),
-                nvlink_group: 2,
-            },
+            gpu("0000:41:00.0", 1),
+            gpu("0000:42:00.0", 1),
+            gpu("0000:81:00.0", 2),
+            gpu("0000:82:00.0", 2),
         ];
         let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 4,
-            min_group_size: 4,
-        };
+        assert!(schedule(&hosts, &assigned, &basic_req(4, 4)).is_err());
+    }
 
-        assert!(schedule(&hosts, &assigned, &req).is_err());
+    #[test]
+    fn test_schedule_hard_constraint_rejects_group_zero() {
+        // 4 GPUs all in group 0 ("unknown / not on NVLink"). A hard same-group
+        // constraint must reject this even though they share the bucket.
+        let gpus = vec![
+            gpu("0000:41:00.0", 0),
+            gpu("0000:42:00.0", 0),
+            gpu("0000:81:00.0", 0),
+            gpu("0000:82:00.0", 0),
+        ];
+        let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
+        let assigned = std::collections::HashMap::new();
+        assert!(schedule(&hosts, &assigned, &basic_req(2, 2)).is_err());
     }
 
     #[test]
     fn test_schedule_skips_assigned_gpus() {
-        let gpus = vec![
-            GpuInfo {
-                pci_address: "0000:41:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "10".to_string(),
-                nvlink_group: 1,
-            },
-            GpuInfo {
-                pci_address: "0000:42:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "11".to_string(),
-                nvlink_group: 1,
-            },
-        ];
+        let gpus = vec![gpu("0000:41:00.0", 1), gpu("0000:42:00.0", 1)];
         let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
 
-        // One GPU already assigned
         let mut assigned = std::collections::HashMap::new();
-        assigned.insert(
-            "h1".to_string(),
-            vec!["0000:41:00.0".to_string()],
-        );
+        assigned.insert("h1".to_string(), vec!["0000:41:00.0".to_string()]);
 
-        // Asking for 2 GPUs should fail (only 1 available)
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 2,
-            min_group_size: 0,
-        };
+        // 2 GPUs requested, only 1 free — should fail
+        assert!(schedule(&hosts, &assigned, &basic_req(2, 0)).is_err());
 
-        assert!(schedule(&hosts, &assigned, &req).is_err());
-
-        // Asking for 1 GPU should succeed
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 1,
-            min_group_size: 0,
-        };
-
-        let (host_id, selected) = schedule(&hosts, &assigned, &req).unwrap();
+        // 1 GPU request should pick the free one
+        let (host_id, selected) = schedule(&hosts, &assigned, &basic_req(1, 0)).unwrap();
         assert_eq!(host_id, "h1");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].pci_address, "0000:42:00.0");
@@ -527,52 +385,17 @@ mod tests {
 
     #[test]
     fn test_schedule_multi_host_gpu_topology_tiebreak() {
-        // Two hosts, both have enough GPUs. Host A has GPUs spread across
-        // NVLink groups, host B has them all in one. Scheduler should prefer B.
-        let gpus_spread = vec![
-            GpuInfo {
-                pci_address: "0000:41:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "10".to_string(),
-                nvlink_group: 1,
-            },
-            GpuInfo {
-                pci_address: "0000:81:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "20".to_string(),
-                nvlink_group: 2,
-            },
-        ];
-        let gpus_together = vec![
-            GpuInfo {
-                pci_address: "0000:41:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "10".to_string(),
-                nvlink_group: 1,
-            },
-            GpuInfo {
-                pci_address: "0000:42:00.0".to_string(),
-                model: "A100".to_string(),
-                iommu_group: "11".to_string(),
-                nvlink_group: 1,
-            },
-        ];
+        // Two hosts with equal capacity. Host "spread" has GPUs across NVLink
+        // groups, "together" has them in one. Scheduler must prefer "together".
+        let gpus_spread = vec![gpu("0000:41:00.0", 1), gpu("0000:81:00.0", 2)];
+        let gpus_together = vec![gpu("0000:41:00.0", 1), gpu("0000:42:00.0", 1)];
 
-        // Same capacity so bin-packing doesn't decide
         let hosts = vec![
             make_host("spread", 16, 65536, 1000, &gpus_spread),
             make_host("together", 16, 65536, 1000, &gpus_together),
         ];
         let assigned = std::collections::HashMap::new();
-        let req = ScheduleRequest {
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 2,
-            min_group_size: 0,
-        };
-
-        let (host_id, selected) = schedule(&hosts, &assigned, &req).unwrap();
+        let (host_id, selected) = schedule(&hosts, &assigned, &basic_req(2, 0)).unwrap();
         assert_eq!(host_id, "together");
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].nvlink_group, selected[1].nvlink_group);

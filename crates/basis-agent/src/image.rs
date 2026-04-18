@@ -238,11 +238,7 @@ impl ImageManager {
 
 /// Convert an image reference to a safe filename for the cache.
 fn image_ref_to_filename(image_ref: &str) -> String {
-    image_ref
-        .replace('/', "_")
-        .replace(':', "_")
-        .replace('.', "_")
-        + ".qcow2"
+    image_ref.replace(['/', ':', '.'], "_") + ".qcow2"
 }
 
 #[cfg(test)]
@@ -251,8 +247,8 @@ mod tests {
 
     #[test]
     fn test_image_ref_to_filename_oci() {
-        let name = image_ref_to_filename("ghcr.io/lattos/lattice-node:v1.32.0");
-        assert_eq!(name, "ghcr_io_lattos_lattice-node_v1_32_0.qcow2");
+        let name = image_ref_to_filename("ghcr.io/evan-hines-js/lattice-node:v1.32.0");
+        assert_eq!(name, "ghcr_io_evan-hines-js_lattice-node_v1_32_0.qcow2");
         assert!(!name.contains('/'));
         assert!(!name.contains(':'));
     }

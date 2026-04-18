@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use basis_common::time::rfc3339_ago;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -19,7 +20,7 @@ pub async fn host_health_checker(db: Db, shutdown: CancellationToken) {
                 return;
             }
             _ = interval.tick() => {
-                let cutoff = chrono_now_minus(HEARTBEAT_STALE_THRESHOLD);
+                let cutoff = rfc3339_ago(HEARTBEAT_STALE_THRESHOLD);
                 match db.mark_stale_hosts_unhealthy(&cutoff).await {
                     Ok(stale) => {
                         for host_id in &stale {
@@ -33,20 +34,4 @@ pub async fn host_health_checker(db: Db, shutdown: CancellationToken) {
             }
         }
     }
-}
-
-fn chrono_now_minus(duration: Duration) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let cutoff = now.saturating_sub(duration.as_secs());
-
-    // Format as ISO 8601 - basic but sufficient for SQLite string comparison
-    let dt = std::time::UNIX_EPOCH + std::time::Duration::from_secs(cutoff);
-    humantime::format_rfc3339_seconds(dt).to_string()
-}
-
-pub fn now_rfc3339() -> String {
-    humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()
 }

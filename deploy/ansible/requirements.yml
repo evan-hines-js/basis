@@ -1,0 +1,10 @@
+---
+# Install with: ansible-galaxy collection install -r requirements.yml
+# Also requires `python3-cryptography` on the Ansible control node.
+collections:
+  - name: community.crypto
+    version: ">=2.0.0"
+  - name: community.general
+    version: ">=8.0.0"
+  - name: ansible.posix
+    version: ">=1.5.0"

@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use basis_controller::config::ControllerConfig;
+use basis_controller::config::BasisControllerSpec;
 use basis_controller::db::Db;
 
 #[derive(Parser)]
@@ -27,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let config = ControllerConfig::load(&cli.config)?;
+    let config = BasisControllerSpec::load(&cli.config)?;
     info!(listen = %config.listen, data_dir = %config.data_dir.display(), "loaded config");
 
     std::fs::create_dir_all(&config.data_dir)?;
@@ -35,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let db = Db::open(&config.db_path()).await?;
     info!(path = %config.db_path().display(), "database ready");
 
-    basis_controller::ip::seed_ip_pools(&db, &config.ip_pools).await?;
+    db.seed_ip_pools(&config.ip_pools).await?;
     info!(count = config.ip_pools.len(), "IP pools seeded");
 
     let shutdown = CancellationToken::new();
@@ -46,9 +47,11 @@ async fn main() -> anyhow::Result<()> {
         basis_controller::host::host_health_checker(health_db, health_shutdown).await;
     });
 
-    let addr = config.listen.parse()?;
-    let basis_server = basis_controller::server::BasisServer::new(db);
-    basis_server.serve(addr, &config, shutdown.clone()).await?;
+    let listener = TcpListener::bind(&config.listen).await?;
+    let tls_config = config.tls.server_config()?;
+    basis_controller::server::BasisServer::new(db)
+        .serve(listener, tls_config, shutdown)
+        .await?;
 
     Ok(())
 }

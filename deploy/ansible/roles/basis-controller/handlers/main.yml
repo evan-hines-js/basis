@@ -1,0 +1,9 @@
+---
+- name: daemon reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart basis-controller
+  ansible.builtin.systemd:
+    name: basis-controller
+    state: restarted

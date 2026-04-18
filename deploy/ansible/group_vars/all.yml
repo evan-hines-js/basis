@@ -1,0 +1,52 @@
+---
+# Paths on managed hosts.
+basis_bin_dir: /usr/local/bin
+basis_config_dir: /etc/basis
+basis_tls_dir: "{{ basis_config_dir }}/tls"
+basis_data_dir: /var/lib/basis
+
+# Controller bind + well-known server SAN. `basis_controller_san` must
+# match the SAN we put on the controller's server cert AND the value the
+# agent clients set as their TLS domain name.
+basis_controller_port: 7443
+basis_controller_san: basis-controller
+
+# Where the playbook finds binaries on the control node. Build with
+# `cargo build --release` before running.
+basis_repo_root: "{{ playbook_dir }}/../.."
+basis_binary_dir: "{{ basis_repo_root }}/target/release"
+
+# Local (control-node) PKI state. Certs/keys never leave the control node
+# except to be copied to their specific host.
+basis_pki_dir: "{{ playbook_dir }}/pki"
+basis_ca_validity_days: 3650
+basis_leaf_validity_days: 365
+
+# Default IP pool. Must be a range OUTSIDE your router's DHCP pool.
+# Basis hands out static IPs via cloud-init — DHCP collisions mean
+# broken VMs with no good diagnostic.
+basis_ip_pool:
+  name: default
+  cidr: 10.0.0.0/24
+  gateway: 10.0.0.1
+  range_start: 10.0.0.210
+  range_end: 10.0.0.250
+
+# Per-host bridge name. Set to `vmbr0` when colocating Basis on hosts
+# that already run Proxmox — the agent skips bridge creation if one
+# by this name already exists, and Basis's VMs end up on the same L2
+# segment as Proxmox's VMs.
+basis_bridge: vmbr0
+
+# Cloud Hypervisor release to install. A static x86_64 binary from the
+# official GitHub release.
+cloud_hypervisor_version: "45.0"
+cloud_hypervisor_url: "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v{{ cloud_hypervisor_version }}/cloud-hypervisor-static"
+
+# Minimal UEFI firmware Cloud Hypervisor loads to boot guest VMs. With
+# this in place stock Ubuntu/Debian cloud images (qcow2) boot unmodified.
+# Must match the path basis-agent's HostSpec.firmware_path expects.
+cloud_hypervisor_fw_version: "0.4.2"
+cloud_hypervisor_fw_url: "https://github.com/cloud-hypervisor/rust-hypervisor-firmware/releases/download/{{ cloud_hypervisor_fw_version }}/hypervisor-fw"
+cloud_hypervisor_fw_dir: /usr/share/cloud-hypervisor
+cloud_hypervisor_fw_path: "{{ cloud_hypervisor_fw_dir }}/hypervisor-fw"

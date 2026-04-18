@@ -1,0 +1,22 @@
+# Example basis-controller config. Install on the single host that will
+# run the controller process.
+apiVersion: basis.dev/v1alpha1
+kind: BasisController
+metadata:
+  name: primary
+spec:
+  listen: "0.0.0.0:7443"
+  dataDir: /var/lib/basis
+  tls:
+    cert: /etc/basis/tls/controller.crt
+    key: /etc/basis/tls/controller.key
+    ca: /etc/basis/tls/ca.crt
+  ipPools:
+    - name: default
+      cidr: 192.168.1.0/24
+      gateway: 192.168.1.1
+      # Carve out a range that does NOT overlap with your router's DHCP.
+      # Basis will reserve one address as each cluster's control-plane VIP
+      # and hand the rest out as VM IPs.
+      rangeStart: 192.168.1.210
+      rangeEnd: 192.168.1.250

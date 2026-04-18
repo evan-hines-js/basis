@@ -282,7 +282,7 @@ mod tests {
     async fn test_cached_image_recording() {
         let db = test_db().await;
         db.record_cached_image(
-            "ghcr.io/lattos/node:v1.32",
+            "ghcr.io/evan-hines-js/node:v1.32",
             "/var/lib/basis/images/node_v1_32.qcow2",
             1073741824,
             "2025-01-01T00:00:00Z",
@@ -292,7 +292,7 @@ mod tests {
 
         // Upsert same image with new path (e.g., re-pull)
         db.record_cached_image(
-            "ghcr.io/lattos/node:v1.32",
+            "ghcr.io/evan-hines-js/node:v1.32",
             "/var/lib/basis/images/node_v1_32_new.qcow2",
             2147483648,
             "2025-01-02T00:00:00Z",

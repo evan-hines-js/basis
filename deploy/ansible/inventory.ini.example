@@ -1,0 +1,22 @@
+# Copy to inventory.ini and edit for your fleet.
+#
+# Each host appears under both its logical role and the global list.
+# `ansible_host` is the SSH target. `basis_physical_nic` tells the agent
+# which physical NIC to attach to its bridge (varies per host).
+
+[basis_controller]
+dell1 ansible_host=192.168.1.11
+
+[basis_agents]
+dell1 ansible_host=192.168.1.11 basis_physical_nic=eno1
+dell2 ansible_host=192.168.1.12 basis_physical_nic=eno1
+beelink1 ansible_host=192.168.1.21 basis_physical_nic=enp2s0
+beelink2 ansible_host=192.168.1.22 basis_physical_nic=enp2s0
+beelink3 ansible_host=192.168.1.23 basis_physical_nic=enp2s0
+
+[basis:children]
+basis_controller
+basis_agents
+
+[basis:vars]
+ansible_user=root

@@ -1,0 +1,17 @@
+# Example basis-agent config. Copy to /etc/basis/host.yaml on each
+# bare-metal host. `metadata.name` becomes the hostname the agent
+# registers as, and must match the CN on the agent's client cert.
+apiVersion: basis.dev/v1alpha1
+kind: Host
+metadata:
+  name: node-1
+spec:
+  controllerEndpoint: "https://10.0.0.1:7443"
+  dataDir: /var/lib/basis
+  network:
+    bridge: basis0
+    physicalNic: eno1
+  tls:
+    cert: /etc/basis/tls/agent.crt
+    key: /etc/basis/tls/agent.key
+    ca: /etc/basis/tls/ca.crt

@@ -2,7 +2,16 @@ syntax = "proto3";
 package basis.v1;
 
 // CAPI-facing service — called by basis-capi-provider running in Kubernetes.
+//
+// Two-level model: a caller first creates a Cluster (reserves a VIP and
+// binds an IP pool), then creates Machines inside that cluster. All VM
+// placement decisions (host, GPUs, IP) belong to the controller — callers
+// describe intent, not placement.
 service Basis {
+  rpc CreateCluster(CreateClusterRequest) returns (CreateClusterResponse);
+  rpc DeleteCluster(DeleteClusterRequest) returns (DeleteClusterResponse);
+  rpc GetCluster(GetClusterRequest) returns (Cluster);
+
   rpc CreateMachine(CreateMachineRequest) returns (CreateMachineResponse);
   rpc DeleteMachine(DeleteMachineRequest) returns (DeleteMachineResponse);
   rpc GetMachine(GetMachineRequest) returns (Machine);
@@ -16,11 +25,47 @@ service BasisAgent {
   rpc StreamMessages(stream AgentMessage) returns (stream ControllerCommand);
 }
 
-// --- CAPI-facing messages ---
+// --- Cluster messages ---
+
+message CreateClusterRequest {
+  // Human-readable cluster name. Must be unique across the Basis
+  // controller. Used in logs and as the `cluster` label on VMs.
+  string name = 1;
+  // Name of the IP pool (configured in controller.toml) to allocate
+  // VIPs and VM IPs from for this cluster.
+  string ip_pool = 2;
+}
+
+message CreateClusterResponse {
+  string cluster_id = 1;
+  // Reserved control-plane endpoint VIP. kube-vip on the first control
+  // plane node claims this address via gratuitous ARP.
+  string control_plane_endpoint = 2;
+}
+
+message DeleteClusterRequest {
+  string cluster_id = 1;
+}
+
+message DeleteClusterResponse {}
+
+message GetClusterRequest {
+  string cluster_id = 1;
+}
+
+message Cluster {
+  string cluster_id = 1;
+  string name = 2;
+  string ip_pool = 3;
+  string control_plane_endpoint = 4;
+}
+
+// --- Machine messages ---
 
 message CreateMachineRequest {
-  string name = 1;
-  string cluster = 2;
+  // Cluster this machine belongs to. Returned from CreateCluster.
+  string cluster_id = 1;
+  string name = 2;
   uint32 cpu = 3;
   uint32 memory_mib = 4;
   uint32 disk_gib = 5;
@@ -28,7 +73,6 @@ message CreateMachineRequest {
   bytes bootstrap_data = 7;
   uint32 gpus = 8;
   GPUConstraints gpu_constraints = 9;
-  string ip_pool = 10;
 }
 
 message CreateMachineResponse {
@@ -49,7 +93,8 @@ message GetMachineRequest {
 }
 
 message ListMachinesRequest {
-  string cluster = 1;
+  // Filter by cluster_id. Empty string means all clusters.
+  string cluster_id = 1;
 }
 
 message ListMachinesResponse {
@@ -59,7 +104,7 @@ message ListMachinesResponse {
 message Machine {
   string id = 1;
   string name = 2;
-  string cluster = 3;
+  string cluster_id = 3;
   string host = 4;
   string provider_id = 5;
   string ip_address = 6;
@@ -115,10 +160,15 @@ message ControllerCommand {
 }
 
 // Sent as the first command after the agent's RegisterHostRequest.
-// Tells the agent its controller-assigned host_id so heartbeats
-// and reconnections use the right identity.
+//
+// The controller is authoritative: `expected_vm_ids` is the complete list
+// of VMs this host should have. The agent MUST delete any local VM not in
+// this list before reporting state — those VMs were forgotten by the
+// controller (e.g., deleted while the agent was offline) and their disks
+// and tap devices are garbage.
 message RegisterHostResponse {
   string host_id = 1;
+  repeated string expected_vm_ids = 2;
 }
 
 // --- Agent registration ---

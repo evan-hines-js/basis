@@ -1,0 +1,17 @@
+[package]
+name = "basis-common"
+version.workspace = true
+edition.workspace = true
+description = "Shared utilities for Basis: TLS config, time helpers, shared types"
+
+[dependencies]
+tonic.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+humantime.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile = "3"

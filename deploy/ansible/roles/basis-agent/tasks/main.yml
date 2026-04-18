@@ -1,0 +1,66 @@
+---
+- name: Copy basis-agent binary
+  ansible.builtin.copy:
+    src: "{{ basis_binary_dir }}/basis-agent"
+    dest: "{{ basis_bin_dir }}/basis-agent"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart basis-agent
+
+- name: Install CA cert
+  ansible.builtin.copy:
+    src: "{{ basis_pki_dir }}/ca.crt"
+    dest: "{{ basis_tls_dir }}/ca.crt"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload basis-agent
+
+- name: Install agent client cert
+  ansible.builtin.copy:
+    src: "{{ basis_pki_dir }}/agent-{{ inventory_hostname }}.crt"
+    dest: "{{ basis_tls_dir }}/agent.crt"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload basis-agent
+
+- name: Install agent client key
+  ansible.builtin.copy:
+    src: "{{ basis_pki_dir }}/agent-{{ inventory_hostname }}.key"
+    dest: "{{ basis_tls_dir }}/agent.key"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reload basis-agent
+
+- name: Write Host config
+  ansible.builtin.template:
+    src: host.yaml.j2
+    dest: "{{ basis_config_dir }}/host.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  # Changes to Host spec trigger SIGHUP. The agent only applies mutable
+  # fields (controllerEndpoint); immutable field changes log a warning
+  # and require a full restart — surfaced by the running agent's logs.
+  notify: reload basis-agent
+
+- name: Install systemd unit
+  ansible.builtin.copy:
+    src: "{{ basis_repo_root }}/deploy/systemd/basis-agent.service"
+    dest: /etc/systemd/system/basis-agent.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - daemon reload
+    - restart basis-agent
+
+- name: Enable and start basis-agent
+  ansible.builtin.systemd:
+    name: basis-agent
+    enabled: true
+    state: started
+    daemon_reload: true

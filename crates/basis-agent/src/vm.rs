@@ -27,14 +27,16 @@ struct TrackedVm {
 
 pub struct VmManager {
     pub vms_dir: PathBuf,
+    firmware_path: PathBuf,
     tracked: HashMap<String, TrackedVm>,
 }
 
 impl VmManager {
-    pub fn new(vms_dir: PathBuf) -> Self {
+    pub fn new(vms_dir: PathBuf, firmware_path: PathBuf) -> Self {
         std::fs::create_dir_all(&vms_dir).ok();
         Self {
             vms_dir,
+            firmware_path,
             tracked: HashMap::new(),
         }
     }
@@ -64,6 +66,7 @@ impl VmManager {
             format!("--api-socket={}", socket_path.to_string_lossy()),
             format!("--cpus=boot={}", cmd.cpu),
             format!("--memory=size={}M", cmd.memory_mib),
+            format!("--firmware={}", self.firmware_path.to_string_lossy()),
             format!("--disk=path={}", disk_path.to_string_lossy()),
             format!("--disk=path={}", cloud_init_path.to_string_lossy()),
             format!("--net=tap={tap_name},mac={}", generate_mac(&cmd.vm_id)),

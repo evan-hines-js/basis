@@ -1,0 +1,39 @@
+---
+# Basis fleet bootstrap.
+#
+# Iteration tips:
+#   ansible-playbook site.yml --limit dell1 -vv
+#   ansible-playbook site.yml --tags pki       # just (re)issue certs
+#   ansible-playbook site.yml --tags controller
+#   ansible-playbook site.yml --tags agent
+#
+# Everything below is idempotent — re-running should produce no changes
+# once a host is healthy.
+
+- name: Issue CA and leaf certificates on the control node
+  hosts: localhost
+  gather_facts: false
+  tags: [pki]
+  roles:
+    - basis-pki
+
+- name: Prepare bare-metal prerequisites
+  hosts: basis
+  become: true
+  tags: [prereqs]
+  roles:
+    - basis-prereqs
+
+- name: Install and run basis-controller
+  hosts: basis_controller
+  become: true
+  tags: [controller]
+  roles:
+    - basis-controller
+
+- name: Install and run basis-agent
+  hosts: basis_agents
+  become: true
+  tags: [agent]
+  roles:
+    - basis-agent

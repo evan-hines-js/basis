@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -10,14 +9,45 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
-use crate::config::ControllerConfig;
-use crate::db::{Db, VmRow};
-use crate::host::now_rfc3339;
-use crate::scheduler::{self, GpuInfo, ScheduleRequest};
+use basis_common::gpu::GpuInfo;
+use basis_common::time::now_rfc3339;
+use basis_common::tls;
+
+use crate::db::{ClusterRow, Db, IpOwner, VmRow};
+use crate::scheduler::{self, ScheduleRequest};
+
+/// Fixed CN required for connections from the CAPI provider.
+pub const CAPI_PROVIDER_CN: &str = "basis-capi-provider";
+
+/// Require that a CAPI-facing RPC was issued by a client whose peer cert
+/// CN is [`CAPI_PROVIDER_CN`]. Rejects any other CN, including a missing one.
+fn require_capi_caller<T>(req: &Request<T>) -> Result<(), Status> {
+    let cn = peer_cn(req)?;
+    if cn == CAPI_PROVIDER_CN {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(format!(
+            "CN '{cn}' is not authorized for CAPI RPCs (expected '{CAPI_PROVIDER_CN}')"
+        )))
+    }
+}
+
+/// Extract the peer CN from the request, treating anything less as an
+/// authentication failure. The server is always TLS-terminated so the only
+/// reason this returns an error is misconfiguration or a missing cert.
+fn peer_cn<T>(req: &Request<T>) -> Result<String, Status> {
+    match tls::request_peer_cn(req) {
+        Ok(Some(cn)) => Ok(cn),
+        Ok(None) => Err(Status::unauthenticated("TLS required")),
+        Err(e) => Err(Status::unauthenticated(format!(
+            "peer certificate: {e}"
+        ))),
+    }
+}
 
 /// Pending create request waiting for the agent to report VM state.
 struct PendingCreate {
@@ -44,21 +74,17 @@ impl BasisServer {
         }
     }
 
+    /// Serve on a caller-provided TCP listener with a caller-provided TLS
+    /// config. The listener must already be bound.
     pub async fn serve(
         self,
-        addr: SocketAddr,
-        config: &ControllerConfig,
+        listener: tokio::net::TcpListener,
+        tls_config: ServerTlsConfig,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
-        let cert_pem = std::fs::read_to_string(&config.tls.cert)?;
-        let key_pem = std::fs::read_to_string(&config.tls.key)?;
-        let ca_pem = std::fs::read_to_string(&config.tls.ca)?;
-
-        let tls_config = ServerTlsConfig::new()
-            .identity(Identity::from_pem(&cert_pem, &key_pem))
-            .client_ca_root(Certificate::from_pem(&ca_pem));
-
+        let addr = listener.local_addr()?;
         let (basis_svc, agent_svc) = self.into_services();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
         info!(%addr, "starting gRPC server");
 
@@ -68,37 +94,10 @@ impl BasisServer {
             .layer(tower::limit::ConcurrencyLimitLayer::new(256))
             .add_service(basis_svc)
             .add_service(agent_svc)
-            .serve_with_shutdown(addr, shutdown.cancelled())
+            .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
             .await?;
 
         Ok(())
-    }
-
-    /// Start without TLS on a random port. Returns the actual address.
-    /// Used for integration tests.
-    pub async fn serve_insecure(
-        self,
-        shutdown: CancellationToken,
-    ) -> anyhow::Result<std::net::SocketAddr> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-
-        let (basis_svc, agent_svc) = self.into_services();
-
-        info!(%addr, "starting insecure gRPC server (test mode)");
-
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-        tokio::spawn(async move {
-            Server::builder()
-                .add_service(basis_svc)
-                .add_service(agent_svc)
-                .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
-                .await
-                .ok();
-        });
-
-        Ok(addr)
     }
 
     fn into_services(
@@ -134,73 +133,182 @@ struct BasisApiService {
 impl BasisApiService {
     /// Clean up a VM that failed to create: release IP, delete DB record.
     async fn cleanup_failed_vm(&self, vm_id: &str) {
-        if let Err(e) = self.db.release_ip(vm_id).await {
+        if let Err(e) = self.db.release_ips(IpOwner::Vm(vm_id)).await {
             warn!(vm_id, error = %e, "failed to release IP during cleanup");
         }
         if let Err(e) = self.db.delete_vm(vm_id).await {
             warn!(vm_id, error = %e, "failed to delete VM record during cleanup");
         }
     }
+
+    /// Send a DeleteVm command to the owning host's agent if connected.
+    /// Best-effort: an offline agent will discover the deletion via the
+    /// authoritative VM list on its next registration.
+    async fn notify_agent_delete(&self, host_id: &str, vm_id: &str) {
+        if let Some(agent) = self.agents.get(host_id) {
+            let cmd = ControllerCommand {
+                request_id: vm_id.to_string(),
+                command: Some(controller_command::Command::DeleteVm(DeleteVmCommand {
+                    vm_id: vm_id.to_string(),
+                })),
+            };
+            let _ = agent.command_tx.send(cmd).await;
+        }
+    }
+
+    /// Tear down a single VM: notify its agent, release its IP, delete its
+    /// DB row. Called by both `delete_machine` and cluster deletion.
+    async fn teardown_vm(&self, vm: &VmRow) -> Result<(), Status> {
+        self.db
+            .update_vm_state(&vm.id, MachineState::Stopping as i64, "", &now_rfc3339())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        self.notify_agent_delete(&vm.host_id, &vm.id).await;
+
+        let _ = self.db.release_ips(IpOwner::Vm(&vm.id)).await;
+        self.db
+            .delete_vm(&vm.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(())
+    }
 }
+
+/// Total time `CreateMachine` will wait for the agent to report RUNNING.
+const CREATE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[tonic::async_trait]
 impl basis_server::Basis for BasisApiService {
+    async fn create_cluster(
+        &self,
+        request: Request<CreateClusterRequest>,
+    ) -> Result<Response<CreateClusterResponse>, Status> {
+        require_capi_caller(&request)?;
+        let req = request.into_inner();
+        if req.name.is_empty() || req.ip_pool.is_empty() {
+            return Err(Status::invalid_argument(
+                "name and ip_pool are required",
+            ));
+        }
+
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+
+        // Reserve the control-plane VIP from the pool before inserting the
+        // cluster row so we don't commit a partial cluster on failure.
+        let vip = self
+            .db
+            .allocate_ip(&req.ip_pool, IpOwner::ClusterVip(&cluster_id))
+            .await
+            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+
+        let row = ClusterRow {
+            id: cluster_id.clone(),
+            name: req.name.clone(),
+            ip_pool: req.ip_pool.clone(),
+            control_plane_endpoint: vip.clone(),
+            created_at: now_rfc3339(),
+        };
+        if let Err(e) = self.db.insert_cluster(&row).await {
+            // Insert failed — roll back the VIP so we don't leak an IP.
+            let _ = self.db.release_ips(IpOwner::ClusterVip(&cluster_id)).await;
+            return Err(match e {
+                crate::db::DbError::Conflict(msg) => Status::already_exists(msg),
+                other => Status::internal(other.to_string()),
+            });
+        }
+
+        Ok(Response::new(CreateClusterResponse {
+            cluster_id,
+            control_plane_endpoint: vip,
+        }))
+    }
+
+    async fn delete_cluster(
+        &self,
+        request: Request<DeleteClusterRequest>,
+    ) -> Result<Response<DeleteClusterResponse>, Status> {
+        require_capi_caller(&request)?;
+        let req = request.into_inner();
+
+        // Ensure the cluster exists — returns NotFound otherwise.
+        self.db
+            .get_cluster(&req.cluster_id)
+            .await
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        // Tear down every VM in the cluster first, then release the VIP,
+        // then remove the row.
+        let vms = self
+            .db
+            .list_vms(Some(&req.cluster_id))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        for vm in &vms {
+            self.teardown_vm(vm).await?;
+        }
+
+        let _ = self
+            .db
+            .release_ips(IpOwner::ClusterVip(&req.cluster_id))
+            .await;
+        self.db
+            .delete_cluster(&req.cluster_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(DeleteClusterResponse {}))
+    }
+
+    async fn get_cluster(
+        &self,
+        request: Request<GetClusterRequest>,
+    ) -> Result<Response<Cluster>, Status> {
+        require_capi_caller(&request)?;
+        let req = request.into_inner();
+        let cluster = self
+            .db
+            .get_cluster(&req.cluster_id)
+            .await
+            .map_err(|e| Status::not_found(e.to_string()))?;
+        Ok(Response::new(Cluster {
+            cluster_id: cluster.id,
+            name: cluster.name,
+            ip_pool: cluster.ip_pool,
+            control_plane_endpoint: cluster.control_plane_endpoint,
+        }))
+    }
+
     async fn create_machine(
         &self,
         request: Request<CreateMachineRequest>,
     ) -> Result<Response<CreateMachineResponse>, Status> {
+        require_capi_caller(&request)?;
         let req = request.into_inner();
+
+        let cluster = self
+            .db
+            .get_cluster(&req.cluster_id)
+            .await
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
         let vm_id = uuid::Uuid::new_v4().to_string();
         let now = now_rfc3339();
 
-        // Schedule: pick a host
-        let hosts = self
-            .db
-            .list_healthy_hosts()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let (host_id, gpu_devices) = self.pick_host(&req).await?;
 
-        // Build map of GPU assignments per host from existing VMs
-        let mut assigned_gpus: HashMap<String, Vec<String>> = HashMap::new();
-        for host in &hosts {
-            let vms = self
-                .db
-                .list_vms_on_host(&host.id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let mut gpus = Vec::new();
-            for vm in &vms {
-                let gpu_devs: Vec<GpuInfo> =
-                    serde_json::from_str(&vm.gpu_assignments).unwrap_or_default();
-                gpus.extend(gpu_devs.into_iter().map(|g| g.pci_address));
-            }
-            assigned_gpus.insert(host.id.clone(), gpus);
-        }
-
-        let sched_req = ScheduleRequest::from(&req);
-        let (host_id, gpu_devices) =
-            scheduler::schedule(&hosts, &assigned_gpus, &sched_req)
-                .map_err(|e| Status::resource_exhausted(e.to_string()))?;
-
-        // Allocate IP
-        let pool_name = if req.ip_pool.is_empty() {
-            "default"
-        } else {
-            &req.ip_pool
-        };
         let ip_address = self
             .db
-            .allocate_ip(pool_name, &vm_id)
+            .allocate_ip(&cluster.ip_pool, IpOwner::Vm(&vm_id))
             .await
             .map_err(|e| Status::resource_exhausted(e.to_string()))?;
 
         let ip_pool = self
             .db
-            .get_ip_pool(pool_name)
+            .get_ip_pool(&cluster.ip_pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Parse CIDR to get prefix length
         let prefix_len = ip_pool
             .cidr
             .split('/')
@@ -208,12 +316,11 @@ impl basis_server::Basis for BasisApiService {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(24);
 
-        // Insert VM record
         let gpu_json = serde_json::to_string(&gpu_devices).unwrap_or_else(|_| "[]".to_string());
         let vm = VmRow {
             id: vm_id.clone(),
             name: req.name.clone(),
-            cluster: req.cluster.clone(),
+            cluster_id: req.cluster_id.clone(),
             host_id: host_id.clone(),
             ip_address: ip_address.clone(),
             state: MachineState::Creating as i64,
@@ -231,11 +338,9 @@ impl basis_server::Basis for BasisApiService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Send CreateVM command to the agent
-        let agent = self
-            .agents
-            .get(&host_id)
-            .ok_or_else(|| Status::unavailable(format!("agent for host '{host_id}' not connected")))?;
+        let agent = self.agents.get(&host_id).ok_or_else(|| {
+            Status::unavailable(format!("agent for host '{host_id}' not connected"))
+        })?;
 
         let (wait_tx, wait_rx) = oneshot::channel();
         self.pending_creates
@@ -261,22 +366,13 @@ impl basis_server::Basis for BasisApiService {
             })),
         };
 
-        agent
-            .command_tx
-            .send(cmd)
-            .await
-            .map_err(|_| {
-                // Agent disconnected before we could send — clean up
-                self.pending_creates.remove(&vm_id);
-                Status::unavailable("agent stream closed")
-            })?;
+        agent.command_tx.send(cmd).await.map_err(|_| {
+            self.pending_creates.remove(&vm_id);
+            Status::unavailable("agent stream closed")
+        })?;
 
-        // Wait for agent to report VM running (or timeout)
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), wait_rx).await;
-
-        match result {
+        match tokio::time::timeout(CREATE_MACHINE_TIMEOUT, wait_rx).await {
             Ok(Ok(Ok(()))) => {
-                // VM is running
                 let provider_id = format!("basis://{host_id}/{vm_id}");
                 Ok(Response::new(CreateMachineResponse {
                     id: vm_id,
@@ -286,21 +382,22 @@ impl basis_server::Basis for BasisApiService {
                 }))
             }
             Ok(Ok(Err(err))) => {
-                // Agent reported FAILED — clean up leaked resources
                 self.cleanup_failed_vm(&vm_id).await;
                 Err(Status::internal(format!("VM creation failed: {err}")))
             }
             Ok(Err(_)) => {
-                // oneshot cancelled (agent disconnected mid-create)
                 self.cleanup_failed_vm(&vm_id).await;
                 Err(Status::internal("agent disconnected during VM creation"))
             }
             Err(_) => {
-                // Timeout — leave VM record (agent may still be working) but
-                // remove the pending waiter so the agent's eventual report
-                // still updates state correctly
+                // Leave the VM record in place — the agent may still finish —
+                // but clear the waiter so the eventual report updates state
+                // rather than a dead oneshot.
                 self.pending_creates.remove(&vm_id);
-                Err(Status::deadline_exceeded("VM creation timed out (60s)"))
+                Err(Status::deadline_exceeded(format!(
+                    "VM creation timed out ({}s)",
+                    CREATE_MACHINE_TIMEOUT.as_secs()
+                )))
             }
         }
     }
@@ -309,37 +406,14 @@ impl basis_server::Basis for BasisApiService {
         &self,
         request: Request<DeleteMachineRequest>,
     ) -> Result<Response<DeleteMachineResponse>, Status> {
+        require_capi_caller(&request)?;
         let req = request.into_inner();
         let vm = self
             .db
             .get_vm(&req.id)
             .await
             .map_err(|e| Status::not_found(e.to_string()))?;
-
-        // Update state to STOPPING
-        self.db
-            .update_vm_state(&vm.id, MachineState::Stopping as i64, "", &now_rfc3339())
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        // Send delete command to agent
-        if let Some(agent) = self.agents.get(&vm.host_id) {
-            let cmd = ControllerCommand {
-                request_id: vm.id.clone(),
-                command: Some(controller_command::Command::DeleteVm(DeleteVmCommand {
-                    vm_id: vm.id.clone(),
-                })),
-            };
-            let _ = agent.command_tx.send(cmd).await;
-        }
-
-        // Release IP and delete VM record
-        let _ = self.db.release_ip(&vm.id).await;
-        self.db
-            .delete_vm(&vm.id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
+        self.teardown_vm(&vm).await?;
         Ok(Response::new(DeleteMachineResponse {}))
     }
 
@@ -347,6 +421,7 @@ impl basis_server::Basis for BasisApiService {
         &self,
         request: Request<GetMachineRequest>,
     ) -> Result<Response<Machine>, Status> {
+        require_capi_caller(&request)?;
         let req = request.into_inner();
         let vm = self
             .db
@@ -361,11 +436,12 @@ impl basis_server::Basis for BasisApiService {
         &self,
         request: Request<ListMachinesRequest>,
     ) -> Result<Response<ListMachinesResponse>, Status> {
+        require_capi_caller(&request)?;
         let req = request.into_inner();
-        let cluster = if req.cluster.is_empty() {
+        let cluster = if req.cluster_id.is_empty() {
             None
         } else {
-            Some(req.cluster.as_str())
+            Some(req.cluster_id.as_str())
         };
 
         let vms = self
@@ -377,6 +453,41 @@ impl basis_server::Basis for BasisApiService {
         Ok(Response::new(ListMachinesResponse {
             machines: vms.iter().map(vm_to_machine).collect(),
         }))
+    }
+}
+
+impl BasisApiService {
+    /// Collect hosts + current GPU assignments, run the scheduler, return the
+    /// chosen host and the set of selected GPU devices.
+    async fn pick_host(
+        &self,
+        req: &CreateMachineRequest,
+    ) -> Result<(String, Vec<GpuDevice>), Status> {
+        let hosts = self
+            .db
+            .list_healthy_hosts()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut assigned_gpus: HashMap<String, Vec<String>> = HashMap::new();
+        for host in &hosts {
+            let vms = self
+                .db
+                .list_vms_on_host(&host.id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let mut gpus = Vec::new();
+            for vm in &vms {
+                let gpu_devs: Vec<GpuInfo> =
+                    serde_json::from_str(&vm.gpu_assignments).unwrap_or_default();
+                gpus.extend(gpu_devs.into_iter().map(|g| g.pci_address));
+            }
+            assigned_gpus.insert(host.id.clone(), gpus);
+        }
+
+        let sched_req = ScheduleRequest::from(req);
+        scheduler::schedule(&hosts, &assigned_gpus, &sched_req)
+            .map_err(|e| Status::resource_exhausted(e.to_string()))
     }
 }
 
@@ -397,6 +508,9 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
         &self,
         request: Request<Streaming<AgentMessage>>,
     ) -> Result<Response<Self::StreamMessagesStream>, Status> {
+        // Capture the peer CN before consuming the request.
+        let peer_cn = peer_cn(&request)?;
+
         let mut inbound = request.into_inner();
 
         // First message must be a RegisterHost
@@ -410,6 +524,14 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
             Some(agent_message::Payload::Register(r)) => r,
             _ => return Err(Status::invalid_argument("first message must be RegisterHost")),
         };
+
+        // Agent's cert CN must match the hostname it's registering as.
+        if peer_cn != register.hostname {
+            return Err(Status::permission_denied(format!(
+                "agent CN '{peer_cn}' does not match registered hostname '{}'",
+                register.hostname
+            )));
+        }
 
         // Check if host already registered
         let host_id = match self.db.get_host_by_hostname(&register.hostname).await {
@@ -450,13 +572,24 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
         // Set up command channel
         let (command_tx, command_rx) = mpsc::channel::<ControllerCommand>(32);
 
-        // Send registration ack so the agent knows its controller-assigned host_id
+        // Authoritative VM list for this host — agent uses this to drop any
+        // local VMs the controller has forgotten.
+        let expected_vm_ids: Vec<String> = self
+            .db
+            .list_vms_on_host(&host_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(|vm| vm.id)
+            .collect();
+
         command_tx
             .send(ControllerCommand {
                 request_id: String::new(),
                 command: Some(controller_command::Command::RegisterAck(
                     RegisterHostResponse {
                         host_id: host_id.clone(),
+                        expected_vm_ids,
                     },
                 )),
             })
@@ -561,7 +694,7 @@ fn vm_to_machine(vm: &VmRow) -> Machine {
     Machine {
         id: vm.id.clone(),
         name: vm.name.clone(),
-        cluster: vm.cluster.clone(),
+        cluster_id: vm.cluster_id.clone(),
         host: vm.host_id.clone(),
         provider_id: format!("basis://{}/{}", vm.host_id, vm.id),
         ip_address: vm.ip_address.clone(),
