@@ -4,6 +4,7 @@
 //! protobuf types, or TLS details. Responses are unwrapped into simple
 //! structs so the reconcilers work with Rust types, not tonic envelopes.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,10 +12,11 @@ use std::time::Duration;
 use basis_common::tls::TlsConfig;
 use basis_proto::{
     basis_client::BasisClient as InnerClient, CreateClusterRequest, CreateMachineRequest,
-    DeleteClusterRequest, DeleteMachineRequest, GetClusterRequest, GpuConstraints,
+    DeleteClusterRequest, DeleteMachineRequest, GpuConstraints,
 };
 use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Response};
 
 const CONTROLLER_SAN: &str = "basis-controller";
 
@@ -31,6 +33,9 @@ pub enum ClientError {
 
     #[error("controller RPC failed: {0}")]
     Rpc(#[from] tonic::Status),
+
+    #[error("controller returned malformed response: {0}")]
+    Malformed(&'static str),
 }
 
 /// A cluster as the capi-provider cares about it — just the two fields
@@ -63,7 +68,7 @@ impl BasisClient {
         }
     }
 
-    async fn client(&self) -> Result<InnerClient<Channel>, ClientError> {
+    async fn connected_client(&self) -> Result<InnerClient<Channel>, ClientError> {
         let mut guard = self.channel.lock().await;
         if guard.is_none() {
             let tls = self.tls.client_config(CONTROLLER_SAN)?;
@@ -78,16 +83,41 @@ impl BasisClient {
         Ok(InnerClient::new(guard.as_ref().unwrap().clone()))
     }
 
+    /// Issue one RPC against the controller. Handles channel reuse,
+    /// unwraps the response, and drops the cached channel on errors
+    /// that suggest the underlying transport is dead — without this,
+    /// a channel that half-closes (controller restart, NAT timeout)
+    /// would fail every subsequent call forever.
+    async fn call<F, Fut, T>(&self, f: F) -> Result<T, ClientError>
+    where
+        F: FnOnce(InnerClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<Response<T>, tonic::Status>>,
+    {
+        let client = self.connected_client().await?;
+        match f(client).await {
+            Ok(resp) => Ok(resp.into_inner()),
+            Err(status) => {
+                if matches!(
+                    status.code(),
+                    Code::Unavailable | Code::Unknown | Code::DeadlineExceeded
+                ) {
+                    *self.channel.lock().await = None;
+                }
+                Err(status.into())
+            }
+        }
+    }
+
     pub async fn create_cluster(
         &self,
         name: String,
         ip_pool: String,
     ) -> Result<Cluster, ClientError> {
-        let mut client = self.client().await?;
-        let resp = client
-            .create_cluster(CreateClusterRequest { name, ip_pool })
-            .await?
-            .into_inner();
+        let resp = self
+            .call(|mut c| async move {
+                c.create_cluster(CreateClusterRequest { name, ip_pool }).await
+            })
+            .await?;
         Ok(Cluster {
             cluster_id: resp.cluster_id,
             control_plane_endpoint: resp.control_plane_endpoint,
@@ -95,23 +125,11 @@ impl BasisClient {
     }
 
     pub async fn delete_cluster(&self, cluster_id: String) -> Result<(), ClientError> {
-        let mut client = self.client().await?;
-        client
-            .delete_cluster(DeleteClusterRequest { cluster_id })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn get_cluster(&self, cluster_id: String) -> Result<Cluster, ClientError> {
-        let mut client = self.client().await?;
-        let resp = client
-            .get_cluster(GetClusterRequest { cluster_id })
-            .await?
-            .into_inner();
-        Ok(Cluster {
-            cluster_id: resp.cluster_id,
-            control_plane_endpoint: resp.control_plane_endpoint,
+        self.call(|mut c| async move {
+            c.delete_cluster(DeleteClusterRequest { cluster_id }).await
         })
+        .await?;
+        Ok(())
     }
 
     pub async fn create_machine(
@@ -134,8 +152,23 @@ impl BasisClient {
                 min_group_size: c.min_group_size,
             }),
         };
-        let mut client = self.client().await?;
-        let resp = client.create_machine(request).await?.into_inner();
+        let resp = self
+            .call(|mut c| async move { c.create_machine(request).await })
+            .await?;
+        // Server-side CreateMachine guarantees these fields are populated
+        // on success. Guard the boundary so an empty value never reaches
+        // the reconciler — an empty IP would otherwise be patched into
+        // `BasisMachine.status.addresses`, which the Kubernetes API
+        // rejects as `status.addresses[0].address: Required value`.
+        if resp.id.is_empty() {
+            return Err(ClientError::Malformed("CreateMachine returned empty id"));
+        }
+        if resp.provider_id.is_empty() {
+            return Err(ClientError::Malformed("CreateMachine returned empty provider_id"));
+        }
+        if resp.ip_address.is_empty() {
+            return Err(ClientError::Malformed("CreateMachine returned empty ip_address"));
+        }
         Ok(CreatedMachine {
             id: resp.id,
             provider_id: resp.provider_id,
@@ -144,8 +177,8 @@ impl BasisClient {
     }
 
     pub async fn delete_machine(&self, id: String) -> Result<(), ClientError> {
-        let mut client = self.client().await?;
-        client.delete_machine(DeleteMachineRequest { id }).await?;
+        self.call(|mut c| async move { c.delete_machine(DeleteMachineRequest { id }).await })
+            .await?;
         Ok(())
     }
 }

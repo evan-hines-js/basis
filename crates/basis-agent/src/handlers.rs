@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use basis_common::json::parse_owned_json;
 use basis_common::time::now_rfc3339;
 use basis_proto::{
     agent_message, AgentMessage, CreateVmCommand, MachineState, ReportVmStateRequest,
@@ -18,7 +19,7 @@ use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
 use crate::image::ImageManager;
 use crate::network::NetworkManager;
-use crate::vm::VmManager;
+use crate::vm::{unit_name_for_vm, VmManager};
 
 /// Prepare disk, network, GPU passthrough, and spawn cloud-hypervisor.
 ///
@@ -69,13 +70,13 @@ pub async fn create_vm(
         .insert_vm(&LocalVmRow {
             vm_id: cmd.vm_id.clone(),
             name: cmd.name.clone(),
-            unit_name: format!("basis-vm-{}.scope", cmd.vm_id),
+            unit_name: unit_name_for_vm(&cmd.vm_id),
             ip_address: cmd.ip_address.clone(),
             cpu: cmd.cpu as i64,
             memory_mib: cmd.memory_mib as i64,
             disk_gib: cmd.disk_gib as i64,
             gpu_pci_addresses: serde_json::to_string(&cmd.gpu_pci_addresses)
-                .unwrap_or_else(|_| "[]".to_string()),
+                .expect("serializing Vec<String> to JSON is infallible"),
             image: cmd.image.clone(),
             created_at: now_rfc3339(),
         })
@@ -96,7 +97,7 @@ pub async fn delete_vm(
 ) {
     if let Ok(Some(record)) = agent_db.get_vm(vm_id).await {
         let addrs: Vec<String> =
-            serde_json::from_str(&record.gpu_pci_addresses).unwrap_or_default();
+            parse_owned_json(&record.gpu_pci_addresses, "local_vms.gpu_pci_addresses");
         for addr in &addrs {
             if let Err(e) = gpu::unbind_vfio(addr).await {
                 warn!(vm_id, pci = %addr, error = %e, "failed to unbind GPU");
@@ -140,58 +141,6 @@ pub async fn reconcile_against_expected(
         }
     }
     Ok(())
-}
-
-/// Current capacity snapshot for the local host.
-///
-/// Derived from the static [`crate::host_info::HostResources`] total minus
-/// the sum of every locally-tracked VM's allocation. The agent is the
-/// source of truth — the controller reads this via heartbeats the same way
-/// kubelet reports node status.
-pub struct Capacity {
-    pub available_cpu: u32,
-    pub available_memory_mib: u64,
-    pub available_disk_gib: u64,
-    /// PCI addresses of GPUs currently bound to a VM on this host.
-    pub assigned_gpus: Vec<String>,
-}
-
-pub async fn compute_capacity(
-    agent_db: &AgentDb,
-    total_cpu: u32,
-    total_memory_mib: u64,
-    total_disk_gib: u64,
-) -> anyhow::Result<Capacity> {
-    let vms = agent_db.list_vms().await?;
-
-    let (used_cpu, used_mem, used_disk) = vms
-        .iter()
-        .fold((0u64, 0u64, 0u64), |(c, m, d), vm| {
-            (
-                c + vm.cpu.max(0) as u64,
-                m + vm.memory_mib.max(0) as u64,
-                d + vm.disk_gib.max(0) as u64,
-            )
-        });
-
-    let mut assigned_gpus = Vec::new();
-    for vm in &vms {
-        let addrs: Vec<String> =
-            serde_json::from_str(&vm.gpu_pci_addresses).unwrap_or_default();
-        assigned_gpus.extend(addrs);
-    }
-
-    Ok(Capacity {
-        available_cpu: saturating_sub_u32(total_cpu, used_cpu),
-        available_memory_mib: total_memory_mib.saturating_sub(used_mem),
-        available_disk_gib: total_disk_gib.saturating_sub(used_disk),
-        assigned_gpus,
-    })
-}
-
-fn saturating_sub_u32(total: u32, used: u64) -> u32 {
-    let total = total as u64;
-    total.saturating_sub(used).min(u32::MAX as u64) as u32
 }
 
 /// Re-verify that every locally-tracked VM is still running. Any VM the
@@ -239,7 +188,9 @@ pub async fn send_vm_state(
             error_message,
         })),
     };
-    let _ = sender.send(msg).await;
+    if let Err(e) = sender.send(msg).await {
+        warn!(error = %e, "dropped VM state report; controller stream is closed");
+    }
 }
 
 /// Report the state of every locally-known VM to the controller. A VM the
@@ -272,7 +223,7 @@ mod tests {
         LocalVmRow {
             vm_id: id.to_string(),
             name: format!("vm-{id}"),
-            unit_name: format!("basis-vm-{id}.scope"),
+            unit_name: unit_name_for_vm(id),
             ip_address: "10.0.10.42".to_string(),
             cpu: 2,
             memory_mib: 4096,
@@ -281,60 +232,6 @@ mod tests {
             image: "img".to_string(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }
-    }
-
-    fn vm_with_gpus(id: &str, gpus: &[&str]) -> LocalVmRow {
-        let mut vm = fake_vm(id);
-        vm.gpu_pci_addresses = serde_json::to_string(gpus).unwrap();
-        vm
-    }
-
-    #[tokio::test]
-    async fn compute_capacity_empty() {
-        let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
-        let c = compute_capacity(&db, 16, 65536, 1000).await.unwrap();
-        assert_eq!(c.available_cpu, 16);
-        assert_eq!(c.available_memory_mib, 65536);
-        assert_eq!(c.available_disk_gib, 1000);
-        assert!(c.assigned_gpus.is_empty());
-    }
-
-    #[tokio::test]
-    async fn compute_capacity_subtracts_allocations() {
-        let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
-        db.insert_vm(&fake_vm("a")).await.unwrap(); // 2 cpu, 4096 mib, 50 gib
-        db.insert_vm(&fake_vm("b")).await.unwrap(); // same
-        let c = compute_capacity(&db, 16, 65536, 1000).await.unwrap();
-        assert_eq!(c.available_cpu, 12);
-        assert_eq!(c.available_memory_mib, 65536 - 8192);
-        assert_eq!(c.available_disk_gib, 900);
-    }
-
-    #[tokio::test]
-    async fn compute_capacity_saturates_at_zero() {
-        let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
-        // Over-subscribed: VM requests more than host has. The DB might
-        // hold stale records; compute should never go negative.
-        for i in 0..10 {
-            db.insert_vm(&fake_vm(&format!("v{i}"))).await.unwrap();
-        }
-        let c = compute_capacity(&db, 4, 8192, 100).await.unwrap();
-        assert_eq!(c.available_cpu, 0);
-        assert_eq!(c.available_memory_mib, 0);
-        assert_eq!(c.available_disk_gib, 0);
-    }
-
-    #[tokio::test]
-    async fn compute_capacity_collects_gpu_pci_addresses() {
-        let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
-        db.insert_vm(&vm_with_gpus("a", &["0000:41:00.0", "0000:42:00.0"]))
-            .await
-            .unwrap();
-        db.insert_vm(&vm_with_gpus("b", &["0000:81:00.0"])).await.unwrap();
-        let c = compute_capacity(&db, 32, 131072, 2000).await.unwrap();
-        assert_eq!(c.assigned_gpus.len(), 3);
-        assert!(c.assigned_gpus.contains(&"0000:41:00.0".to_string()));
-        assert!(c.assigned_gpus.contains(&"0000:81:00.0".to_string()));
     }
 
     /// `reconcile_against_expected` deletes everything the controller has

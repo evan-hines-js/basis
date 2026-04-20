@@ -1,13 +1,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::{routing::get, Router};
 use basis_capi_provider::basis_client::BasisClient;
 use basis_capi_provider::crds::{BasisCluster, BasisMachine, BasisMachineTemplate};
 use basis_capi_provider::{cluster, machine};
 use clap::Parser;
 use kube::{Client, CustomResourceExt};
+use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+const HEALTH_ADDR: &str = "0.0.0.0:9443";
 
 #[derive(Parser)]
 #[command(name = "basis-capi-provider", about = "CAPI infrastructure provider for Basis")]
@@ -48,7 +52,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .expect("failed to install rustls crypto provider");
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("basis=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("basis=info".parse().expect("static directive string")),
+        )
         .init();
 
     let controller_endpoint = cli.controller_endpoint.expect("required by clap");
@@ -69,8 +76,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let cluster_task = tokio::spawn(cluster::run(kube.clone(), basis.clone()));
     let machine_task = tokio::spawn(machine::run(kube.clone(), basis.clone()));
+    let health_task = tokio::spawn(serve_health());
 
-    tokio::try_join!(flatten(cluster_task), flatten(machine_task))?;
+    tokio::try_join!(
+        flatten(cluster_task),
+        flatten(machine_task),
+        flatten(health_task),
+    )?;
+    Ok(())
+}
+
+async fn serve_health() -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(|| async { "ok" }));
+    let listener = TcpListener::bind(HEALTH_ADDR).await?;
+    info!(addr = HEALTH_ADDR, "health server listening");
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

@@ -71,8 +71,15 @@ tower = { version = "0.5", features = ["util", "limit"] }
 humantime = "2"
 hostname = "0.4"
 
+# Metrics
+prometheus = "0.13"
+axum = "0.7"
+
 # TLS peer cert parsing
 x509-parser = "0.18"
+
+# OCI registry client (basis-agent pulls VM disk images as OCI artifacts)
+oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"] }
 
 # Test-only: self-signed cert generation
 rcgen = "0.13"

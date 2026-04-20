@@ -62,26 +62,40 @@ impl VmManager {
         let socket_path = vm_dir.join("cloud-hypervisor.sock");
         let unit_name = unit_name_for_vm(&cmd.vm_id);
 
+        // Cloud-hypervisor takes multiple values for `--disk` as
+        // space-separated arguments after a single flag — NOT as repeated
+        // `--disk` flags. Same shape for `--device` below.
         let mut ch_args = vec![
             format!("--api-socket={}", socket_path.to_string_lossy()),
             format!("--cpus=boot={}", cmd.cpu),
             format!("--memory=size={}M", cmd.memory_mib),
             format!("--firmware={}", self.firmware_path.to_string_lossy()),
-            format!("--disk=path={}", disk_path.to_string_lossy()),
-            format!("--disk=path={}", cloud_init_path.to_string_lossy()),
             format!("--net=tap={tap_name},mac={}", generate_mac(&cmd.vm_id)),
             "--serial=tty".to_string(),
             "--console=off".to_string(),
+            "--disk".to_string(),
+            format!("path={}", disk_path.to_string_lossy()),
+            format!("path={}", cloud_init_path.to_string_lossy()),
         ];
 
-        for device_path in vfio_devices {
-            ch_args.push(format!("--device=path={device_path}"));
+        if !vfio_devices.is_empty() {
+            ch_args.push("--device".to_string());
+            for device_path in vfio_devices {
+                ch_args.push(format!("path={device_path}"));
+            }
         }
 
-        // Build systemd-run command
+        // Run as a transient *service*, not a scope. `--scope` would block
+        // here until cloud-hypervisor exits (it attaches the process to
+        // the caller's session). A service forks the VM under systemd's
+        // supervision, systemd-run returns immediately, and the VM keeps
+        // running if the agent restarts. `--remain-after-exit` keeps the
+        // unit visible in `systemctl` after cloud-hypervisor exits so we
+        // can read its journal and exit status — essential for debugging
+        // a VM that crashed at boot.
         let mut args = vec![
-            "--scope".to_string(),
             format!("--unit={unit_name}"),
+            "--service-type=exec".to_string(),
             "--remain-after-exit".to_string(),
             format!("--description=Basis VM {}", cmd.vm_id),
             "--".to_string(),
@@ -164,7 +178,7 @@ impl VmManager {
         let output = Command::new("systemctl")
             .args([
                 "list-units",
-                "--type=scope",
+                "--type=service",
                 "--state=running",
                 "--no-legend",
                 "--plain",
@@ -180,7 +194,7 @@ impl VmManager {
             let unit = line.split_whitespace().next().unwrap_or("");
             if let Some(vm_id) = unit
                 .strip_prefix("basis-vm-")
-                .and_then(|s| s.strip_suffix(".scope"))
+                .and_then(|s| s.strip_suffix(".service"))
             {
                 running_vm_ids.push(vm_id.to_string());
 
@@ -234,8 +248,10 @@ async fn shutdown_via_api(socket_path: &Path) -> Result<(), VmError> {
     Ok(())
 }
 
-fn unit_name_for_vm(vm_id: &str) -> String {
-    format!("basis-vm-{vm_id}.scope")
+/// Transient systemd unit name for a VM. Services (not scopes) — see the
+/// comment in `create_vm`.
+pub fn unit_name_for_vm(vm_id: &str) -> String {
+    format!("basis-vm-{vm_id}.service")
 }
 
 /// Generate a deterministic MAC address from a VM ID.
@@ -292,6 +308,6 @@ mod tests {
     #[test]
     fn test_unit_name_format() {
         let name = unit_name_for_vm("abc-123");
-        assert_eq!(name, "basis-vm-abc-123.scope");
+        assert_eq!(name, "basis-vm-abc-123.service");
     }
 }

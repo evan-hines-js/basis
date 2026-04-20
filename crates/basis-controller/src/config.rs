@@ -27,11 +27,27 @@ pub type BasisController = Resource<BasisControllerSpec>;
 pub struct BasisControllerSpec {
     /// `host:port` the gRPC server binds to.
     pub listen: String,
+    /// `host:port` the plain-HTTP metrics server binds to.
+    #[serde(default = "default_metrics_listen")]
+    pub metrics_listen: String,
     /// Persistent state directory (holds `controller.db`).
     pub data_dir: PathBuf,
     pub tls: TlsConfig,
     #[serde(default)]
     pub ip_pools: Vec<IpPool>,
+    /// Resolvers the agent bakes into each VM's cloud-init network config.
+    /// Defaults to public Google DNS so a stock deployment boots; override
+    /// in any environment without outbound 8.8.8.8 reachability.
+    #[serde(default = "default_dns_servers")]
+    pub dns_servers: Vec<String>,
+}
+
+fn default_metrics_listen() -> String {
+    "0.0.0.0:9443".to_string()
+}
+
+fn default_dns_servers() -> Vec<String> {
+    vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

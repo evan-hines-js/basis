@@ -13,6 +13,7 @@ use basis_agent::reconcile;
 use basis_agent::vm::VmManager;
 use basis_common::gpu::GpuInfo;
 use basis_proto::*;
+use anyhow::Context;
 use clap::Parser;
 use futures::StreamExt;
 use tokio::signal::unix::{signal, SignalKind};
@@ -60,7 +61,10 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to install rustls crypto provider");
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("basis=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("basis=info".parse().expect("static directive string")),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -106,7 +110,21 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     );
     net_mgr.ensure_bridge().await?;
 
-    let image_mgr = Arc::new(ImageManager::new(spec.images_dir()));
+    let image_mgr = Arc::new(ImageManager::with_auth(
+        spec.images_dir(),
+        spec.registries
+            .iter()
+            .map(|r| {
+                (
+                    r.host.clone(),
+                    oci_client::secrets::RegistryAuth::Basic(
+                        r.username.clone(),
+                        r.password.clone(),
+                    ),
+                )
+            })
+            .collect(),
+    ));
     let vm_mgr = Arc::new(Mutex::new(VmManager::new(
         spec.vms_dir(),
         spec.firmware_path.clone(),
@@ -125,7 +143,13 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     );
 
     let host_resources = HostResources::discover(&spec.data_dir);
-    let gpus = gpu::discover_gpus().await.unwrap_or_default();
+    // Fail loudly on GPU discovery errors. On a GPU host, silently
+    // registering with 0 GPUs means the scheduler packs CPU workloads
+    // onto it and customers never see their GPUs — the exact failure
+    // mode a GPU cloud can't have.
+    let gpus = gpu::discover_gpus()
+        .await
+        .context("discovering GPUs (set RUST_LOG=basis=debug for driver details)")?;
     info!(
         hostname = %hostname,
         cpu = host_resources.total_cpu,
@@ -194,6 +218,9 @@ async fn reload_config(
     if new_spec.tls != rt.spec.tls {
         warn!("spec.tls change ignored — restart required");
     }
+    if new_spec.registries != rt.spec.registries {
+        warn!("spec.registries change ignored — restart required (image pull auth is cached)");
+    }
 
     if new_spec.controller_endpoint != rt.spec.controller_endpoint {
         info!(
@@ -251,7 +278,7 @@ async fn run_session(
         handlers::report_local_vm_states(&rt.agent_db, &rt.vm_mgr, &msg_tx).await?;
     }
 
-    spawn_heartbeat_loop(msg_tx.clone(), host_id.clone(), runtime.clone());
+    spawn_heartbeat_loop(msg_tx.clone(), host_id.clone());
     spawn_periodic_reconciler(msg_tx.clone(), runtime.clone());
 
     process_inbound(&mut inbound, runtime, msg_tx, reconnect).await
@@ -318,39 +345,14 @@ async fn handshake(
     Ok(ack.host_id)
 }
 
-fn spawn_heartbeat_loop(
-    sender: mpsc::Sender<AgentMessage>,
-    host_id: String,
-    runtime: Arc<tokio::sync::RwLock<AgentRuntime>>,
-) {
+fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>, host_id: String) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
-            let capacity = {
-                let rt = runtime.read().await;
-                handlers::compute_capacity(
-                    &rt.agent_db,
-                    rt.host_resources.total_cpu,
-                    rt.host_resources.total_memory_mib,
-                    rt.host_resources.total_disk_gib,
-                )
-                .await
-            };
-            let capacity = match capacity {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "failed to compute capacity for heartbeat");
-                    continue;
-                }
-            };
             let msg = AgentMessage {
                 payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
                     host_id: host_id.clone(),
-                    available_cpu: capacity.available_cpu,
-                    available_memory_mib: capacity.available_memory_mib,
-                    available_disk_gib: capacity.available_disk_gib,
-                    assigned_gpus: capacity.assigned_gpus,
                 })),
             };
             if sender.send(msg).await.is_err() {
@@ -406,10 +408,24 @@ async fn process_inbound(
                         warn!("unexpected duplicate registration ack, ignoring");
                     }
                     Some(controller_command::Command::CreateVm(create)) => {
+                        info!(
+                            vm_id = %create.vm_id,
+                            name = %create.name,
+                            image = %create.image,
+                            cpu = create.cpu,
+                            memory_mib = create.memory_mib,
+                            disk_gib = create.disk_gib,
+                            gpus = create.gpu_pci_addresses.len(),
+                            "received CreateVm"
+                        );
                         spawn_create(create, rt_snapshot, sender.clone());
                     }
                     Some(controller_command::Command::DeleteVm(delete)) => {
+                        info!(vm_id = %delete.vm_id, "received DeleteVm");
                         spawn_delete(delete, rt_snapshot, sender.clone());
+                    }
+                    Some(controller_command::Command::ReconcileHost(reconcile)) => {
+                        spawn_reconcile(reconcile, rt_snapshot);
                     }
                     None => {}
                 }
@@ -444,6 +460,26 @@ fn spawn_delete(cmd: DeleteVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
     tokio::spawn(async move {
         handlers::delete_vm(&cmd.vm_id, &rt.vm_mgr, rt.net_mgr.as_ref(), &rt.agent_db).await;
         handlers::send_vm_state(&sender, cmd.vm_id, MachineState::Stopped, String::new()).await;
+    });
+}
+
+/// Apply a controller-pushed authoritative VM list. Same contract as the
+/// initial list from `RegisterHostResponse` — locally-known VMs absent
+/// from the list have been forgotten by the controller and must be torn
+/// down. Delegated to the same handler so behavior is identical whether
+/// the trigger was registration or the periodic push.
+fn spawn_reconcile(cmd: ReconcileHostCommand, rt: TaskContext) {
+    tokio::spawn(async move {
+        if let Err(e) = handlers::reconcile_against_expected(
+            &cmd.expected_vm_ids,
+            &rt.vm_mgr,
+            rt.net_mgr.as_ref(),
+            &rt.agent_db,
+        )
+        .await
+        {
+            warn!(error = %e, "controller-driven reconcile failed");
+        }
     });
 }
 

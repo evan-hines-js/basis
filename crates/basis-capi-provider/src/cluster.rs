@@ -1,23 +1,23 @@
 //! `BasisCluster` reconciler.
 //!
-//! Create flow:
-//!   1. Call `Basis.CreateCluster(name, ipPool)` → get cluster_id + VIP
-//!   2. Write `status.basisClusterId` and `spec.controlPlaneEndpoint`
-//!   3. Mark provisioned + ready
+//! Create flow is driven by two idempotency primitives:
+//!   - `Basis.CreateCluster` is idempotent by name server-side (see
+//!     basis-controller/src/server.rs). Calling it twice with the same
+//!     `(name, ip_pool)` returns the same `(cluster_id, endpoint)`.
+//!   - Every reconcile rewrites `spec.controlPlaneEndpoint` and the
+//!     `status` fields as merge patches. Writing identical values is a
+//!     no-op on the API server, so repeated reconciles converge without
+//!     diverging the resource.
 //!
 //! Delete flow:
 //!   1. Call `Basis.DeleteCluster(cluster_id)` (cascades VM deletes + releases VIP)
 //!   2. Remove finalizer
-//!
-//! Idempotent: if `status.basisClusterId` is already set, we only refresh
-//! the Ready condition.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use basis_common::time::now_rfc3339;
 use futures::StreamExt;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::Api;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{finalizer, Event};
 use kube::runtime::watcher;
@@ -26,7 +26,9 @@ use serde_json::json;
 use tracing::{error, info, warn};
 
 use crate::basis_client::BasisClient;
-use crate::crds::{BasisCluster, Condition, ControlPlaneEndpoint, DEFAULT_CONTROL_PLANE_PORT};
+use crate::conditions;
+use crate::crds::{BasisCluster, ControlPlaneEndpoint, DEFAULT_CONTROL_PLANE_PORT};
+use crate::reconcile_util::{merge_spec, merge_status, namespace_of};
 
 const FINALIZER: &str = "basiscluster.infrastructure.cluster.x-k8s.io/finalizer";
 
@@ -60,18 +62,18 @@ pub async fn run(client: Client, basis: Arc<BasisClient>) -> anyhow::Result<()> 
             }
         })
         .await;
-    Ok(())
+    // The watch stream terminated — kube-runtime only returns from
+    // for_each when the apiserver connection is irrecoverable. Surface
+    // this as an error so the process exits and gets restarted by
+    // Kubernetes rather than silently continuing with a dead watcher.
+    Err(anyhow::anyhow!("BasisCluster watch stream terminated"))
 }
 
 async fn reconcile(
     cluster: Arc<BasisCluster>,
     ctx: Arc<ClusterContext>,
 ) -> Result<Action, ClusterError> {
-    let namespace = cluster
-        .metadata
-        .namespace
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+    let namespace = namespace_of(cluster.as_ref());
     let api: Api<BasisCluster> = Api::namespaced(ctx.client.clone(), &namespace);
 
     finalizer(&api, FINALIZER, cluster, |event| async {
@@ -89,58 +91,60 @@ async fn apply(
     ctx: Arc<ClusterContext>,
 ) -> Result<Action, ClusterError> {
     let name = cluster.name_any();
-    let namespace = cluster
-        .metadata
-        .namespace
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
-    let api: Api<BasisCluster> = Api::namespaced(ctx.client.clone(), &namespace);
+    let api: Api<BasisCluster> = Api::namespaced(ctx.client.clone(), &namespace_of(cluster.as_ref()));
+    let generation = cluster.metadata.generation;
 
-    // Idempotency: once provisioned, we're done.
-    let already_provisioned = cluster
-        .status
-        .as_ref()
-        .and_then(|s| s.basis_cluster_id.as_ref())
-        .is_some();
-    if already_provisioned {
-        return Ok(Action::requeue(Duration::from_secs(300)));
-    }
-
+    // Server-side CreateCluster is idempotent by name — calling it again
+    // with the same (name, ip_pool) returns the existing cluster_id and
+    // endpoint. That lets us issue the RPC on every reconcile without
+    // worrying about duplicates, which is how we recover from partial
+    // writes below.
     info!(cluster = %name, ip_pool = %cluster.spec.ip_pool, "calling Basis.CreateCluster");
     let created = ctx
         .basis
         .create_cluster(name.clone(), cluster.spec.ip_pool.clone())
         .await?;
 
-    // Patch status + spec. spec carries controlPlaneEndpoint because
-    // KubeadmControlPlane reads it from there.
-    let spec_patch = json!({
-        "spec": {
-            "controlPlaneEndpoint": ControlPlaneEndpoint {
-                host: created.control_plane_endpoint.clone(),
-                port: DEFAULT_CONTROL_PLANE_PORT,
-            }
-        }
-    });
-    api.patch(&name, &PatchParams::default(), &Patch::Merge(&spec_patch))
-        .await?;
+    // Write status FIRST — `basisClusterId` is the durable marker that a
+    // basis-side cluster exists under this name. If the spec patch below
+    // fails, the next reconcile still calls CreateCluster (idempotent)
+    // and reaches the spec write again.
+    let mut conditions = cluster
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    conditions::upsert(&mut conditions, conditions::ready_true("Provisioned", generation));
 
-    let status_patch = json!({
-        "status": {
-            "basisClusterId": created.cluster_id,
-            "ready": true,
-            "initialization": { "provisioned": true },
-            "conditions": [Condition {
-                kind: "Ready".to_string(),
-                status: "True".to_string(),
-                reason: Some("Provisioned".to_string()),
-                message: None,
-                last_transition_time: now_rfc3339(),
-            }],
-        }
-    });
-    api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&status_patch))
-        .await?;
+    merge_status(
+        &api,
+        &name,
+        &json!({
+            "status": {
+                "basisClusterId": created.cluster_id,
+                "ready": true,
+                "initialization": { "provisioned": true },
+                "conditions": conditions,
+            }
+        }),
+    )
+    .await?;
+
+    // Spec carries controlPlaneEndpoint because KubeadmControlPlane reads
+    // it from there.
+    merge_spec(
+        &api,
+        &name,
+        &json!({
+            "spec": {
+                "controlPlaneEndpoint": ControlPlaneEndpoint {
+                    host: created.control_plane_endpoint.clone(),
+                    port: DEFAULT_CONTROL_PLANE_PORT,
+                }
+            }
+        }),
+    )
+    .await?;
 
     Ok(Action::requeue(Duration::from_secs(300)))
 }

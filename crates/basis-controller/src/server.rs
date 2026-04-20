@@ -13,12 +13,13 @@ use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
-use basis_common::gpu::GpuInfo;
+use basis_common::json::parse_owned_json;
 use basis_common::time::now_rfc3339;
 use basis_common::tls;
 
 use crate::db::{ClusterRow, Db, IpOwner, VmRow};
-use crate::scheduler::{self, ScheduleRequest};
+use crate::metrics::Metrics;
+use crate::scheduler::{self, ScheduleRequest, SchedulerError};
 
 /// Fixed CN required for connections from the CAPI provider.
 pub const CAPI_PROVIDER_CN: &str = "basis-capi-provider";
@@ -61,17 +62,36 @@ struct ConnectedAgent {
 
 pub struct BasisServer {
     db: Db,
+    metrics: Arc<Metrics>,
+    dns_servers: Arc<Vec<String>>,
+    reconcile_interval: std::time::Duration,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_creates: Arc<DashMap<String, PendingCreate>>,
 }
 
+/// How often the controller pushes `ReconcileHostCommand` to each
+/// connected agent. Matches the agent's own periodic local-reconcile
+/// cadence so drift is converged on within one minute.
+const DEFAULT_AGENT_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl BasisServer {
-    pub fn new(db: Db) -> Self {
+    pub fn new(db: Db, metrics: Arc<Metrics>, dns_servers: Vec<String>) -> Self {
         Self {
             db,
+            metrics,
+            dns_servers: Arc::new(dns_servers),
+            reconcile_interval: DEFAULT_AGENT_RECONCILE_INTERVAL,
             agents: Arc::new(DashMap::new()),
             pending_creates: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Override the controller→agent reconcile cadence. Intended for tests
+    /// that need to observe a `ReconcileHostCommand` without waiting a
+    /// minute.
+    pub fn with_reconcile_interval(mut self, interval: std::time::Duration) -> Self {
+        self.reconcile_interval = interval;
+        self
     }
 
     /// Serve on a caller-provided TCP listener with a caller-provided TLS
@@ -108,12 +128,16 @@ impl BasisServer {
     ) {
         let basis_svc = basis_server::BasisServer::new(BasisApiService {
             db: self.db.clone(),
+            metrics: self.metrics.clone(),
+            dns_servers: self.dns_servers.clone(),
             agents: self.agents.clone(),
             pending_creates: self.pending_creates.clone(),
         });
 
         let agent_svc = basis_agent_server::BasisAgentServer::new(BasisAgentService {
             db: self.db.clone(),
+            metrics: self.metrics.clone(),
+            reconcile_interval: self.reconcile_interval,
             agents: self.agents.clone(),
             pending_creates: self.pending_creates.clone(),
         });
@@ -126,6 +150,8 @@ impl BasisServer {
 
 struct BasisApiService {
     db: Db,
+    metrics: Arc<Metrics>,
+    dns_servers: Arc<Vec<String>>,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_creates: Arc<DashMap<String, PendingCreate>>,
 }
@@ -186,10 +212,33 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<CreateClusterResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
+        info!(name = %req.name, ip_pool = %req.ip_pool, "CreateCluster received");
         if req.name.is_empty() || req.ip_pool.is_empty() {
             return Err(Status::invalid_argument(
                 "name and ip_pool are required",
             ));
+        }
+
+        // Idempotent by name: CAPI reconcilers retry after partial failures
+        // (cluster created in basis but status patch never landed in k8s).
+        // Returning the existing record lets the reconciler recover on its
+        // next pass instead of spinning on AlreadyExists.
+        if let Some(existing) = self
+            .db
+            .get_cluster_by_name(&req.name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            info!(
+                cluster_id = %existing.id,
+                name = %req.name,
+                endpoint = %existing.control_plane_endpoint,
+                "CreateCluster idempotent return: cluster already exists"
+            );
+            return Ok(Response::new(CreateClusterResponse {
+                cluster_id: existing.id,
+                control_plane_endpoint: existing.control_plane_endpoint,
+            }));
         }
 
         let cluster_id = uuid::Uuid::new_v4().to_string();
@@ -210,14 +259,40 @@ impl basis_server::Basis for BasisApiService {
             created_at: now_rfc3339(),
         };
         if let Err(e) = self.db.insert_cluster(&row).await {
-            // Insert failed — roll back the VIP so we don't leak an IP.
+            // Insert failed — roll back our VIP allocation so we don't
+            // leak an IP.
             let _ = self.db.release_ips(IpOwner::ClusterVip(&cluster_id)).await;
-            return Err(match e {
-                crate::db::DbError::Conflict(msg) => Status::already_exists(msg),
-                other => Status::internal(other.to_string()),
-            });
+            return match e {
+                // Narrow race: idempotency check above passed but a
+                // concurrent CreateCluster inserted the same name
+                // first. Return the winner's row.
+                crate::db::DbError::Conflict(_) => {
+                    let existing = self
+                        .db
+                        .get_cluster_by_name(&req.name)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .ok_or_else(|| {
+                            Status::internal(
+                                "cluster insert rejected as duplicate but row not found",
+                            )
+                        })?;
+                    Ok(Response::new(CreateClusterResponse {
+                        cluster_id: existing.id,
+                        control_plane_endpoint: existing.control_plane_endpoint,
+                    }))
+                }
+                other => Err(Status::internal(other.to_string())),
+            };
         }
 
+        info!(
+            cluster_id = %cluster_id,
+            name = %req.name,
+            endpoint = %vip,
+            ip_pool = %req.ip_pool,
+            "CreateCluster: new cluster provisioned"
+        );
         Ok(Response::new(CreateClusterResponse {
             cluster_id,
             control_plane_endpoint: vip,
@@ -230,6 +305,7 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<DeleteClusterResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
+        info!(cluster_id = %req.cluster_id, "DeleteCluster received");
 
         // Ensure the cluster exists — returns NotFound otherwise.
         self.db
@@ -244,6 +320,7 @@ impl basis_server::Basis for BasisApiService {
             .list_vms(Some(&req.cluster_id))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        info!(cluster_id = %req.cluster_id, vm_count = vms.len(), "DeleteCluster: cascading VM deletes");
         for vm in &vms {
             self.teardown_vm(vm).await?;
         }
@@ -257,6 +334,7 @@ impl basis_server::Basis for BasisApiService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        info!(cluster_id = %req.cluster_id, "DeleteCluster complete");
         Ok(Response::new(DeleteClusterResponse {}))
     }
 
@@ -285,12 +363,51 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<CreateMachineResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
+        info!(
+            cluster_id = %req.cluster_id,
+            name = %req.name,
+            cpu = req.cpu,
+            memory_mib = req.memory_mib,
+            disk_gib = req.disk_gib,
+            gpus = req.gpus,
+            image = %req.image,
+            "CreateMachine received"
+        );
 
         let cluster = self
             .db
             .get_cluster(&req.cluster_id)
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(|e| {
+                warn!(cluster_id = %req.cluster_id, name = %req.name, error = %e, "CreateMachine rejected: cluster not found");
+                Status::not_found(e.to_string())
+            })?;
+
+        // Idempotent by (cluster_id, name): if the CAPI provider retries
+        // after a partial failure (VM created on the basis side but the
+        // status patch never landed in k8s), return the existing row so
+        // the reconciler can recover on the next pass instead of creating
+        // a duplicate VM.
+        if let Some(existing) = self
+            .db
+            .get_vm_by_name(&req.cluster_id, &req.name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            info!(
+                vm_id = %existing.id,
+                cluster_id = %req.cluster_id,
+                name = %req.name,
+                host_id = %existing.host_id,
+                "CreateMachine idempotent return: VM already exists"
+            );
+            return Ok(Response::new(CreateMachineResponse {
+                id: existing.id.clone(),
+                provider_id: provider_id(&existing.host_id, &existing.id),
+                ip_address: existing.ip_address,
+                host: existing.host_id,
+            }));
+        }
 
         let vm_id = uuid::Uuid::new_v4().to_string();
         let now = now_rfc3339();
@@ -316,7 +433,8 @@ impl basis_server::Basis for BasisApiService {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(24);
 
-        let gpu_json = serde_json::to_string(&gpu_devices).unwrap_or_else(|_| "[]".to_string());
+        let gpu_json = serde_json::to_string(&gpu_devices)
+            .expect("serializing Vec<GpuDevice> to JSON is infallible");
         let vm = VmRow {
             id: vm_id.clone(),
             name: req.name.clone(),
@@ -333,12 +451,39 @@ impl basis_server::Basis for BasisApiService {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.db
-            .insert_vm(&vm)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // Narrow race: idempotency check passed but a concurrent
+        // CreateMachine inserted the same `(cluster_id, name)` first. The
+        // UNIQUE index rejects our insert — roll back our IP and return
+        // the winner's row instead of creating a duplicate.
+        if let Err(e) = self.db.insert_vm(&vm).await {
+            let _ = self.db.release_ips(IpOwner::Vm(&vm_id)).await;
+            return match e {
+                crate::db::DbError::Conflict(_) => {
+                    let existing = self
+                        .db
+                        .get_vm_by_name(&req.cluster_id, &req.name)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .ok_or_else(|| {
+                            Status::internal("VM insert rejected as duplicate but row not found")
+                        })?;
+                    Ok(Response::new(CreateMachineResponse {
+                        id: existing.id.clone(),
+                        provider_id: provider_id(&existing.host_id, &existing.id),
+                        ip_address: existing.ip_address,
+                        host: existing.host_id,
+                    }))
+                }
+                other => Err(Status::internal(other.to_string())),
+            };
+        }
 
         let agent = self.agents.get(&host_id).ok_or_else(|| {
+            self.metrics
+                .vm_create_result_total
+                .with_label_values(&["no_agent"])
+                .inc();
+            warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: scheduled host has no connected agent");
             Status::unavailable(format!("agent for host '{host_id}' not connected"))
         })?;
 
@@ -361,32 +506,44 @@ impl basis_server::Basis for BasisApiService {
                 prefix_len,
                 gpus: req.gpus,
                 gpu_constraints: req.gpu_constraints,
-                dns_servers: vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()],
+                dns_servers: self.dns_servers.as_ref().clone(),
                 gpu_pci_addresses: gpu_devices.iter().map(|g| g.pci_address.clone()).collect(),
             })),
         };
 
+        info!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: dispatching CreateVm to agent");
         agent.command_tx.send(cmd).await.map_err(|_| {
             self.pending_creates.remove(&vm_id);
+            self.metrics
+                .vm_create_result_total
+                .with_label_values(&["stream_closed"])
+                .inc();
+            warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: agent stream closed before command delivered");
             Status::unavailable("agent stream closed")
         })?;
 
-        match tokio::time::timeout(CREATE_MACHINE_TIMEOUT, wait_rx).await {
+        let result_label: &'static str;
+        let response = match tokio::time::timeout(CREATE_MACHINE_TIMEOUT, wait_rx).await {
             Ok(Ok(Ok(()))) => {
-                let provider_id = format!("basis://{host_id}/{vm_id}");
+                result_label = "placed";
+                info!(vm_id = %vm_id, host_id = %host_id, ip = %ip_address, "CreateMachine: agent reported RUNNING");
                 Ok(Response::new(CreateMachineResponse {
-                    id: vm_id,
-                    provider_id,
+                    id: vm_id.clone(),
+                    provider_id: provider_id(&host_id, &vm_id),
                     ip_address,
                     host: host_id,
                 }))
             }
             Ok(Ok(Err(err))) => {
+                warn!(vm_id = %vm_id, host_id = %host_id, error = %err, "CreateMachine: agent reported FAILED");
                 self.cleanup_failed_vm(&vm_id).await;
+                result_label = "vm_failed";
                 Err(Status::internal(format!("VM creation failed: {err}")))
             }
             Ok(Err(_)) => {
+                warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: agent disconnected during VM creation");
                 self.cleanup_failed_vm(&vm_id).await;
+                result_label = "agent_error";
                 Err(Status::internal("agent disconnected during VM creation"))
             }
             Err(_) => {
@@ -394,12 +551,24 @@ impl basis_server::Basis for BasisApiService {
                 // but clear the waiter so the eventual report updates state
                 // rather than a dead oneshot.
                 self.pending_creates.remove(&vm_id);
+                result_label = "timeout";
+                warn!(
+                    vm_id = %vm_id,
+                    host_id = %host_id,
+                    timeout_s = CREATE_MACHINE_TIMEOUT.as_secs(),
+                    "CreateMachine: timed out waiting for agent to report RUNNING"
+                );
                 Err(Status::deadline_exceeded(format!(
                     "VM creation timed out ({}s)",
                     CREATE_MACHINE_TIMEOUT.as_secs()
                 )))
             }
-        }
+        };
+        self.metrics
+            .vm_create_result_total
+            .with_label_values(&[result_label])
+            .inc();
+        response
     }
 
     async fn delete_machine(
@@ -408,6 +577,7 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<DeleteMachineResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
+        info!(vm_id = %req.id, "DeleteMachine received");
         let vm = self
             .db
             .get_vm(&req.id)
@@ -469,25 +639,57 @@ impl BasisApiService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut assigned_gpus: HashMap<String, Vec<String>> = HashMap::new();
+        // Gather all VMs currently assigned to each healthy host. The
+        // scheduler uses this to compute both per-host capacity (totals
+        // minus VM allocations) and GPU availability.
+        let mut vms_by_host: HashMap<String, Vec<VmRow>> = HashMap::new();
         for host in &hosts {
             let vms = self
                 .db
                 .list_vms_on_host(&host.id)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let mut gpus = Vec::new();
-            for vm in &vms {
-                let gpu_devs: Vec<GpuInfo> =
-                    serde_json::from_str(&vm.gpu_assignments).unwrap_or_default();
-                gpus.extend(gpu_devs.into_iter().map(|g| g.pci_address));
-            }
-            assigned_gpus.insert(host.id.clone(), gpus);
+            vms_by_host.insert(host.id.clone(), vms);
         }
 
         let sched_req = ScheduleRequest::from(req);
-        scheduler::schedule(&hosts, &assigned_gpus, &sched_req)
-            .map_err(|e| Status::resource_exhausted(e.to_string()))
+        match scheduler::schedule(&hosts, &vms_by_host, &sched_req) {
+            Ok((host_id, gpus)) => {
+                self.metrics
+                    .scheduler_decisions_total
+                    .with_label_values(&["placed"])
+                    .inc();
+                info!(
+                    host_id = %host_id,
+                    gpus = gpus.len(),
+                    cpu = req.cpu,
+                    memory_mib = req.memory_mib,
+                    disk_gib = req.disk_gib,
+                    "scheduler placed VM"
+                );
+                Ok((host_id, gpus))
+            }
+            Err(SchedulerError::NoCapacity(msg)) => {
+                self.metrics
+                    .scheduler_decisions_total
+                    .with_label_values(&["no_capacity"])
+                    .inc();
+                self.metrics
+                    .vm_create_result_total
+                    .with_label_values(&["no_capacity"])
+                    .inc();
+                warn!(
+                    reason = %msg,
+                    healthy_hosts = hosts.len(),
+                    cpu = req.cpu,
+                    memory_mib = req.memory_mib,
+                    disk_gib = req.disk_gib,
+                    gpus = req.gpus,
+                    "scheduler rejected VM: no capacity"
+                );
+                Err(Status::resource_exhausted(msg))
+            }
+        }
     }
 }
 
@@ -495,6 +697,8 @@ impl BasisApiService {
 
 struct BasisAgentService {
     db: Db,
+    metrics: Arc<Metrics>,
+    reconcile_interval: std::time::Duration,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_creates: Arc<DashMap<String, PendingCreate>>,
 }
@@ -510,6 +714,17 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
     ) -> Result<Response<Self::StreamMessagesStream>, Status> {
         // Capture the peer CN before consuming the request.
         let peer_cn = peer_cn(&request)?;
+
+        // Belt-and-suspenders: the CAPI provider's CN would only slip
+        // through the hostname check below if someone literally registered
+        // a host named `basis-capi-provider`. Reject it explicitly so the
+        // agent stream is unreachable to that identity even under that
+        // accident.
+        if peer_cn == CAPI_PROVIDER_CN {
+            return Err(Status::permission_denied(format!(
+                "CN '{peer_cn}' is not authorized for agent RPCs"
+            )));
+        }
 
         let mut inbound = request.into_inner();
 
@@ -541,19 +756,15 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
             }
             Ok(None) => {
                 let host_id = uuid::Uuid::new_v4().to_string();
-                let gpu_json =
-                    serde_json::to_string(&register.gpus).unwrap_or_else(|_| "[]".to_string());
+                let gpu_json = serde_json::to_string(&register.gpus)
+                    .expect("serializing Vec<GpuDevice> to JSON is infallible");
 
                 let host = crate::db::HostRow {
                     id: host_id.clone(),
                     hostname: register.hostname.clone(),
-                    address: String::new(),
                     total_cpu: register.total_cpu as i64,
                     total_memory_mib: register.total_memory_mib as i64,
                     total_disk_gib: register.total_disk_gib as i64,
-                    available_cpu: register.total_cpu as i64,
-                    available_memory_mib: register.total_memory_mib as i64,
-                    available_disk_gib: register.total_disk_gib as i64,
                     gpu_inventory: gpu_json,
                     last_heartbeat: now_rfc3339(),
                     healthy: true,
@@ -598,14 +809,59 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
 
         self.agents.insert(
             host_id.clone(),
-            ConnectedAgent { command_tx },
+            ConnectedAgent {
+                command_tx: command_tx.clone(),
+            },
         );
+        self.metrics
+            .agent_connected
+            .with_label_values(&[&register.hostname])
+            .set(1);
+
+        // Periodic controller→agent authoritative VM list. Runs for as
+        // long as the stream is alive; send fails when the receiver side
+        // drops (client disconnect or inbound handler removes the agent),
+        // which is how this task terminates.
+        let reconcile_db = self.db.clone();
+        let reconcile_host_id = host_id.clone();
+        let reconcile_interval = self.reconcile_interval;
+        let reconcile_handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(reconcile_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately — skip it. The initial list was
+            // already sent inside `RegisterHostResponse` at handshake.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let expected = match reconcile_db.list_vms_on_host(&reconcile_host_id).await {
+                    Ok(vms) => vms.into_iter().map(|vm| vm.id).collect::<Vec<_>>(),
+                    Err(e) => {
+                        warn!(error = %e, host_id = %reconcile_host_id, "reconcile list_vms_on_host failed");
+                        continue;
+                    }
+                };
+                let cmd = ControllerCommand {
+                    request_id: String::new(),
+                    command: Some(controller_command::Command::ReconcileHost(
+                        ReconcileHostCommand {
+                            expected_vm_ids: expected,
+                        },
+                    )),
+                };
+                if command_tx.send(cmd).await.is_err() {
+                    // Receiver dropped — agent stream is gone.
+                    break;
+                }
+            }
+        });
 
         // Spawn task to process inbound agent messages
         let db = self.db.clone();
         let agents = self.agents.clone();
         let pending_creates = self.pending_creates.clone();
+        let metrics = self.metrics.clone();
         let agent_host_id = host_id.clone();
+        let agent_hostname = register.hostname.clone();
 
         tokio::spawn(async move {
             while let Some(result) = inbound.next().await {
@@ -630,6 +886,11 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
             }
             info!(host_id = %agent_host_id, "agent disconnected");
             agents.remove(&agent_host_id);
+            reconcile_handle.abort();
+            metrics
+                .agent_connected
+                .with_label_values(&[&agent_hostname])
+                .set(0);
         });
 
         let output = ReceiverStream::new(command_rx).map(Ok);
@@ -645,14 +906,7 @@ async fn handle_agent_message(
 ) -> anyhow::Result<()> {
     match msg.payload {
         Some(agent_message::Payload::Heartbeat(hb)) => {
-            db.update_host_heartbeat(
-                &hb.host_id,
-                hb.available_cpu as i64,
-                hb.available_memory_mib as i64,
-                hb.available_disk_gib as i64,
-                &now_rfc3339(),
-            )
-            .await?;
+            db.update_host_heartbeat(&hb.host_id, &now_rfc3339()).await?;
         }
         Some(agent_message::Payload::VmState(report)) => {
             let state = report.state();
@@ -687,21 +941,37 @@ async fn handle_agent_message(
     Ok(())
 }
 
+/// CAPI-shaped provider ID for a VM. The CAPI controller treats this as
+/// opaque — we only require that it's unique per VM and round-trippable
+/// back to `(host_id, vm_id)` for debugging.
+fn provider_id(host_id: &str, vm_id: &str) -> String {
+    format!("basis://{host_id}/{vm_id}")
+}
+
 fn vm_to_machine(vm: &VmRow) -> Machine {
     let gpu_devices: Vec<GpuDevice> =
-        serde_json::from_str(&vm.gpu_assignments).unwrap_or_default();
+        parse_owned_json(&vm.gpu_assignments, "vms.gpu_assignments");
+
+    let gpus = gpu_devices
+        .into_iter()
+        .map(|g| MachineGpu {
+            pci_address: g.pci_address,
+            model: g.model,
+            nvlink_group: g.nvlink_group,
+        })
+        .collect();
 
     Machine {
         id: vm.id.clone(),
         name: vm.name.clone(),
         cluster_id: vm.cluster_id.clone(),
         host: vm.host_id.clone(),
-        provider_id: format!("basis://{}/{}", vm.host_id, vm.id),
+        provider_id: provider_id(&vm.host_id, &vm.id),
         ip_address: vm.ip_address.clone(),
         state: vm.state as i32,
         cpu: vm.cpu as u32,
         memory_mib: vm.memory_mib as u32,
         disk_gib: vm.disk_gib as u32,
-        gpus: gpu_devices,
+        gpus,
     }
 }

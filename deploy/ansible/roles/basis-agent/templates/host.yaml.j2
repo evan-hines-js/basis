@@ -12,3 +12,11 @@ spec:
     cert: {{ basis_tls_dir }}/agent.crt
     key: {{ basis_tls_dir }}/agent.key
     ca: {{ basis_tls_dir }}/ca.crt
+{% if basis_agent_registries %}
+  registries:
+{% for r in basis_agent_registries %}
+    - host: {{ r.host }}
+      username: {{ r.username }}
+      password: {{ r.password }}
+{% endfor %}
+{% endif %}

@@ -37,6 +37,22 @@ pub struct HostSpec {
     /// Ubuntu/Debian cloud images run unmodified (no kernel extraction).
     #[serde(default = "default_firmware_path")]
     pub firmware_path: PathBuf,
+
+    /// Credentials for private OCI registries the agent pulls VM images
+    /// from. Omit or leave empty for public-only pulls. Entries are
+    /// matched against the registry portion of the image reference
+    /// (e.g., `ghcr.io`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registries: Vec<RegistryCredentials>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryCredentials {
+    /// Registry host to match (e.g., `ghcr.io`, `docker.io`).
+    pub host: String,
+    pub username: String,
+    pub password: String,
 }
 
 fn default_firmware_path() -> PathBuf {

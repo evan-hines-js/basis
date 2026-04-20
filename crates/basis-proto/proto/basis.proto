@@ -112,7 +112,17 @@ message Machine {
   uint32 cpu = 8;
   uint32 memory_mib = 9;
   uint32 disk_gib = 10;
-  repeated GPUDevice gpus = 11;
+  repeated MachineGPU gpus = 11;
+}
+
+// GPU detail exposed to CAPI consumers. Strictly a subset of the internal
+// `GPUDevice`: iommu groups are a host-internal passthrough detail the
+// scheduler needs, but CAPI has no use for them and they shouldn't leak
+// out on the read path.
+message MachineGPU {
+  string pci_address = 1;
+  string model = 2;
+  uint32 nvlink_group = 3;
 }
 
 enum MachineState {
@@ -156,7 +166,18 @@ message ControllerCommand {
     CreateVMCommand create_vm = 2;
     DeleteVMCommand delete_vm = 3;
     RegisterHostResponse register_ack = 4;
+    ReconcileHostCommand reconcile_host = 5;
   }
+}
+
+// Periodic authoritative VM list for this host. Carries the same contract
+// as `RegisterHostResponse.expected_vm_ids` but fires on an interval while
+// the agent is already connected — so a controller that loses track of a
+// VM (e.g. a fire-and-forget DeleteVm that dropped) is still converged on
+// without requiring the agent to reconnect. The agent deletes any local
+// VM not in this list.
+message ReconcileHostCommand {
+  repeated string expected_vm_ids = 1;
 }
 
 // Sent as the first command after the agent's RegisterHostRequest.
@@ -182,12 +203,12 @@ message RegisterHostRequest {
   repeated IOMMUGroup iommu_groups = 6;
 }
 
+// Agent liveness signal. The controller is authoritative for capacity:
+// `available = total - sum(vms on host)` is computed server-side at
+// scheduling time from the VM table. The agent only needs to tell the
+// controller it is alive.
 message HeartbeatRequest {
   string host_id = 1;
-  uint32 available_cpu = 2;
-  uint64 available_memory_mib = 3;
-  uint64 available_disk_gib = 4;
-  repeated string assigned_gpus = 5;
 }
 
 message ReportVMStateRequest {

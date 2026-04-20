@@ -40,6 +40,12 @@ struct RunningController {
 
 impl RunningController {
     async fn start() -> (Self, basis_controller::db::Db) {
+        Self::start_with_reconcile(Duration::from_secs(60)).await
+    }
+
+    async fn start_with_reconcile(
+        reconcile_interval: Duration,
+    ) -> (Self, basis_controller::db::Db) {
         install_crypto_provider_once().await;
 
         let db = basis_controller::db::Db::open(":memory:".as_ref())
@@ -62,7 +68,13 @@ impl RunningController {
         let addr = listener.local_addr().unwrap();
 
         let shutdown = CancellationToken::new();
-        let server = basis_controller::server::BasisServer::new(db.clone());
+        let metrics = basis_controller::metrics::Metrics::new().unwrap();
+        let server = basis_controller::server::BasisServer::new(
+            db.clone(),
+            metrics,
+            vec!["1.1.1.1".to_string()],
+        )
+        .with_reconcile_interval(reconcile_interval);
         let server_shutdown = shutdown.clone();
 
         let handle = tokio::spawn(async move {
@@ -246,19 +258,24 @@ async fn test_create_cluster_reserves_vip() {
 }
 
 #[tokio::test]
-async fn test_create_cluster_duplicate_name_fails() {
+async fn test_create_cluster_is_idempotent_by_name() {
+    // CAPI reconcilers retry after partial failures (cluster created in
+    // basis but status patch never landed). A second CreateCluster with
+    // the same name must return the existing record, not error.
     let (running, _db) = RunningController::start().await;
-    create_cluster(&running, "dup").await;
+    let (first_id, first_vip) = create_cluster(&running, "dup").await;
 
     let mut capi = running.capi_client().await;
-    let err = capi
+    let resp = capi
         .create_cluster(CreateClusterRequest {
             name: "dup".to_string(),
             ip_pool: "default".to_string(),
         })
         .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.cluster_id, first_id);
+    assert_eq!(resp.control_plane_endpoint, first_vip);
 }
 
 #[tokio::test]
@@ -372,13 +389,9 @@ async fn test_create_machine_no_agent() {
     db.upsert_host(&basis_controller::db::HostRow {
         id: "ghost-host".to_string(),
         hostname: "ghost".to_string(),
-        address: String::new(),
         total_cpu: 16,
         total_memory_mib: 65536,
         total_disk_gib: 1000,
-        available_cpu: 16,
-        available_memory_mib: 65536,
-        available_disk_gib: 1000,
         gpu_inventory: "[]".to_string(),
         last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
         healthy: true,
@@ -467,6 +480,23 @@ async fn test_wrong_cn_rejected_from_capi_rpc() {
 }
 
 #[tokio::test]
+async fn test_capi_cn_cannot_open_agent_stream() {
+    // The CAPI provider's CN is authorised for CAPI RPCs only. Opening the
+    // agent stream with that CN must be rejected before any register
+    // message is inspected.
+    let (running, _db) = RunningController::start().await;
+    let mut client = running
+        .agent_client(basis_controller::server::CAPI_PROVIDER_CN)
+        .await;
+    let (_tx, rx) = mpsc::channel::<AgentMessage>(1);
+    let err = client
+        .stream_messages(ReceiverStream::new(rx))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
 async fn test_agent_cn_must_match_registered_hostname() {
     let (running, _db) = RunningController::start().await;
     let mut client = running.agent_client("my-hostname").await;
@@ -493,47 +523,63 @@ async fn test_agent_cn_must_match_registered_hostname() {
 }
 
 #[tokio::test]
-async fn test_heartbeat_updates_host_capacity() {
+async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
     let (running, db) = RunningController::start().await;
     let (agent_tx, inbound, ack) = register_agent(&running, "capacity-host").await;
 
-    // After RegisterHost, available = total.
-    let host = db.get_host(&ack.host_id).await.unwrap();
-    assert_eq!(host.available_cpu, 16);
+    // Simulate a blip: the health checker has marked this host unhealthy.
+    // A fresh heartbeat should flip it back.
+    db.mark_host_unhealthy(&ack.host_id).await.unwrap();
+    assert!(!db.get_host(&ack.host_id).await.unwrap().healthy);
 
-    // Agent sends a heartbeat with actual post-allocation capacity.
     agent_tx
         .send(AgentMessage {
             payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
                 host_id: ack.host_id.clone(),
-                available_cpu: 10,
-                available_memory_mib: 40960,
-                available_disk_gib: 800,
-                assigned_gpus: vec!["0000:41:00.0".to_string()],
             })),
         })
         .await
         .unwrap();
 
-    // Poll until the controller has applied the heartbeat update. Limit
-    // retries to keep the test fast on CI.
     let mut attempts = 0;
     loop {
-        let host = db.get_host(&ack.host_id).await.unwrap();
-        if host.available_cpu == 10 {
-            assert_eq!(host.available_memory_mib, 40960);
-            assert_eq!(host.available_disk_gib, 800);
+        if db.get_host(&ack.host_id).await.unwrap().healthy {
             break;
         }
         attempts += 1;
         if attempts > 50 {
-            panic!("heartbeat never applied (available_cpu still {})", host.available_cpu);
+            panic!("heartbeat never marked host healthy");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     drop(agent_tx);
     drop(inbound);
+}
+
+#[tokio::test]
+async fn test_controller_pushes_periodic_reconcile() {
+    // Closes the staleness gap: while the agent is already connected, the
+    // controller periodically pushes the authoritative VM list so a VM
+    // that was deleted but whose DeleteVm never landed still gets cleaned
+    // up without waiting for the agent to reconnect.
+    let (running, _db) =
+        RunningController::start_with_reconcile(Duration::from_millis(150)).await;
+    let (_agent_tx, mut inbound, _ack) = register_agent(&running, "reconcile-host").await;
+
+    // First ReconcileHostCommand must arrive within a few intervals. With
+    // no VMs on this host, it should carry an empty list.
+    let cmd = tokio::time::timeout(Duration::from_secs(2), inbound.next())
+        .await
+        .expect("ReconcileHost command never arrived")
+        .unwrap()
+        .unwrap();
+    match cmd.command {
+        Some(controller_command::Command::ReconcileHost(r)) => {
+            assert!(r.expected_vm_ids.is_empty());
+        }
+        other => panic!("expected ReconcileHost, got {other:?}"),
+    }
 }
 
 #[tokio::test]

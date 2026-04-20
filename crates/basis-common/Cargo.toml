@@ -7,6 +7,7 @@ description = "Shared utilities for Basis: TLS config, time helpers, shared type
 [dependencies]
 tonic.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml_ng.workspace = true
 thiserror.workspace = true
 humantime.workspace = true

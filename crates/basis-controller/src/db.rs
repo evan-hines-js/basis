@@ -76,13 +76,9 @@ impl Db {
             "CREATE TABLE IF NOT EXISTS hosts (
                 id TEXT PRIMARY KEY,
                 hostname TEXT NOT NULL UNIQUE,
-                address TEXT NOT NULL,
                 total_cpu INTEGER NOT NULL,
                 total_memory_mib INTEGER NOT NULL,
                 total_disk_gib INTEGER NOT NULL,
-                available_cpu INTEGER NOT NULL,
-                available_memory_mib INTEGER NOT NULL,
-                available_disk_gib INTEGER NOT NULL,
                 gpu_inventory TEXT NOT NULL DEFAULT '[]',
                 last_heartbeat TEXT NOT NULL,
                 healthy INTEGER NOT NULL DEFAULT 1
@@ -120,6 +116,18 @@ impl Db {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Enforces that `(cluster_id, name)` is unique across VMs. CAPI
+        // reconcilers may retry `CreateMachine` after a partial failure and
+        // we rely on this constraint to keep the name-based idempotency
+        // check in server.rs race-free: a second concurrent call either
+        // sees the existing row or is rejected at insert time.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_vms_cluster_name
+             ON vms (cluster_id, name)",
         )
         .execute(&self.pool)
         .await?;
@@ -281,6 +289,15 @@ impl Db {
             .ok_or_else(|| DbError::NotFound(format!("cluster '{id}'")))
     }
 
+    pub async fn get_cluster_by_name(&self, name: &str) -> Result<Option<ClusterRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     pub async fn delete_cluster(&self, id: &str) -> Result<(), DbError> {
         sqlx::query("DELETE FROM clusters WHERE id = ?")
             .bind(id)
@@ -289,35 +306,33 @@ impl Db {
         Ok(())
     }
 
+    pub async fn list_clusters(&self) -> Result<Vec<ClusterRow>, DbError> {
+        Ok(sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters")
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     // --- Hosts ---
 
     pub async fn upsert_host(&self, host: &HostRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO hosts (id, hostname, address, total_cpu, total_memory_mib, total_disk_gib,
-                available_cpu, available_memory_mib, available_disk_gib, gpu_inventory, last_heartbeat, healthy)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO hosts (id, hostname, total_cpu, total_memory_mib, total_disk_gib,
+                gpu_inventory, last_heartbeat, healthy)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 hostname = excluded.hostname,
-                address = excluded.address,
                 total_cpu = excluded.total_cpu,
                 total_memory_mib = excluded.total_memory_mib,
                 total_disk_gib = excluded.total_disk_gib,
-                available_cpu = excluded.available_cpu,
-                available_memory_mib = excluded.available_memory_mib,
-                available_disk_gib = excluded.available_disk_gib,
                 gpu_inventory = excluded.gpu_inventory,
                 last_heartbeat = excluded.last_heartbeat,
                 healthy = excluded.healthy",
         )
         .bind(&host.id)
         .bind(&host.hostname)
-        .bind(&host.address)
         .bind(host.total_cpu)
         .bind(host.total_memory_mib)
         .bind(host.total_disk_gib)
-        .bind(host.available_cpu)
-        .bind(host.available_memory_mib)
-        .bind(host.available_disk_gib)
         .bind(&host.gpu_inventory)
         .bind(&host.last_heartbeat)
         .bind(host.healthy)
@@ -351,26 +366,20 @@ impl Db {
         )
     }
 
-    pub async fn update_host_heartbeat(
-        &self,
-        host_id: &str,
-        available_cpu: i64,
-        available_memory_mib: i64,
-        available_disk_gib: i64,
-        now: &str,
-    ) -> Result<(), DbError> {
-        let result = sqlx::query(
-            "UPDATE hosts SET
-                available_cpu = ?,
-                available_memory_mib = ?,
-                available_disk_gib = ?,
-                last_heartbeat = ?,
-                healthy = 1
-             WHERE id = ?",
+    pub async fn list_hosts(&self) -> Result<Vec<HostRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, HostRow>("SELECT * FROM hosts")
+                .fetch_all(&self.pool)
+                .await?,
         )
-        .bind(available_cpu)
-        .bind(available_memory_mib)
-        .bind(available_disk_gib)
+    }
+
+    /// Refresh `last_heartbeat` and flip the host back to healthy. Capacity
+    /// isn't stored per-host — scheduler computes it from VM allocations.
+    pub async fn update_host_heartbeat(&self, host_id: &str, now: &str) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE hosts SET last_heartbeat = ?, healthy = 1 WHERE id = ?",
+        )
         .bind(now)
         .bind(host_id)
         .execute(&self.pool)
@@ -413,7 +422,13 @@ impl Db {
         .bind(&vm.created_at)
         .bind(&vm.updated_at)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => DbError::Conflict(
+                format!("vm '{}' already exists in cluster '{}'", vm.name, vm.cluster_id),
+            ),
+            other => DbError::Sqlx(other),
+        })?;
         Ok(())
     }
 
@@ -423,6 +438,20 @@ impl Db {
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("vm '{id}'")))
+    }
+
+    pub async fn get_vm_by_name(
+        &self,
+        cluster_id: &str,
+        name: &str,
+    ) -> Result<Option<VmRow>, DbError> {
+        Ok(sqlx::query_as::<_, VmRow>(
+            "SELECT * FROM vms WHERE cluster_id = ? AND name = ?",
+        )
+        .bind(cluster_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn list_vms(&self, cluster_id: Option<&str>) -> Result<Vec<VmRow>, DbError> {
@@ -505,13 +534,9 @@ impl Db {
 pub struct HostRow {
     pub id: String,
     pub hostname: String,
-    pub address: String,
     pub total_cpu: i64,
     pub total_memory_mib: i64,
     pub total_disk_gib: i64,
-    pub available_cpu: i64,
-    pub available_memory_mib: i64,
-    pub available_disk_gib: i64,
     pub gpu_inventory: String,
     pub last_heartbeat: String,
     pub healthy: bool,
@@ -566,13 +591,9 @@ mod tests {
         HostRow {
             id: id.to_string(),
             hostname: hostname.to_string(),
-            address: "10.0.0.1".to_string(),
             total_cpu: 16,
             total_memory_mib: 65536,
             total_disk_gib: 1000,
-            available_cpu: 16,
-            available_memory_mib: 65536,
-            available_disk_gib: 1000,
             gpu_inventory: "[]".to_string(),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,
@@ -646,12 +667,12 @@ mod tests {
         db.upsert_host(&host).await.unwrap();
 
         host.total_cpu = 32;
-        host.available_memory_mib = 32768;
+        host.total_memory_mib = 131072;
         db.upsert_host(&host).await.unwrap();
 
         let fetched = db.get_host("h1").await.unwrap();
         assert_eq!(fetched.total_cpu, 32);
-        assert_eq!(fetched.available_memory_mib, 32768);
+        assert_eq!(fetched.total_memory_mib, 131072);
     }
 
     #[tokio::test]
@@ -683,26 +704,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_heartbeat_updates_capacity() {
+    async fn test_heartbeat_refreshes_timestamp_and_health() {
         let db = test_db().await;
-        db.upsert_host(&make_host("h1", "node-1")).await.unwrap();
+        let mut h = make_host("h1", "node-1");
+        h.healthy = false;
+        db.upsert_host(&h).await.unwrap();
 
-        db.update_host_heartbeat("h1", 8, 32768, 500, "2025-01-01T01:00:00Z")
-            .await
-            .unwrap();
+        db.update_host_heartbeat("h1", "2025-01-01T01:00:00Z").await.unwrap();
 
         let host = db.get_host("h1").await.unwrap();
-        assert_eq!(host.available_cpu, 8);
-        assert_eq!(host.available_memory_mib, 32768);
         assert_eq!(host.last_heartbeat, "2025-01-01T01:00:00Z");
-        assert!(host.healthy);
+        assert!(host.healthy, "heartbeat must flip unhealthy → healthy");
     }
 
     #[tokio::test]
     async fn test_heartbeat_unknown_host_fails() {
         let db = test_db().await;
         let result = db
-            .update_host_heartbeat("nonexistent", 8, 32768, 500, "2025-01-01T00:00:00Z")
+            .update_host_heartbeat("nonexistent", "2025-01-01T00:00:00Z")
             .await;
         assert!(matches!(result, Err(DbError::NotFound(_))));
     }
@@ -838,12 +857,17 @@ mod tests {
         db.insert_cluster(&make_cluster("c1", "cluster-a")).await.unwrap();
         db.insert_vm(&make_vm("vm1", "h1", "c1")).await.unwrap();
 
-        db.update_vm_state("vm1", 5, "disk error", "2025-01-02T00:00:00Z")
-            .await
-            .unwrap();
+        db.update_vm_state(
+            "vm1",
+            basis_proto::MachineState::Failed as i64,
+            "disk error",
+            "2025-01-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
 
         let vm = db.get_vm("vm1").await.unwrap();
-        assert_eq!(vm.state, 5); // FAILED
+        assert_eq!(vm.state, basis_proto::MachineState::Failed as i64);
         assert_eq!(vm.error_message, "disk error");
         assert_eq!(vm.updated_at, "2025-01-02T00:00:00Z");
     }
@@ -852,7 +876,12 @@ mod tests {
     async fn test_update_vm_state_not_found() {
         let db = test_db().await;
         let result = db
-            .update_vm_state("nonexistent", 2, "", "2025-01-01T00:00:00Z")
+            .update_vm_state(
+                "nonexistent",
+                basis_proto::MachineState::Running as i64,
+                "",
+                "2025-01-01T00:00:00Z",
+            )
             .await;
         assert!(matches!(result, Err(DbError::NotFound(_))));
     }

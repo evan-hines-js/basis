@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+
 use basis_common::gpu::GpuInfo;
+use basis_common::json::parse_owned_json;
 use basis_proto::{CreateMachineRequest, GpuDevice};
 
-use crate::db::HostRow;
+use crate::db::{HostRow, VmRow};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
@@ -33,35 +36,72 @@ impl From<&CreateMachineRequest> for ScheduleRequest {
     }
 }
 
+/// Derived per-host capacity, computed from the host's totals minus the
+/// VMs currently assigned to it.
+#[derive(Debug, Clone, Copy)]
+struct HostCapacity {
+    available_cpu: u32,
+    available_memory_mib: u32,
+    available_disk_gib: u32,
+}
+
+impl HostCapacity {
+    fn compute(host: &HostRow, vms: &[VmRow]) -> Self {
+        let used_cpu: i64 = vms.iter().map(|v| v.cpu).sum();
+        let used_mem: i64 = vms.iter().map(|v| v.memory_mib).sum();
+        let used_disk: i64 = vms.iter().map(|v| v.disk_gib).sum();
+
+        Self {
+            available_cpu: host.total_cpu.saturating_sub(used_cpu).max(0) as u32,
+            available_memory_mib: host.total_memory_mib.saturating_sub(used_mem).max(0) as u32,
+            available_disk_gib: host.total_disk_gib.saturating_sub(used_disk).max(0) as u32,
+        }
+    }
+}
+
 /// Pick the best host for a VM request and return the GPUs selected on that host.
+///
+/// `vms_by_host` must map every healthy host's id to the VMs currently
+/// assigned to it — the controller is the authoritative source of
+/// capacity, and derives availability here rather than trusting agent
+/// heartbeats.
 pub fn schedule(
     hosts: &[HostRow],
-    assigned_vms: &std::collections::HashMap<String, Vec<String>>,
+    vms_by_host: &HashMap<String, Vec<VmRow>>,
     req: &ScheduleRequest,
 ) -> Result<(String, Vec<GpuDevice>), SchedulerError> {
-    let mut candidates: Vec<(&HostRow, i32, Vec<GpuInfo>)> = Vec::new();
+    let mut candidates: Vec<(&HostRow, i32, Vec<GpuInfo>, HostCapacity)> = Vec::new();
 
+    let empty: Vec<VmRow> = Vec::new();
     for host in hosts {
         if !host.healthy {
             continue;
         }
-        if (host.available_cpu as u32) < req.cpu
-            || (host.available_memory_mib as u32) < req.memory_mib
-            || (host.available_disk_gib as u32) < req.disk_gib
+
+        let vms = vms_by_host.get(&host.id).unwrap_or(&empty);
+        let cap = HostCapacity::compute(host, vms);
+
+        if cap.available_cpu < req.cpu
+            || cap.available_memory_mib < req.memory_mib
+            || cap.available_disk_gib < req.disk_gib
         {
             continue;
         }
 
-        let inventory: Vec<GpuInfo> =
-            serde_json::from_str(&host.gpu_inventory).unwrap_or_default();
-        let assigned_on_host = assigned_vms.get(&host.id);
+        let inventory: Vec<GpuInfo> = parse_owned_json(&host.gpu_inventory, "hosts.gpu_inventory");
+
+        let assigned_pci: Vec<String> = vms
+            .iter()
+            .flat_map(|vm| {
+                let devs: Vec<GpuInfo> =
+                    parse_owned_json(&vm.gpu_assignments, "vms.gpu_assignments");
+                devs.into_iter().map(|g| g.pci_address)
+            })
+            .collect();
 
         let available_gpus: Vec<GpuInfo> = inventory
             .into_iter()
-            .filter(|g| match assigned_on_host {
-                Some(assigned) => !assigned.contains(&g.pci_address),
-                None => true,
-            })
+            .filter(|g| !assigned_pci.contains(&g.pci_address))
             .collect();
 
         if req.gpus > 0 {
@@ -75,9 +115,9 @@ pub fn schedule(
                 continue;
             }
 
-            candidates.push((host, score, selected));
+            candidates.push((host, score, selected, cap));
         } else {
-            candidates.push((host, 0, Vec::new()));
+            candidates.push((host, 0, Vec::new(), cap));
         }
     }
 
@@ -91,13 +131,13 @@ pub fn schedule(
     // Sort: highest GPU topology score first, then best-fit bin-packing (least remaining capacity)
     candidates.sort_by(|a, b| {
         b.1.cmp(&a.1).then_with(|| {
-            let remaining_a = remaining_capacity(a.0, req);
-            let remaining_b = remaining_capacity(b.0, req);
-            remaining_a.cmp(&remaining_b)
+            let rem_a = remaining_after_place(a.3, req);
+            let rem_b = remaining_after_place(b.3, req);
+            rem_a.cmp(&rem_b)
         })
     });
 
-    let (host, _score, selected_gpus) = &candidates[0];
+    let (host, _score, selected_gpus, _) = &candidates[0];
     let gpu_devices: Vec<GpuDevice> = selected_gpus
         .iter()
         .map(|g| GpuDevice {
@@ -111,9 +151,9 @@ pub fn schedule(
     Ok((host.id.clone(), gpu_devices))
 }
 
-fn remaining_capacity(host: &HostRow, req: &ScheduleRequest) -> u64 {
-    let cpu_rem = host.available_cpu.saturating_sub(req.cpu as i64) as u64;
-    let mem_rem = host.available_memory_mib.saturating_sub(req.memory_mib as i64) as u64;
+fn remaining_after_place(cap: HostCapacity, req: &ScheduleRequest) -> u64 {
+    let cpu_rem = cap.available_cpu.saturating_sub(req.cpu) as u64;
+    let mem_rem = cap.available_memory_mib.saturating_sub(req.memory_mib) as u64;
     cpu_rem + mem_rem
 }
 
@@ -181,13 +221,9 @@ mod tests {
         HostRow {
             id: id.to_string(),
             hostname: format!("{id}.local"),
-            address: "10.0.0.1".to_string(),
             total_cpu: cpu,
             total_memory_mib: mem,
             total_disk_gib: disk,
-            available_cpu: cpu,
-            available_memory_mib: mem,
-            available_disk_gib: disk,
             gpu_inventory: serde_json::to_string(gpus).unwrap(),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,
@@ -213,14 +249,36 @@ mod tests {
         }
     }
 
+    /// Build a VM that consumes `(cpu, mem, disk)` with the given PCI
+    /// addresses already bound to it. Only the fields the scheduler reads
+    /// are populated.
+    fn vm_on(host_id: &str, cpu: i64, mem: i64, disk: i64, gpus: &[GpuInfo]) -> VmRow {
+        VmRow {
+            id: format!("vm-{host_id}"),
+            name: "test".to_string(),
+            cluster_id: "c1".to_string(),
+            host_id: host_id.to_string(),
+            ip_address: "10.0.0.1".to_string(),
+            state: 2,
+            cpu,
+            memory_mib: mem,
+            disk_gib: disk,
+            gpu_assignments: serde_json::to_string(gpus).unwrap(),
+            image: String::new(),
+            error_message: String::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn test_schedule_basic() {
         let hosts = vec![
             make_host("h1", 8, 16384, 500, &[]),
             make_host("h2", 4, 8192, 200, &[]),
         ];
-        let assigned = std::collections::HashMap::new();
-        let (host_id, gpus) = schedule(&hosts, &assigned, &basic_req(0, 0)).unwrap();
+        let vms = HashMap::new();
+        let (host_id, gpus) = schedule(&hosts, &vms, &basic_req(0, 0)).unwrap();
         // h2 is a tighter fit (best-fit bin-packing prefers closest to full)
         assert_eq!(host_id, "h2");
         assert!(gpus.is_empty());
@@ -229,7 +287,7 @@ mod tests {
     #[test]
     fn test_schedule_no_capacity() {
         let hosts = vec![make_host("h1", 2, 4096, 50, &[])];
-        let assigned = std::collections::HashMap::new();
+        let vms = HashMap::new();
         let req = ScheduleRequest {
             cpu: 8,
             memory_mib: 16384,
@@ -237,16 +295,15 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-        assert!(schedule(&hosts, &assigned, &req).is_err());
+        assert!(schedule(&hosts, &vms, &req).is_err());
     }
 
     #[test]
     fn test_schedule_with_gpus() {
         let gpus = vec![gpu("0000:41:00.0", 1), gpu("0000:42:00.0", 1)];
         let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
-        let assigned = std::collections::HashMap::new();
-        let (host_id, selected) =
-            schedule(&hosts, &assigned, &basic_req(2, 2)).unwrap();
+        let vms = HashMap::new();
+        let (host_id, selected) = schedule(&hosts, &vms, &basic_req(2, 2)).unwrap();
         assert_eq!(host_id, "h1");
         assert_eq!(selected.len(), 2);
     }
@@ -259,8 +316,8 @@ mod tests {
         ];
         hosts[0].healthy = false;
 
-        let assigned = std::collections::HashMap::new();
-        let (host_id, _) = schedule(&hosts, &assigned, &basic_req(0, 0)).unwrap();
+        let vms = HashMap::new();
+        let (host_id, _) = schedule(&hosts, &vms, &basic_req(0, 0)).unwrap();
         assert_eq!(host_id, "h2");
     }
 
@@ -269,14 +326,14 @@ mod tests {
         let mut hosts = vec![make_host("h1", 16, 65536, 1000, &[])];
         hosts[0].healthy = false;
 
-        let assigned = std::collections::HashMap::new();
-        assert!(schedule(&hosts, &assigned, &basic_req(0, 0)).is_err());
+        let vms = HashMap::new();
+        assert!(schedule(&hosts, &vms, &basic_req(0, 0)).is_err());
     }
 
     #[test]
     fn test_schedule_empty_hosts_returns_error() {
         let hosts = vec![];
-        let assigned = std::collections::HashMap::new();
+        let vms = HashMap::new();
         let req = ScheduleRequest {
             cpu: 1,
             memory_mib: 1024,
@@ -284,7 +341,7 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-        assert!(schedule(&hosts, &assigned, &req).is_err());
+        assert!(schedule(&hosts, &vms, &req).is_err());
     }
 
     #[test]
@@ -294,8 +351,8 @@ mod tests {
             make_host("medium", 16, 32768, 500, &[]),
             make_host("small", 8, 16384, 200, &[]),
         ];
-        let assigned = std::collections::HashMap::new();
-        let (host_id, _) = schedule(&hosts, &assigned, &basic_req(0, 0)).unwrap();
+        let vms = HashMap::new();
+        let (host_id, _) = schedule(&hosts, &vms, &basic_req(0, 0)).unwrap();
         assert_eq!(host_id, "small");
     }
 
@@ -305,8 +362,8 @@ mod tests {
             make_host("h1", 16, 65536, 50, &[]),
             make_host("h2", 16, 65536, 200, &[]),
         ];
-        let assigned = std::collections::HashMap::new();
-        let (host_id, _) = schedule(&hosts, &assigned, &basic_req(0, 0)).unwrap();
+        let vms = HashMap::new();
+        let (host_id, _) = schedule(&hosts, &vms, &basic_req(0, 0)).unwrap();
         assert_eq!(host_id, "h2");
     }
 
@@ -314,8 +371,8 @@ mod tests {
     fn test_schedule_gpu_not_enough_available() {
         let gpus = vec![gpu("0000:41:00.0", 1)];
         let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
-        let assigned = std::collections::HashMap::new();
-        assert!(schedule(&hosts, &assigned, &basic_req(2, 0)).is_err());
+        let vms = HashMap::new();
+        assert!(schedule(&hosts, &vms, &basic_req(2, 0)).is_err());
     }
 
     #[test]
@@ -329,8 +386,8 @@ mod tests {
             gpu("0000:82:00.0", 2),
         ];
         let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
-        let assigned = std::collections::HashMap::new();
-        let (_, selected) = schedule(&hosts, &assigned, &basic_req(2, 0)).unwrap();
+        let vms = HashMap::new();
+        let (_, selected) = schedule(&hosts, &vms, &basic_req(2, 0)).unwrap();
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].nvlink_group, selected[1].nvlink_group);
     }
@@ -346,8 +403,8 @@ mod tests {
             gpu("0000:82:00.0", 2),
         ];
         let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
-        let assigned = std::collections::HashMap::new();
-        assert!(schedule(&hosts, &assigned, &basic_req(4, 4)).is_err());
+        let vms = HashMap::new();
+        assert!(schedule(&hosts, &vms, &basic_req(4, 4)).is_err());
     }
 
     #[test]
@@ -361,26 +418,39 @@ mod tests {
             gpu("0000:82:00.0", 0),
         ];
         let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
-        let assigned = std::collections::HashMap::new();
-        assert!(schedule(&hosts, &assigned, &basic_req(2, 2)).is_err());
+        let vms = HashMap::new();
+        assert!(schedule(&hosts, &vms, &basic_req(2, 2)).is_err());
     }
 
     #[test]
     fn test_schedule_skips_assigned_gpus() {
-        let gpus = vec![gpu("0000:41:00.0", 1), gpu("0000:42:00.0", 1)];
-        let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
+        let all_gpus = vec![gpu("0000:41:00.0", 1), gpu("0000:42:00.0", 1)];
+        let hosts = vec![make_host("h1", 16, 65536, 1000, &all_gpus)];
 
-        let mut assigned = std::collections::HashMap::new();
-        assigned.insert("h1".to_string(), vec!["0000:41:00.0".to_string()]);
+        // One VM on h1 already holds 0000:41:00.0.
+        let mut vms = HashMap::new();
+        vms.insert(
+            "h1".to_string(),
+            vec![vm_on("h1", 2, 2048, 10, &[gpu("0000:41:00.0", 1)])],
+        );
 
         // 2 GPUs requested, only 1 free — should fail
-        assert!(schedule(&hosts, &assigned, &basic_req(2, 0)).is_err());
+        assert!(schedule(&hosts, &vms, &basic_req(2, 0)).is_err());
 
         // 1 GPU request should pick the free one
-        let (host_id, selected) = schedule(&hosts, &assigned, &basic_req(1, 0)).unwrap();
+        let (host_id, selected) = schedule(&hosts, &vms, &basic_req(1, 0)).unwrap();
         assert_eq!(host_id, "h1");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].pci_address, "0000:42:00.0");
+    }
+
+    #[test]
+    fn test_schedule_subtracts_vm_allocations_from_capacity() {
+        // h1 has 16 vCPU, a 14-vCPU VM is on it. A request for 4 vCPU must fail.
+        let hosts = vec![make_host("h1", 16, 65536, 1000, &[])];
+        let mut vms = HashMap::new();
+        vms.insert("h1".to_string(), vec![vm_on("h1", 14, 8192, 50, &[])]);
+        assert!(schedule(&hosts, &vms, &basic_req(0, 0)).is_err()); // basic_req needs 4 cpu
     }
 
     #[test]
@@ -394,8 +464,8 @@ mod tests {
             make_host("spread", 16, 65536, 1000, &gpus_spread),
             make_host("together", 16, 65536, 1000, &gpus_together),
         ];
-        let assigned = std::collections::HashMap::new();
-        let (host_id, selected) = schedule(&hosts, &assigned, &basic_req(2, 0)).unwrap();
+        let vms = HashMap::new();
+        let (host_id, selected) = schedule(&hosts, &vms, &basic_req(2, 0)).unwrap();
         assert_eq!(host_id, "together");
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].nvlink_group, selected[1].nvlink_group);

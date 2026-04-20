@@ -1,12 +1,33 @@
+//! VM disk image management.
+//!
+//! Disk images are published as single-layer OCI artifacts (see
+//! `scripts/build-node-image.sh` which uses `oras push` with media type
+//! `application/vnd.lattice.node.v1+qcow2`). The agent pulls them with
+//! the `oci-client` crate — a native-Rust OCI v2 client that handles
+//! token auth and streams blobs to disk, so there's no external binary
+//! to depend on and no in-memory buffering of multi-GB images.
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use futures::TryStreamExt;
+use oci_client::client::ClientConfig;
+use oci_client::secrets::RegistryAuth;
+use oci_client::{Client, Reference};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::info;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
+    #[error("invalid image reference '{0}': {1}")]
+    BadReference(String, String),
+
     #[error("image pull failed: {0}")]
     PullFailed(String),
+
+    #[error("image manifest has no layers")]
+    EmptyManifest,
 
     #[error("overlay creation failed: {0}")]
     OverlayFailed(String),
@@ -20,15 +41,23 @@ pub enum ImageError {
 
 pub struct ImageManager {
     images_dir: PathBuf,
+    /// Per-registry credentials, keyed by registry host (e.g., "ghcr.io").
+    /// Empty map means every pull is anonymous.
+    auth: HashMap<String, RegistryAuth>,
 }
 
 impl ImageManager {
     pub fn new(images_dir: PathBuf) -> Self {
-        std::fs::create_dir_all(&images_dir).ok();
-        Self { images_dir }
+        Self::with_auth(images_dir, HashMap::new())
     }
 
-    /// Ensure the base image is cached locally. Returns the path to the cached base image.
+    pub fn with_auth(images_dir: PathBuf, auth: HashMap<String, RegistryAuth>) -> Self {
+        std::fs::create_dir_all(&images_dir).ok();
+        Self { images_dir, auth }
+    }
+
+    /// Ensure the base image is cached locally. Returns the path to the
+    /// cached base image.
     pub async fn ensure_cached(&self, image_ref: &str) -> Result<PathBuf, ImageError> {
         let cache_name = image_ref_to_filename(image_ref);
         let cached_path = self.images_dir.join(&cache_name);
@@ -39,14 +68,50 @@ impl ImageManager {
         }
 
         info!(image = %image_ref, "pulling image");
-
-        if image_ref.starts_with("http://") || image_ref.starts_with("https://") {
-            self.pull_http(image_ref, &cached_path).await?;
-        } else {
-            self.pull_oci(image_ref, &cached_path).await?;
-        }
-
+        self.pull_oci(image_ref, &cached_path).await?;
         Ok(cached_path)
+    }
+
+    async fn pull_oci(&self, image_ref: &str, dest: &Path) -> Result<(), ImageError> {
+        let reference: Reference = image_ref
+            .parse()
+            .map_err(|e: oci_client::ParseError| {
+                ImageError::BadReference(image_ref.to_string(), e.to_string())
+            })?;
+        let auth = self
+            .auth
+            .get(reference.registry())
+            .cloned()
+            .unwrap_or(RegistryAuth::Anonymous);
+
+        let client = Client::new(ClientConfig::default());
+        let (manifest, _digest) = client
+            .pull_image_manifest(&reference, &auth)
+            .await
+            .map_err(|e| ImageError::PullFailed(format!("fetching manifest: {e}")))?;
+
+        let layer = manifest.layers.first().ok_or(ImageError::EmptyManifest)?;
+
+        // Stream the blob straight to disk via a temp file so a failed
+        // pull never leaves a truncated cache entry that a later run
+        // mistakes for a valid image.
+        let tmp = dest.with_extension("partial");
+        let mut out = tokio::fs::File::create(&tmp).await?;
+        let mut stream = client
+            .pull_blob_stream(&reference, layer)
+            .await
+            .map_err(|e| ImageError::PullFailed(format!("fetching blob: {e}")))?;
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|e| ImageError::PullFailed(format!("reading blob: {e}")))?
+        {
+            out.write_all(&chunk).await?;
+        }
+        out.flush().await?;
+        drop(out);
+        tokio::fs::rename(&tmp, dest).await?;
+        Ok(())
     }
 
     /// Create a qcow2 copy-on-write overlay backed by the base image.
@@ -98,16 +163,12 @@ impl ImageManager {
         let cidata_dir = vm_dir.join("cidata");
         std::fs::create_dir_all(&cidata_dir)?;
 
-        // Write userdata
         std::fs::write(cidata_dir.join("user-data"), userdata)?;
-
-        // Write meta-data (minimal)
         std::fs::write(
             cidata_dir.join("meta-data"),
             "instance-id: basis\nlocal-hostname: basis\n",
         )?;
 
-        // Write network-config
         let dns_entries: String = dns_servers
             .iter()
             .map(|s| format!("          - {s}"))
@@ -129,7 +190,6 @@ impl ImageManager {
         );
         std::fs::write(cidata_dir.join("network-config"), &network_config)?;
 
-        // Create ISO
         let iso_path = vm_dir.join("cidata.iso");
         let output = Command::new("mkisofs")
             .args([
@@ -147,21 +207,19 @@ impl ImageManager {
         // Fallback to genisoimage if mkisofs not available
         let output = match output {
             Ok(o) if o.status.success() => o,
-            _ => {
-                Command::new("genisoimage")
-                    .args([
-                        "-output",
-                        &iso_path.to_string_lossy(),
-                        "-volid",
-                        "cidata",
-                        "-joliet",
-                        "-rock",
-                        &cidata_dir.to_string_lossy(),
-                    ])
-                    .output()
-                    .await
-                    .map_err(|e| ImageError::CloudInitFailed(e.to_string()))?
-            }
+            _ => Command::new("genisoimage")
+                .args([
+                    "-output",
+                    &iso_path.to_string_lossy(),
+                    "-volid",
+                    "cidata",
+                    "-joliet",
+                    "-rock",
+                    &cidata_dir.to_string_lossy(),
+                ])
+                .output()
+                .await
+                .map_err(|e| ImageError::CloudInitFailed(e.to_string()))?,
         };
 
         if !output.status.success() {
@@ -170,69 +228,10 @@ impl ImageManager {
             ));
         }
 
-        // Clean up cidata dir, keep only the ISO
         std::fs::remove_dir_all(&cidata_dir).ok();
 
         info!(path = %iso_path.display(), "created cloud-init ISO");
         Ok(iso_path)
-    }
-
-    async fn pull_http(&self, url: &str, dest: &Path) -> Result<(), ImageError> {
-        let output = Command::new("curl")
-            .args(["-fSL", "-o", &dest.to_string_lossy(), url])
-            .output()
-            .await
-            .map_err(|e| ImageError::PullFailed(e.to_string()))?;
-
-        if !output.status.success() {
-            return Err(ImageError::PullFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn pull_oci(&self, image_ref: &str, dest: &Path) -> Result<(), ImageError> {
-        // Use skopeo to pull OCI image, then extract the qcow2 layer
-        let oci_dir = dest.with_extension("oci");
-        let output = Command::new("skopeo")
-            .args([
-                "copy",
-                &format!("docker://{image_ref}"),
-                &format!("oci:{}:latest", oci_dir.to_string_lossy()),
-            ])
-            .output()
-            .await
-            .map_err(|e| ImageError::PullFailed(e.to_string()))?;
-
-        if !output.status.success() {
-            return Err(ImageError::PullFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
-        }
-
-        // Extract the first blob as the disk image (convention: single-layer OCI artifact)
-        let blobs_dir = oci_dir.join("blobs").join("sha256");
-        if let Ok(mut entries) = std::fs::read_dir(&blobs_dir) {
-            // Find the largest blob (the disk image)
-            let mut largest: Option<(PathBuf, u64)> = None;
-            while let Some(Ok(entry)) = entries.next() {
-                if let Ok(meta) = entry.metadata() {
-                    match &largest {
-                        Some((_, size)) if meta.len() <= *size => {}
-                        _ => largest = Some((entry.path(), meta.len())),
-                    }
-                }
-            }
-            if let Some((blob_path, _)) = largest {
-                std::fs::rename(&blob_path, dest)?;
-            }
-        }
-
-        // Clean up OCI dir
-        std::fs::remove_dir_all(&oci_dir).ok();
-
-        Ok(())
     }
 }
 
@@ -251,14 +250,6 @@ mod tests {
         assert_eq!(name, "ghcr_io_evan-hines-js_lattice-node_v1_32_0.qcow2");
         assert!(!name.contains('/'));
         assert!(!name.contains(':'));
-    }
-
-    #[test]
-    fn test_image_ref_to_filename_http() {
-        let name = image_ref_to_filename("https://example.com/images/node.qcow2");
-        assert!(!name.contains('/'));
-        assert!(!name.contains(':'));
-        assert!(name.ends_with(".qcow2"));
     }
 
     #[test]

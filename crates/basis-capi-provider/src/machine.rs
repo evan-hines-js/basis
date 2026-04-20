@@ -1,6 +1,6 @@
 //! `BasisMachine` reconciler.
 //!
-//! Create flow (only runs once `status.basisVmId` is unset):
+//! Create flow:
 //!   1. Resolve the owning `Cluster` via CAPI labels.
 //!   2. Resolve the owning `Machine` via OwnerReferences and read its
 //!      `bootstrap.dataSecretName`.
@@ -8,7 +8,11 @@
 //!   4. Resolve the `BasisCluster` owning this machine and read
 //!      `status.basisClusterId` — this is the cluster_id we pass to Basis.
 //!   5. Call `Basis.CreateMachine(cluster_id, ...)`.
-//!   6. Write `spec.providerID`, `status.basisVmId`, `status.addresses`.
+//!   6. Write status, then spec (providerID).
+//!
+//! Idempotency lives at the Basis API boundary: `CreateMachine` is
+//! idempotent by `(cluster_id, name)`, so retries after a partial
+//! failure return the existing VM rather than creating a duplicate.
 //!
 //! Delete flow:
 //!   1. If `status.basisVmId` is set, call `Basis.DeleteMachine`.
@@ -17,9 +21,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use basis_common::time::now_rfc3339;
 use futures::StreamExt;
-use kube::api::{Api, Patch, PatchParams, ResourceExt};
+use kube::api::{Api, ResourceExt};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{finalizer, Event};
 use kube::runtime::watcher;
@@ -29,7 +32,9 @@ use tracing::{error, info, warn};
 
 use crate::basis_client::{self, BasisClient};
 use crate::bootstrap;
-use crate::crds::{BasisCluster, BasisMachine, Condition, Machine as CapiMachine, MachineAddress};
+use crate::conditions;
+use crate::crds::{BasisCluster, BasisMachine, Machine as CapiMachine, MachineAddress};
+use crate::reconcile_util::{merge_spec, merge_status, namespace_of};
 
 const FINALIZER: &str = "basismachine.infrastructure.cluster.x-k8s.io/finalizer";
 /// Label CAPI places on every Machine/BasisMachine naming the cluster
@@ -75,18 +80,16 @@ pub async fn run(client: Client, basis: Arc<BasisClient>) -> anyhow::Result<()> 
             }
         })
         .await;
-    Ok(())
+    // See the sibling comment in cluster::run — surface watch-stream
+    // termination as an error so the pod restarts.
+    Err(anyhow::anyhow!("BasisMachine watch stream terminated"))
 }
 
 async fn reconcile(
     machine: Arc<BasisMachine>,
     ctx: Arc<MachineContext>,
 ) -> Result<Action, MachineError> {
-    let namespace = machine
-        .metadata
-        .namespace
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+    let namespace = namespace_of(machine.as_ref());
     let api: Api<BasisMachine> = Api::namespaced(ctx.client.clone(), &namespace);
 
     finalizer(&api, FINALIZER, machine, |event| async {
@@ -106,15 +109,7 @@ async fn apply(
 ) -> Result<Action, MachineError> {
     let name = machine.name_any();
     let api: Api<BasisMachine> = Api::namespaced(ctx.client.clone(), namespace);
-
-    if machine
-        .status
-        .as_ref()
-        .and_then(|s| s.basis_vm_id.as_ref())
-        .is_some()
-    {
-        return Ok(Action::requeue(Duration::from_secs(300)));
-    }
+    let generation = machine.metadata.generation;
 
     let cluster_name = machine
         .labels()
@@ -128,41 +123,92 @@ async fn apply(
     let bootstrap_data =
         bootstrap::load_bootstrap_data(ctx.client.clone(), namespace, &bootstrap_secret).await?;
 
+    // Server-side CreateMachine is idempotent by `(cluster_id, name)`.
+    // Issuing it on every reconcile lets us self-heal partial writes:
+    // if a prior attempt created the VM but crashed before patching
+    // status/spec, the next call returns the existing row and we finish
+    // the patches below.
     info!(machine = %name, cluster_id = %basis_cluster_id, "calling Basis.CreateMachine");
     let created = ctx
         .basis
         .create_machine(basis_cluster_id, name.clone(), &machine.spec, bootstrap_data)
         .await?;
 
-    let spec_patch = json!({
-        "spec": { "providerId": created.provider_id }
-    });
-    api.patch(&name, &PatchParams::default(), &Patch::Merge(&spec_patch))
-        .await?;
-
-    let status_patch = json!({
-        "status": {
-            "ready": true,
-            "initialization": { "provisioned": true },
-            "providerId": created.provider_id,
-            "basisVmId": created.id,
-            "addresses": [MachineAddress {
-                kind: "InternalIP".to_string(),
-                address: created.ip_address,
-            }],
-            "conditions": [Condition {
-                kind: "Ready".to_string(),
-                status: "True".to_string(),
-                reason: Some("VMRunning".to_string()),
-                message: None,
-                last_transition_time: now_rfc3339(),
-            }],
+    // If status/spec patches fail after a successful CreateMachine, the
+    // basis-side VM exists but k8s doesn't know its vm_id — on BasisMachine
+    // deletion, `cleanup()` skips DeleteMachine for lack of basis_vm_id and
+    // the VM leaks. Roll back the create so the next reconcile starts
+    // clean. `create_machine` is idempotent by name, so if the rollback
+    // itself fails (e.g. controller unreachable), the next reconcile will
+    // find the ghost and either finish patching it or delete it via the
+    // CAPI deletion path.
+    if let Err(e) = write_machine_patches(&api, &name, &created, &machine, generation).await {
+        warn!(
+            machine = %name,
+            vm_id = %created.id,
+            error = %e,
+            "patches failed after CreateMachine; rolling back basis-side VM",
+        );
+        if let Err(rb) = ctx.basis.delete_machine(created.id.clone()).await {
+            warn!(
+                machine = %name,
+                vm_id = %created.id,
+                error = %rb,
+                "rollback DeleteMachine failed; leaving cleanup to next reconcile",
+            );
         }
-    });
-    api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&status_patch))
-        .await?;
+        return Err(e);
+    }
 
     Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Patch status (with the `basisVmId` marker) first, then spec. Status
+/// carries the durable id; writing it before spec means a crash between
+/// the two patches is self-healing on the next reconcile — the basis-side
+/// VM is re-created idempotently and spec is finished. The opposite order
+/// would leave spec populated without the id k8s uses to clean up.
+async fn write_machine_patches(
+    api: &Api<BasisMachine>,
+    name: &str,
+    created: &crate::basis_client::CreatedMachine,
+    machine: &BasisMachine,
+    generation: Option<i64>,
+) -> Result<(), MachineError> {
+    let mut conditions = machine
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    conditions::upsert(&mut conditions, conditions::ready_true("VMRunning", generation));
+
+    merge_status(
+        api,
+        name,
+        &json!({
+            "status": {
+                "ready": true,
+                "initialization": { "provisioned": true },
+                "providerId": created.provider_id,
+                "basisVmId": created.id,
+                "addresses": [MachineAddress {
+                    kind: "InternalIP".to_string(),
+                    address: created.ip_address.clone(),
+                }],
+                "conditions": conditions,
+            }
+        }),
+    )
+    .await?;
+
+    merge_spec(
+        api,
+        name,
+        &json!({ "spec": { "providerId": created.provider_id } }),
+    )
+    .await?;
+
+    Ok(())
 }
 
 async fn cleanup(

@@ -201,7 +201,7 @@ mod tests {
         LocalVmRow {
             vm_id: vm_id.to_string(),
             name: format!("vm-{vm_id}"),
-            unit_name: format!("basis-vm-{vm_id}.scope"),
+            unit_name: format!("basis-vm-{vm_id}.service"),
             ip_address: "10.0.10.42".to_string(),
             cpu: 4,
             memory_mib: 8192,

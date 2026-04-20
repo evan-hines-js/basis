@@ -1,9 +1,19 @@
 use std::sync::Arc;
 
+use futures::stream::{self, StreamExt};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+use basis_common::json::parse_owned_json;
 use basis_proto::CreateVmCommand;
+
+/// Max number of VMs the agent restarts in parallel after a node reboot.
+/// On a host with many VMs, a serial cold-start would compound GPU-bind
+/// latency into minutes of downtime. The per-VM work that gains from
+/// parallelism (disk probe, tap creation, vfio-pci rebind) is IO-bound;
+/// the systemd-run spawn at the end still serialises on the VmManager
+/// mutex, which is fine.
+const RESTART_CONCURRENCY: usize = 4;
 
 use crate::config::HostSpec;
 use crate::db::{AgentDb, LocalVmRow};
@@ -59,45 +69,57 @@ pub async fn reconcile_on_startup(
         known_vms.iter().map(|v| v.vm_id.clone()).collect();
 
     // --- Cases 1 & 2: VMs we know about ---
-    // TODO: restart VMs with bounded parallelism (e.g., futures::stream::for_each_concurrent(4, ...))
-    // to avoid serial cold-start on hosts with many VMs. Fine for v1.
-    for vm_record in &known_vms {
-        if running_set.contains(vm_record.vm_id.as_str()) {
-            // Case 1: already running in systemd, re-tracked by reconcile_running()
-            report.recovered += 1;
-        } else {
-            // Case 2: node rebooted, VM not running. Try to re-launch from disk.
-            match restart_vm(config, vm_record, vm_mgr, net_mgr).await {
-                Ok(()) => {
-                    report.restarted += 1;
-                }
-                Err(RestartError::DiskMissing) => {
-                    // VM directory exists but files are missing (anomalous) or
-                    // entire directory gone. Keep the DB record so an operator
-                    // can see what happened — the controller reconciliation pass
-                    // will clean it up authoritatively. Report as lost.
-                    warn!(
-                        vm_id = %vm_record.vm_id,
-                        "VM disk files missing after reboot, cannot restart — reporting FAILED to controller"
-                    );
-                    report.lost += 1;
-                }
-                Err(RestartError::GpuBindFailed(e)) => {
-                    // GPU failed to rebind. A half-restored VM (booted without its
-                    // GPU) is worse than a dead VM — the guest comes up, K8s schedules
-                    // GPU pods, pods fail silently. Abort and let CAPI remediate.
-                    error!(
-                        vm_id = %vm_record.vm_id,
-                        error = %e,
-                        "GPU rebind failed, aborting VM restart — CAPI will remediate"
-                    );
-                    report.failed += 1;
-                }
-                Err(RestartError::Other(e)) => {
-                    error!(vm_id = %vm_record.vm_id, error = %e, "failed to restart VM");
-                    report.failed += 1;
-                }
+    // Partition up-front: case 1 (already running) is a pure count; case 2
+    // (needs restart) is the concurrent work.
+    let (running_here, to_restart): (Vec<_>, Vec<_>) = known_vms
+        .iter()
+        .partition(|vm| running_set.contains(vm.vm_id.as_str()));
+    report.recovered = running_here.len() as u32;
+
+    let outcomes: Vec<RestartOutcome> = stream::iter(to_restart)
+        .map(|vm_record| async move {
+            (
+                vm_record.vm_id.clone(),
+                restart_vm(config, vm_record, vm_mgr, net_mgr).await,
+            )
+        })
+        .buffer_unordered(RESTART_CONCURRENCY)
+        .map(|(vm_id, result)| match result {
+            Ok(()) => RestartOutcome::Restarted,
+            Err(RestartError::DiskMissing) => {
+                // Disk files missing (directory or qcow2/ISO gone) — keep
+                // the DB record so an operator can see it and let the
+                // controller reconciliation pass clean it up.
+                warn!(
+                    vm_id = %vm_id,
+                    "VM disk files missing after reboot, cannot restart — reporting FAILED to controller"
+                );
+                RestartOutcome::Lost
             }
+            Err(RestartError::GpuBindFailed(e)) => {
+                // A VM booted without its GPU is silently broken — K8s
+                // schedules GPU pods onto it and they fail. Abort the
+                // restart and let CAPI remediate.
+                error!(
+                    vm_id = %vm_id,
+                    error = %e,
+                    "GPU rebind failed, aborting VM restart — CAPI will remediate"
+                );
+                RestartOutcome::Failed
+            }
+            Err(RestartError::Other(e)) => {
+                error!(vm_id = %vm_id, error = %e, "failed to restart VM");
+                RestartOutcome::Failed
+            }
+        })
+        .collect()
+        .await;
+
+    for outcome in outcomes {
+        match outcome {
+            RestartOutcome::Restarted => report.restarted += 1,
+            RestartOutcome::Lost => report.lost += 1,
+            RestartOutcome::Failed => report.failed += 1,
         }
     }
 
@@ -117,6 +139,12 @@ enum RestartError {
     DiskMissing,
     GpuBindFailed(String),
     Other(anyhow::Error),
+}
+
+enum RestartOutcome {
+    Restarted,
+    Lost,
+    Failed,
 }
 
 async fn restart_vm(
@@ -144,7 +172,7 @@ async fn restart_vm(
     // Re-bind GPUs. If any GPU fails to bind, abort the entire VM restart.
     // A VM missing a GPU is silently broken — worse than being dead.
     let gpu_addrs: Vec<String> =
-        serde_json::from_str(&vm_record.gpu_pci_addresses).unwrap_or_default();
+        parse_owned_json(&vm_record.gpu_pci_addresses, "local_vms.gpu_pci_addresses");
     let mut vfio_devices = Vec::new();
     for addr in &gpu_addrs {
         match gpu::bind_vfio(addr).await {
@@ -173,12 +201,24 @@ async fn restart_vm(
     // baked into cidata.iso on disk. These fields are not used by create_vm for
     // the actual cloud-hypervisor invocation — they're only used when generating
     // the ISO, which we skip on restart.
+    // Narrow i64 → u32 with an explicit check. DB entries originated
+    // from u32-typed proto fields so truncation is not expected, but a
+    // corrupt row or hand-edited DB could produce a value that silently
+    // wraps — refuse to restart rather than boot a VM with wrong specs.
+    let narrow_u32 = |field: &str, v: i64| -> Result<u32, RestartError> {
+        u32::try_from(v).map_err(|_| {
+            RestartError::Other(anyhow::anyhow!(
+                "VM {} has corrupt {field}={v} in local DB (out of u32 range)",
+                vm_record.vm_id
+            ))
+        })
+    };
     let restart_cmd = CreateVmCommand {
         vm_id: vm_record.vm_id.clone(),
         name: vm_record.name.clone(),
-        cpu: vm_record.cpu as u32,
-        memory_mib: vm_record.memory_mib as u32,
-        disk_gib: vm_record.disk_gib as u32,
+        cpu: narrow_u32("cpu", vm_record.cpu)?,
+        memory_mib: narrow_u32("memory_mib", vm_record.memory_mib)?,
+        disk_gib: narrow_u32("disk_gib", vm_record.disk_gib)?,
         image: vm_record.image.clone(),
         bootstrap_data: Vec::new(),
         ip_address: vm_record.ip_address.clone(),
@@ -187,8 +227,7 @@ async fn restart_vm(
         gpus: 0,
         gpu_constraints: None,
         dns_servers: Vec::new(),
-        gpu_pci_addresses: serde_json::from_str(&vm_record.gpu_pci_addresses)
-            .unwrap_or_default(),
+        gpu_pci_addresses: gpu_addrs,
     };
 
     vm_mgr

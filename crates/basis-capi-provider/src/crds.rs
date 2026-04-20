@@ -121,7 +121,7 @@ pub struct BasisMachineStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "camelCase")]
 pub struct MachineAddress {
     #[serde(rename = "type")]
     pub kind: String,
@@ -185,6 +185,11 @@ pub struct Condition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub last_transition_time: String,
+    /// `metadata.generation` at the time this condition was set. Consumers
+    /// use this to tell whether the condition reflects the current spec.
+    /// CAPI v1beta2 conditions carry this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
 }
 
 /// Default port for the control-plane VIP. kubeadm's apiserver listens

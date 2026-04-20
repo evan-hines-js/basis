@@ -11,6 +11,11 @@ basis_data_dir: /var/lib/basis
 basis_controller_port: 7443
 basis_controller_san: basis-controller
 
+# Plain-HTTP Prometheus metrics endpoint on the controller. Scraped by
+# Prometheus at /metrics; no TLS, no auth — bind to a network that only
+# your Prometheus can reach.
+basis_controller_metrics_port: 9443
+
 # Where the playbook finds binaries on the control node. Build with
 # `cargo build --release` before running.
 basis_repo_root: "{{ playbook_dir }}/../.."
@@ -31,6 +36,15 @@ basis_ip_pool:
   gateway: 10.0.0.1
   range_start: 10.0.0.210
   range_end: 10.0.0.250
+
+# Credentials for private OCI registries basis-agent pulls VM images
+# from. Override in host/group vars or vault when deploying against
+# private registries. Example:
+#   basis_agent_registries:
+#     - host: ghcr.io
+#       username: "{{ ghcr_user }}"
+#       password: "{{ ghcr_token }}"   # source from ansible-vault
+basis_agent_registries: []
 
 # Per-host bridge name. Set to `vmbr0` when colocating Basis on hosts
 # that already run Proxmox — the agent skips bridge creation if one

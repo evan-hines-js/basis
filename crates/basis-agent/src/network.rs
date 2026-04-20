@@ -80,9 +80,18 @@ impl NetworkManager {
             .await?;
 
         if exists.status.success() {
-            // Already exists — make sure it's up and on our bridge
-            run_cmd("ip", &["link", "set", &tap_name, "master", &self.bridge_name]).await.ok();
-            run_cmd("ip", &["link", "set", &tap_name, "up"]).await.ok();
+            // Already exists — make sure it's up and on our bridge. These
+            // writes are idempotent when state is already correct, so
+            // failures here mean the link layer is inconsistent (kernel
+            // refusal, namespace mismatch) and should not be silenced.
+            if let Err(e) =
+                run_cmd("ip", &["link", "set", &tap_name, "master", &self.bridge_name]).await
+            {
+                warn!(tap = %tap_name, error = %e, "failed to re-attach existing tap to bridge");
+            }
+            if let Err(e) = run_cmd("ip", &["link", "set", &tap_name, "up"]).await {
+                warn!(tap = %tap_name, error = %e, "failed to bring existing tap up");
+            }
             info!(tap = %tap_name, vm_id = %vm_id, "tap device already exists, ensured up");
             return Ok(tap_name);
         }

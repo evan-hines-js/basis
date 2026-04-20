@@ -139,8 +139,14 @@ pub async fn unbind_vfio(pci_address: &str) -> Result<(), GpuError> {
         }
     })?;
 
-    // May fail if already unbound — that's fine.
-    let _ = std::fs::write("/sys/bus/pci/drivers/vfio-pci/unbind", pci_address);
+    // NotFound means the device wasn't bound to vfio-pci — benign during
+    // restart or when the BIOS driver already released it. Anything else
+    // is sysfs weirdness worth seeing in the logs.
+    if let Err(e) = std::fs::write("/sys/bus/pci/drivers/vfio-pci/unbind", pci_address) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(pci_address, error = %e, "vfio-pci unbind failed");
+        }
+    }
 
     std::fs::write("/sys/bus/pci/drivers_probe", pci_address).map_err(|e| {
         GpuError::UnbindFailed {
@@ -156,11 +162,11 @@ pub async fn unbind_vfio(pci_address: &str) -> Result<(), GpuError> {
 async fn read_iommu_group(pci_address: &str) -> Result<String, GpuError> {
     let link = format!("/sys/bus/pci/devices/{pci_address}/iommu_group");
     let target = std::fs::read_link(&link)?;
-    Ok(target
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string())
+    let group = target.file_name().ok_or_else(|| GpuError::BindFailed {
+        pci_address: pci_address.to_string(),
+        reason: format!("iommu_group symlink has no file name: {}", target.display()),
+    })?;
+    Ok(group.to_string_lossy().into_owned())
 }
 
 fn extract_model_name(lspci_line: &str) -> String {

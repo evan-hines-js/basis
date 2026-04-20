@@ -4,6 +4,7 @@ metadata:
   name: {{ inventory_hostname }}
 spec:
   listen: "0.0.0.0:{{ basis_controller_port }}"
+  metricsListen: "0.0.0.0:{{ basis_controller_metrics_port }}"
   dataDir: {{ basis_data_dir }}
   tls:
     cert: {{ basis_tls_dir }}/controller.crt
@@ -15,3 +16,9 @@ spec:
       gateway: {{ basis_ip_pool.gateway }}
       rangeStart: {{ basis_ip_pool.range_start }}
       rangeEnd: {{ basis_ip_pool.range_end }}
+{% if basis_dns_servers is defined %}
+  dnsServers:
+{% for dns in basis_dns_servers %}
+    - {{ dns }}
+{% endfor %}
+{% endif %}

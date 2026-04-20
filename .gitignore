@@ -1,5 +1,9 @@
 /target
+/build
 .claude/
 node_modules/
 package.json
 package-lock.json
+
+# Local ansible secrets (dev vault password is weak — do not commit).
+deploy/ansible/secrets.yml

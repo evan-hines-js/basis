@@ -35,6 +35,8 @@ dashmap.workspace = true
 tower.workspace = true
 serde_json.workspace = true
 humantime.workspace = true
+prometheus.workspace = true
+axum.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

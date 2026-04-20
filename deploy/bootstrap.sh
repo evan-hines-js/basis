@@ -59,6 +59,14 @@ say "Binaries built: $TARGET_DIR"
 
 say "Running Ansible playbook"
 cd "$ANSIBLE_DIR"
+# Pick up the repo-local secrets.yml automatically if it exists so callers
+# don't have to remember `-e @secrets.yml` every run. The vault password
+# itself lives at ~/.basis-vault-pass (configured in ansible.cfg).
+EXTRA_VARS=()
+if [[ -f "$ANSIBLE_DIR/secrets.yml" ]]; then
+  EXTRA_VARS+=("-e" "@secrets.yml")
+fi
 exec ansible-playbook site.yml \
   -e "basis_binary_dir=$TARGET_DIR" \
+  "${EXTRA_VARS[@]}" \
   "$@"

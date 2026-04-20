@@ -41,7 +41,9 @@
     dest: "{{ basis_config_dir }}/host.yaml"
     owner: root
     group: root
-    mode: "0644"
+    # 0600 because registry credentials (if configured) live here in
+    # plaintext. The agent runs as root, no other reader should see this.
+    mode: "0600"
   # Changes to Host spec trigger SIGHUP. The agent only applies mutable
   # fields (controllerEndpoint); immutable field changes log a warning
   # and require a full restart — surfaced by the running agent's logs.
