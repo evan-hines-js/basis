@@ -50,14 +50,34 @@ fn default_dns_servers() -> Vec<String> {
     vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()]
 }
 
+/// Inclusive IPv4 range used by the IP-pool allocators.
+///
+/// Both ends are parsed to `Ipv4Addr` at allocation time; this type
+/// just carries the config strings verbatim so YAML round-trips cleanly.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IpRange {
+    pub start: String,
+    pub end: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IpPool {
     pub name: String,
     pub cidr: String,
     pub gateway: String,
-    pub range_start: String,
-    pub range_end: String,
+    /// Range the controller auto-picks VM IPs from (`allocate_ip`).
+    /// Must be disjoint from `vip_range` — the two allocators write to
+    /// the same `ip_allocations` table and rely on range-level
+    /// separation so VM auto-allocation can never race a pending VIP
+    /// reservation for a sibling cluster that hasn't been created yet.
+    pub vm_range: IpRange,
+    /// Range the controller auto-picks control-plane VIPs from
+    /// (`allocate_vip`). Sized to the number of concurrent clusters you
+    /// expect; a homelab with a handful of clusters can get away with
+    /// 4–8 addresses.
+    pub vip_range: IpRange,
 }
 
 impl BasisControllerSpec {
@@ -101,15 +121,24 @@ spec:
     - name: default
       cidr: 10.0.10.0/24
       gateway: 10.0.10.1
-      rangeStart: 10.0.10.10
-      rangeEnd: 10.0.10.250
+      vmRange:
+        start: 10.0.10.20
+        end: 10.0.10.250
+      vipRange:
+        start: 10.0.10.10
+        end: 10.0.10.19
 "#,
         );
         let spec = BasisControllerSpec::load(f.path()).unwrap();
         assert_eq!(spec.listen, "0.0.0.0:7443");
-        assert_eq!(spec.db_path(), PathBuf::from("/var/lib/basis/controller.db"));
+        assert_eq!(
+            spec.db_path(),
+            PathBuf::from("/var/lib/basis/controller.db")
+        );
         assert_eq!(spec.ip_pools.len(), 1);
         assert_eq!(spec.ip_pools[0].name, "default");
+        assert_eq!(spec.ip_pools[0].vm_range.start, "10.0.10.20");
+        assert_eq!(spec.ip_pools[0].vip_range.end, "10.0.10.19");
     }
 
     #[test]

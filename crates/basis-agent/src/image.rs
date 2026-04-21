@@ -1,14 +1,20 @@
 //! VM disk image management.
 //!
-//! Disk images are published as single-layer OCI artifacts (see
-//! `scripts/build-node-image.sh` which uses `oras push` with media type
-//! `application/vnd.lattice.node.v1+qcow2`). The agent pulls them with
-//! the `oci-client` crate — a native-Rust OCI v2 client that handles
-//! token auth and streams blobs to disk, so there's no external binary
-//! to depend on and no in-memory buffering of multi-GB images.
+//! Node images are published as three-layer OCI artifacts (see
+//! `scripts/build-node-image.sh`): a qcow2 rootfs, a Linux bzImage
+//! kernel, and a matching initrd. Cloud-hypervisor's minimal firmware
+//! (rust-hypervisor-firmware) doesn't implement the UEFI variable / TPM
+//! surface Ubuntu's shim+grub depend on, so we skip the EFI chain and
+//! boot the guest kernel directly (see `vm.rs`).
+//!
+//! The agent pulls all three layers with `oci-client` and caches them
+//! alongside each other, keyed by media type. Layers are streamed to
+//! `.partial` side files and atomically renamed so a failed or
+//! interrupted pull never leaves a truncated cache entry.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use futures::TryStreamExt;
 use oci_client::client::ClientConfig;
@@ -16,6 +22,7 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tracing::info;
 
 #[derive(Debug, thiserror::Error)]
@@ -26,8 +33,8 @@ pub enum ImageError {
     #[error("image pull failed: {0}")]
     PullFailed(String),
 
-    #[error("image manifest has no layers")]
-    EmptyManifest,
+    #[error("image manifest missing required layer with media type '{0}'")]
+    MissingLayer(&'static str),
 
     #[error("overlay creation failed: {0}")]
     OverlayFailed(String),
@@ -39,11 +46,29 @@ pub enum ImageError {
     Io(#[from] std::io::Error),
 }
 
+/// Media types attached to each layer of a basis node-image artifact by
+/// `scripts/build-node-image.sh`.
+const MEDIA_TYPE_QCOW2: &str = "application/vnd.lattice.node.v1+qcow2";
+const MEDIA_TYPE_KERNEL: &str = "application/vnd.lattice.node.v1+kernel";
+const MEDIA_TYPE_INITRD: &str = "application/vnd.lattice.node.v1+initrd";
+
+/// Paths to a node image's three cached artifacts on disk.
+pub struct CachedImage {
+    pub rootfs: PathBuf,
+    pub kernel: PathBuf,
+    pub initrd: PathBuf,
+}
+
 pub struct ImageManager {
     images_dir: PathBuf,
     /// Per-registry credentials, keyed by registry host (e.g., "ghcr.io").
     /// Empty map means every pull is anonymous.
     auth: HashMap<String, RegistryAuth>,
+    /// Per-image-ref locks. When N CreateVm commands arrive at once for
+    /// the same image, one winner takes the lock and pulls; the others
+    /// await it, find the cache populated, and return without touching
+    /// the network or the shared `.partial` side files.
+    pull_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl ImageManager {
@@ -53,31 +78,86 @@ impl ImageManager {
 
     pub fn with_auth(images_dir: PathBuf, auth: HashMap<String, RegistryAuth>) -> Self {
         std::fs::create_dir_all(&images_dir).ok();
-        Self { images_dir, auth }
+        Self {
+            images_dir,
+            auth,
+            pull_locks: Mutex::new(HashMap::new()),
+        }
     }
 
-    /// Ensure the base image is cached locally. Returns the path to the
-    /// cached base image.
-    pub async fn ensure_cached(&self, image_ref: &str) -> Result<PathBuf, ImageError> {
-        let cache_name = image_ref_to_filename(image_ref);
-        let cached_path = self.images_dir.join(&cache_name);
+    /// Ensure the rootfs, kernel, and initrd for `image_ref` are cached
+    /// locally. Fetches any missing layer; no-op if all three are
+    /// already present. Concurrent callers for the same `image_ref`
+    /// serialize on a per-ref lock so only one pull runs.
+    pub async fn ensure_cached(&self, image_ref: &str) -> Result<CachedImage, ImageError> {
+        let prefix = image_ref_to_prefix(image_ref);
+        let rootfs = self.images_dir.join(format!("{prefix}.qcow2"));
+        let kernel = self.images_dir.join(format!("{prefix}.vmlinuz"));
+        let initrd = self.images_dir.join(format!("{prefix}.initrd"));
 
-        if cached_path.exists() {
-            info!(image = %image_ref, path = %cached_path.display(), "image already cached");
-            return Ok(cached_path);
+        // Fast path: everything cached. Exists-check is racy against a
+        // concurrent puller still writing a `.partial`, but that's what
+        // the per-image lock below is for — if any file is missing we
+        // take the lock and re-check under it.
+        if rootfs.exists() && kernel.exists() && initrd.exists() {
+            return Ok(CachedImage {
+                rootfs,
+                kernel,
+                initrd,
+            });
+        }
+
+        let lock = self.lock_for(image_ref).await;
+        let _guard = lock.lock().await;
+
+        // Re-check under the lock. If we raced an earlier puller, the
+        // cache is now populated and we return without hitting the
+        // network.
+        if rootfs.exists() && kernel.exists() && initrd.exists() {
+            return Ok(CachedImage {
+                rootfs,
+                kernel,
+                initrd,
+            });
         }
 
         info!(image = %image_ref, "pulling image");
-        self.pull_oci(image_ref, &cached_path).await?;
-        Ok(cached_path)
+        self.pull_oci(
+            image_ref,
+            &[
+                (MEDIA_TYPE_QCOW2, rootfs.as_path()),
+                (MEDIA_TYPE_KERNEL, kernel.as_path()),
+                (MEDIA_TYPE_INITRD, initrd.as_path()),
+            ],
+        )
+        .await?;
+        Ok(CachedImage {
+            rootfs,
+            kernel,
+            initrd,
+        })
     }
 
-    async fn pull_oci(&self, image_ref: &str, dest: &Path) -> Result<(), ImageError> {
-        let reference: Reference = image_ref
-            .parse()
-            .map_err(|e: oci_client::ParseError| {
-                ImageError::BadReference(image_ref.to_string(), e.to_string())
-            })?;
+    /// Get or create the lock for an image ref. The map grows one entry
+    /// per distinct ref the agent has ever pulled — bounded by the
+    /// number of node-image tags the deploy uses in practice (typically
+    /// one per k8s minor version), so no reaping is needed.
+    async fn lock_for(&self, image_ref: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.pull_locks.lock().await;
+        locks
+            .entry(image_ref.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn pull_oci(
+        &self,
+        image_ref: &str,
+        targets: &[(&'static str, &Path)],
+    ) -> Result<(), ImageError> {
+        let reference: Reference = image_ref.parse().map_err(|e: oci_client::ParseError| {
+            ImageError::BadReference(image_ref.to_string(), e.to_string())
+        })?;
         let auth = self
             .auth
             .get(reference.registry())
@@ -90,27 +170,47 @@ impl ImageManager {
             .await
             .map_err(|e| ImageError::PullFailed(format!("fetching manifest: {e}")))?;
 
-        let layer = manifest.layers.first().ok_or(ImageError::EmptyManifest)?;
+        for (media_type, dest) in targets {
+            if dest.exists() {
+                continue;
+            }
+            let layer = manifest
+                .layers
+                .iter()
+                .find(|l| l.media_type == *media_type)
+                .ok_or(ImageError::MissingLayer(media_type))?;
 
-        // Stream the blob straight to disk via a temp file so a failed
-        // pull never leaves a truncated cache entry that a later run
-        // mistakes for a valid image.
-        let tmp = dest.with_extension("partial");
-        let mut out = tokio::fs::File::create(&tmp).await?;
-        let mut stream = client
-            .pull_blob_stream(&reference, layer)
-            .await
-            .map_err(|e| ImageError::PullFailed(format!("fetching blob: {e}")))?;
-        while let Some(chunk) = stream
-            .try_next()
-            .await
-            .map_err(|e| ImageError::PullFailed(format!("reading blob: {e}")))?
-        {
-            out.write_all(&chunk).await?;
+            info!(media_type = %media_type, dest = %dest.display(), size = layer.size, "pulling layer");
+            // Stream to a `.partial` side file, then atomically rename so
+            // a failed pull never leaves a truncated cache entry that a
+            // later run mistakes for valid.
+            let tmp = dest.with_extension("partial");
+            let mut out = tokio::fs::File::create(&tmp).await?;
+            let mut stream = client
+                .pull_blob_stream(&reference, layer)
+                .await
+                .map_err(|e| ImageError::PullFailed(format!("fetching blob: {e}")))?;
+            while let Some(chunk) = stream
+                .try_next()
+                .await
+                .map_err(|e| ImageError::PullFailed(format!("reading blob: {e}")))?
+            {
+                out.write_all(&chunk).await?;
+            }
+            out.flush().await?;
+            drop(out);
+
+            if *media_type == MEDIA_TYPE_QCOW2 {
+                // Ubuntu's cloud image ships qcow2 with compressed clusters.
+                // Small on the registry (~600MB) but cloud-hypervisor can't
+                // read compressed clusters at runtime — `qemu-img convert`
+                // without `-c` rewrites them uncompressed at the cache path.
+                decompress_qcow2_in_place(&tmp, dest).await?;
+                tokio::fs::remove_file(&tmp).await.ok();
+            } else {
+                tokio::fs::rename(&tmp, dest).await?;
+            }
         }
-        out.flush().await?;
-        drop(out);
-        tokio::fs::rename(&tmp, dest).await?;
         Ok(())
     }
 
@@ -151,9 +251,21 @@ impl ImageManager {
     }
 
     /// Create a cloud-init ISO (cidata) with network config and userdata.
+    ///
+    /// `instance_id` must be unique per VM: kubeadm's kubelet arg
+    /// `provider-id=basis://{{ ds.meta_data.instance_id }}` expands from
+    /// this, so the value has to match what
+    /// `basis-controller::provider_id()` returns after the `basis://`
+    /// scheme. Callers pass the basis VM id.
+    ///
+    /// `hostname` sets the guest's `local-hostname` so every VM's Node
+    /// object has a distinct name; a shared hostname makes the cluster
+    /// join the second node over the first.
     pub async fn create_cloud_init_iso(
         &self,
         vm_dir: &Path,
+        instance_id: &str,
+        hostname: &str,
         userdata: &[u8],
         ip_address: &str,
         gateway: &str,
@@ -166,7 +278,7 @@ impl ImageManager {
         std::fs::write(cidata_dir.join("user-data"), userdata)?;
         std::fs::write(
             cidata_dir.join("meta-data"),
-            "instance-id: basis\nlocal-hostname: basis\n",
+            format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n"),
         )?;
 
         let dns_entries: String = dns_servers
@@ -235,9 +347,37 @@ impl ImageManager {
     }
 }
 
-/// Convert an image reference to a safe filename for the cache.
-fn image_ref_to_filename(image_ref: &str) -> String {
-    image_ref.replace(['/', ':', '.'], "_") + ".qcow2"
+/// Convert an image reference to a safe filename stem for the cache.
+/// The three layers share this stem with different extensions — see
+/// `ensure_cached`.
+fn image_ref_to_prefix(image_ref: &str) -> String {
+    image_ref.replace(['/', ':', '.'], "_")
+}
+
+/// Run `qemu-img convert -O qcow2 src dst`, which rewrites compressed
+/// clusters as uncompressed (no `-c` flag passed) so cloud-hypervisor
+/// can read every cluster at runtime.
+async fn decompress_qcow2_in_place(src: &Path, dst: &Path) -> Result<(), ImageError> {
+    let status = Command::new("qemu-img")
+        .args([
+            "convert",
+            "-f",
+            "qcow2",
+            "-O",
+            "qcow2",
+            &src.to_string_lossy(),
+            &dst.to_string_lossy(),
+        ])
+        .status()
+        .await
+        .map_err(|e| ImageError::PullFailed(format!("qemu-img spawn: {e}")))?;
+    if !status.success() {
+        tokio::fs::remove_file(dst).await.ok();
+        return Err(ImageError::PullFailed(
+            "qemu-img convert failed stripping qcow2 compression".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -245,17 +385,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_image_ref_to_filename_oci() {
-        let name = image_ref_to_filename("ghcr.io/evan-hines-js/lattice-node:v1.32.0");
-        assert_eq!(name, "ghcr_io_evan-hines-js_lattice-node_v1_32_0.qcow2");
-        assert!(!name.contains('/'));
-        assert!(!name.contains(':'));
+    fn prefix_is_filename_safe() {
+        let p = image_ref_to_prefix("ghcr.io/evan-hines-js/lattice-node:v1.32.0");
+        assert_eq!(p, "ghcr_io_evan-hines-js_lattice-node_v1_32_0");
+        assert!(!p.contains('/'));
+        assert!(!p.contains(':'));
+        assert!(!p.contains('.'));
     }
 
     #[test]
-    fn test_image_ref_to_filename_deterministic() {
-        let a = image_ref_to_filename("test:latest");
-        let b = image_ref_to_filename("test:latest");
-        assert_eq!(a, b);
+    fn prefix_is_deterministic() {
+        assert_eq!(
+            image_ref_to_prefix("test:latest"),
+            image_ref_to_prefix("test:latest"),
+        );
     }
 }

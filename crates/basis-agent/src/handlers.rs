@@ -36,15 +36,17 @@ pub async fn create_vm(
     let vm_dir_path = vms_dir.join(&cmd.vm_id);
     std::fs::create_dir_all(&vm_dir_path)?;
 
-    let base_image = image_mgr.ensure_cached(&cmd.image).await?;
+    let base = image_mgr.ensure_cached(&cmd.image).await?;
 
     let disk_path = image_mgr
-        .create_overlay(&base_image, &vm_dir_path, cmd.disk_gib)
+        .create_overlay(&base.rootfs, &vm_dir_path, cmd.disk_gib)
         .await?;
 
     let cloud_init_path = image_mgr
         .create_cloud_init_iso(
             &vm_dir_path,
+            &cmd.vm_id,
+            &cmd.name,
             &cmd.bootstrap_data,
             &cmd.ip_address,
             &cmd.gateway,
@@ -63,7 +65,15 @@ pub async fn create_vm(
     vm_mgr
         .lock()
         .await
-        .create_vm(cmd, &disk_path, &cloud_init_path, &tap_name, &vfio_devices)
+        .create_vm(
+            cmd,
+            &base.kernel,
+            &base.initrd,
+            &disk_path,
+            &cloud_init_path,
+            &tap_name,
+            &vfio_devices,
+        )
         .await?;
 
     agent_db
@@ -247,21 +257,20 @@ mod tests {
 
         let vm_mgr = Arc::new(Mutex::new(VmManager::new(
             std::env::temp_dir().join("basis-test-reconcile"),
-            std::path::PathBuf::from("/nonexistent/hypervisor-fw"),
         )));
         let net_mgr = NetworkManager::new("test-br".to_string(), "lo".to_string());
 
-        reconcile_against_expected(
-            &["keep".to_string()],
-            &vm_mgr,
-            &net_mgr,
-            &db,
-        )
-        .await
-        .unwrap();
+        reconcile_against_expected(&["keep".to_string()], &vm_mgr, &net_mgr, &db)
+            .await
+            .unwrap();
 
-        let remaining: Vec<String> =
-            db.list_vms().await.unwrap().into_iter().map(|v| v.vm_id).collect();
+        let remaining: Vec<String> = db
+            .list_vms()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.vm_id)
+            .collect();
         assert_eq!(remaining, vec!["keep".to_string()]);
     }
 
@@ -273,18 +282,12 @@ mod tests {
 
         let vm_mgr = Arc::new(Mutex::new(VmManager::new(
             std::env::temp_dir().join("basis-test-reconcile-noop"),
-            std::path::PathBuf::from("/nonexistent/hypervisor-fw"),
         )));
         let net_mgr = NetworkManager::new("test-br".to_string(), "lo".to_string());
 
-        reconcile_against_expected(
-            &["a".to_string(), "b".to_string()],
-            &vm_mgr,
-            &net_mgr,
-            &db,
-        )
-        .await
-        .unwrap();
+        reconcile_against_expected(&["a".to_string(), "b".to_string()], &vm_mgr, &net_mgr, &db)
+            .await
+            .unwrap();
 
         assert_eq!(db.list_vms().await.unwrap().len(), 2);
     }

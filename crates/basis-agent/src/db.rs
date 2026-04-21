@@ -132,11 +132,9 @@ impl AgentDb {
     }
 
     pub async fn list_vms(&self) -> Result<Vec<LocalVmRow>, AgentDbError> {
-        Ok(
-            sqlx::query_as::<_, LocalVmRow>("SELECT * FROM local_vms")
-                .fetch_all(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_as::<_, LocalVmRow>("SELECT * FROM local_vms")
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     pub async fn get_vm(&self, vm_id: &str) -> Result<Option<LocalVmRow>, AgentDbError> {
@@ -219,17 +217,11 @@ mod tests {
         assert!(db.get_host_id().await.unwrap().is_none());
 
         db.set_host_id("host-abc-123").await.unwrap();
-        assert_eq!(
-            db.get_host_id().await.unwrap().unwrap(),
-            "host-abc-123"
-        );
+        assert_eq!(db.get_host_id().await.unwrap().unwrap(), "host-abc-123");
 
         // Overwrite
         db.set_host_id("host-xyz-456").await.unwrap();
-        assert_eq!(
-            db.get_host_id().await.unwrap().unwrap(),
-            "host-xyz-456"
-        );
+        assert_eq!(db.get_host_id().await.unwrap().unwrap(), "host-xyz-456");
     }
 
     #[tokio::test]
@@ -313,8 +305,7 @@ mod tests {
         db.insert_vm(&vm).await.unwrap();
 
         let fetched = db.get_vm("gpu-vm").await.unwrap().unwrap();
-        let addrs: Vec<String> =
-            serde_json::from_str(&fetched.gpu_pci_addresses).unwrap();
+        let addrs: Vec<String> = serde_json::from_str(&fetched.gpu_pci_addresses).unwrap();
         assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0], "0000:41:00.0");
     }

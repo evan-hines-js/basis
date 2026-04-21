@@ -3,7 +3,13 @@
 basis_bin_dir: /usr/local/bin
 basis_config_dir: /etc/basis
 basis_tls_dir: "{{ basis_config_dir }}/tls"
-basis_data_dir: /var/lib/basis
+# VM overlays, cached OCI images, and cloud-init ISOs all live here. Put
+# this on an enterprise SSD with power-loss protection — guest etcd
+# fsyncs hit this disk directly, and consumer SSD tail latency produces
+# multi-second WAL commits that cascade into lease-expiry storms across
+# the whole control plane. `/ent-zfspool` on the current homelab is a
+# pre-mounted ZFS pool on Intel DC S-series drives.
+basis_data_dir: /ent-zfspool/basis
 
 # Controller bind + well-known server SAN. `basis_controller_san` must
 # match the SAN we put on the controller's server cert AND the value the
@@ -27,15 +33,22 @@ basis_pki_dir: "{{ playbook_dir }}/pki"
 basis_ca_validity_days: 3650
 basis_leaf_validity_days: 365
 
-# Default IP pool. Must be a range OUTSIDE your router's DHCP pool.
-# Basis hands out static IPs via cloud-init — DHCP collisions mean
-# broken VMs with no good diagnostic.
+# Default IP pool. Must be a range OUTSIDE your router's DHCP pool —
+# basis hands out static IPs via cloud-init, so a DHCP collision shows
+# up as a broken VM with no good diagnostic.
+#
+# `vm_range` is where the controller auto-picks IPs for VMs. `vip_range`
+# is a disjoint sub-range reserved for control-plane VIPs (one per
+# cluster). They have to be disjoint so a busy cluster's VM allocation
+# can never race a pending CreateCluster for a sibling's VIP.
 basis_ip_pool:
   name: default
   cidr: 10.0.0.0/24
   gateway: 10.0.0.1
-  range_start: 10.0.0.210
-  range_end: 10.0.0.250
+  vm_range_start: 10.0.0.220
+  vm_range_end: 10.0.0.250
+  vip_range_start: 10.0.0.210
+  vip_range_end: 10.0.0.219
 
 # Credentials for private OCI registries basis-agent pulls VM images
 # from. Override in host/group vars or vault when deploying against
@@ -54,13 +67,10 @@ basis_bridge: vmbr0
 
 # Cloud Hypervisor release to install. A static x86_64 binary from the
 # official GitHub release.
-cloud_hypervisor_version: "45.0"
+cloud_hypervisor_version: "51.1"
 cloud_hypervisor_url: "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v{{ cloud_hypervisor_version }}/cloud-hypervisor-static"
 
-# Minimal UEFI firmware Cloud Hypervisor loads to boot guest VMs. With
-# this in place stock Ubuntu/Debian cloud images (qcow2) boot unmodified.
-# Must match the path basis-agent's HostSpec.firmware_path expects.
-cloud_hypervisor_fw_version: "0.4.2"
-cloud_hypervisor_fw_url: "https://github.com/cloud-hypervisor/rust-hypervisor-firmware/releases/download/{{ cloud_hypervisor_fw_version }}/hypervisor-fw"
-cloud_hypervisor_fw_dir: /usr/share/cloud-hypervisor
-cloud_hypervisor_fw_path: "{{ cloud_hypervisor_fw_dir }}/hypervisor-fw"
+# Note: we do NOT install rust-hypervisor-firmware. basis-agent boots
+# guests directly with `cloud-hypervisor --kernel --initramfs` using the
+# kernel+initrd shipped as OCI layers alongside each node image. The
+# firmware blob would only be needed if we switched to EFI boot.

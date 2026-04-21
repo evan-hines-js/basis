@@ -8,16 +8,10 @@ use tracing::{info, warn};
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
     #[error("vfio bind failed for {pci_address}: {reason}")]
-    BindFailed {
-        pci_address: String,
-        reason: String,
-    },
+    BindFailed { pci_address: String, reason: String },
 
     #[error("vfio unbind failed for {pci_address}: {reason}")]
-    UnbindFailed {
-        pci_address: String,
-        reason: String,
-    },
+    UnbindFailed { pci_address: String, reason: String },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -184,7 +178,10 @@ fn extract_model_name(lspci_line: &str) -> String {
 /// GPUs connected by any NVLink link share a group. GPUs with no NVLink
 /// edges remain ungrouped and are assigned `0` by the caller.
 async fn nvlink_groups_from_nvidia_smi() -> Result<HashMap<String, u32>, GpuError> {
-    let topo = Command::new("nvidia-smi").args(["topo", "-m"]).output().await?;
+    let topo = Command::new("nvidia-smi")
+        .args(["topo", "-m"])
+        .output()
+        .await?;
     if !topo.status.success() {
         return Err(GpuError::BindFailed {
             pci_address: String::new(),
@@ -403,9 +400,8 @@ mod tests {
     #[test]
     fn test_assign_nvlink_groups_union() {
         // Edges 0-1, 1-2, 3-4 → groups {0,1,2} and {3,4}.
-        let index_to_pci: HashMap<u32, String> = (0..5)
-            .map(|i| (i, format!("0000:4{i}:00.0")))
-            .collect();
+        let index_to_pci: HashMap<u32, String> =
+            (0..5).map(|i| (i, format!("0000:4{i}:00.0"))).collect();
         let edges = vec![(0, 1), (1, 2), (3, 4)];
         let groups = assign_nvlink_groups(&index_to_pci, &edges);
 

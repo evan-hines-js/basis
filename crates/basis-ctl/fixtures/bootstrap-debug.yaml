@@ -1,0 +1,17 @@
+#cloud-config
+# Minimal cloud-init for debugging VM boot — no kubeadm, no networking
+# beyond what cidata already configures. Enables the serial getty so
+# `journalctl -u basis-vm-<id>.service` on the hypervisor host shows the
+# guest login prompt, and sets a password on the default `ubuntu` user
+# so you can SSH in without keys.
+#
+# Login: ssh ubuntu@<vm-ip>  (password: basis)
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  users:
+    - name: ubuntu
+      password: basis
+      type: text
+runcmd:
+  - [ systemctl, enable, --now, 'serial-getty@ttyS0.service' ]

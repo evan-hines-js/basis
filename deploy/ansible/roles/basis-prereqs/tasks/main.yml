@@ -38,34 +38,12 @@
     mode: "0755"
     owner: root
     group: root
-  # Skip if the binary is already present at the expected version.
+    # `force: true` is required: without it, get_url skips the download
+    # whenever `dest` already exists, so version bumps silently no-op.
+    # `when` still gates it, so we only pay the download cost on upgrade.
+    force: true
   # `cloud-hypervisor --version` prints `cloud-hypervisor v<N>.<N>.<N>`.
   when: ch_version_check.rc != 0 or cloud_hypervisor_version not in (ch_version_check.stdout | default(''))
-
-- name: Ensure cloud-hypervisor firmware directory exists
-  ansible.builtin.file:
-    path: "{{ cloud_hypervisor_fw_dir }}"
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
-
-- name: Check installed cloud-hypervisor firmware version
-  ansible.builtin.stat:
-    path: "{{ cloud_hypervisor_fw_path }}"
-  register: ch_fw_check
-
-- name: Download cloud-hypervisor firmware blob
-  # rust-hypervisor-firmware is the minimal UEFI blob Cloud-Hypervisor uses
-  # to boot stock Linux cloud images (same pattern CAPMOX's Proxmox
-  # templates use — the image itself is unmodified).
-  ansible.builtin.get_url:
-    url: "{{ cloud_hypervisor_fw_url }}"
-    dest: "{{ cloud_hypervisor_fw_path }}"
-    mode: "0644"
-    owner: root
-    group: root
-  when: not ch_fw_check.stat.exists
 
 - name: Verify /dev/kvm exists (virtualization enabled in BIOS)
   ansible.builtin.stat:

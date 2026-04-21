@@ -1,10 +1,14 @@
 #!/bin/bash
 # Build the lattice-node VM image.
 #
-# Produces a qcow2 disk image containing an Ubuntu 24.04 base with
+# Produces an uncompressed qcow2 containing an Ubuntu 24.04 base with
 # kubelet / kubeadm / containerd pre-installed for a specific Kubernetes
-# version, then pushes it as an OCI artifact so basis-agent can pull it
-# via skopeo.
+# version, then pushes it as an OCI artifact so basis-agent can pull it.
+#
+# We push qcow2 (sparse, ~2 GiB) rather than raw (~10 GiB logical) so
+# uploads stay tolerable. basis-agent converts the qcow2 to raw locally
+# on first pull — cloud-hypervisor 45 needs a raw backing file for
+# overlay disks (qcow2-backed-by-qcow2 trips EINVAL on io_uring reads).
 #
 # Output tag: ghcr.io/evan-hines-js/lattice-node:v<K8S_VERSION>
 #
@@ -72,6 +76,35 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# If a prior run was SIGKILL'd, its trap never fired and we've inherited
+# mounts, a running qemu-nbd daemon, and/or stuck kernel state on the nbd
+# device (manifests as "Input/output error" when reconnecting). Force a
+# full reset before touching anything.
+reclaim_nbd() {
+    set +e
+    # 1. Unmount leftover mounts backed by our nbd device. `tac` so we
+    #    unmount children (/dev, /dev/pts, ...) before their parents.
+    awk -v dev="$NBD_DEV" '$1 ~ "^"dev {print $2}' /proc/mounts \
+        | tac | xargs -r -n1 umount -l 2>/dev/null
+
+    # 2. Graceful disconnect. A stale qemu-nbd daemon can block rmmod; if
+    #    disconnect doesn't reap it, kill explicitly.
+    qemu-nbd --disconnect "$NBD_DEV" 2>/dev/null
+    pgrep -f "qemu-nbd.*$NBD_DEV" | xargs -r kill 2>/dev/null
+    sleep 1
+    pgrep -f "qemu-nbd.*$NBD_DEV" | xargs -r kill -9 2>/dev/null
+
+    # 3. Force-reload the nbd module. A prior unclean disconnect leaves
+    #    per-device state stuck inside the kernel — rmmod+modprobe is the
+    #    only userspace way to clear it short of a reboot. The main script
+    #    re-modprobes below before qemu-nbd --connect.
+    if lsmod | grep -q '^nbd '; then
+        rmmod nbd 2>/dev/null
+    fi
+    set -e
+}
+reclaim_nbd
+
 if [[ ! -f "$BASE_IMAGE" ]]; then
     echo "Downloading Ubuntu 24.04 cloud image..."
     curl -fSL "$BASE_IMAGE_URL" -o "$BASE_IMAGE"
@@ -118,6 +151,11 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
 apt-get upgrade -y -o Dpkg::Options::=--force-confnew
+# Explicit kernel install. Ubuntu's minimal cloud image ships
+# `linux-image-virtual` (kernel-stub only); we replace it with the
+# generic meta-package so `/boot/vmlinuz-*` + `/boot/initrd.img-*`
+# exist on-disk for direct-kernel boot (see build-node-image.sh top).
+apt-get install -y linux-image-generic
 apt-get install -y curl ca-certificates apt-transport-https gnupg socat conntrack ebtables ethtool containerd
 
 mkdir -p /etc/apt/keyrings
@@ -140,7 +178,56 @@ sed -i '/ swap / s/^/#/' /etc/fstab
 truncate -s 0 /etc/machine-id
 CHROOT_EOF
 
+# Extract the guest kernel and initrd *before* cleanup unmounts the
+# rootfs — cloud-hypervisor's minimal firmware (rust-hypervisor-firmware)
+# doesn't implement the UEFI variable / TPM / Secure Boot surface that
+# Ubuntu Noble's shim+grub depend on, so the EFI-chained boot on Noble
+# gets the kernel running but never loads an initrd and panics mounting
+# rootfs. We skip the entire chain by booting the kernel directly with
+# `cloud-hypervisor --kernel --initramfs`.
+#
+# Ubuntu cloud images don't ship `/boot/vmlinuz` / `/boot/initrd.img`
+# symlinks — only the versioned files from the installed kernel package.
+# Glob to find them; there's exactly one each after a fresh install.
+KERNEL_OUT="$WORK_DIR/lattice-node-v${K8S_VERSION}.vmlinuz"
+INITRD_OUT="$WORK_DIR/lattice-node-v${K8S_VERSION}.initrd"
+echo ""
+echo "=== $MOUNT_DIR/boot contents (root of mounted rootfs) ==="
+ls -la "$MOUNT_DIR/boot" 2>&1 || true
+echo ""
+echo "=== device partitions on $NBD_DEV ==="
+lsblk -f "$NBD_DEV" 2>&1 || true
+echo ""
+echo "=== current mounts from our nbd device ==="
+grep "$NBD_DEV" /proc/mounts || true
+echo ""
+
+shopt -s nullglob
+KERNEL_SRCS=("$MOUNT_DIR"/boot/vmlinuz-*)
+INITRD_SRCS=("$MOUNT_DIR"/boot/initrd.img-*)
+shopt -u nullglob
+
+if [[ ${#KERNEL_SRCS[@]} -ne 1 ]]; then
+    echo "ERROR: expected exactly one vmlinuz-*, found ${#KERNEL_SRCS[@]}"
+    exit 1
+fi
+if [[ ${#INITRD_SRCS[@]} -ne 1 ]]; then
+    echo "ERROR: expected exactly one initrd.img-*, found ${#INITRD_SRCS[@]}"
+    exit 1
+fi
+cp "${KERNEL_SRCS[0]}" "$KERNEL_OUT"
+cp "${INITRD_SRCS[0]}" "$INITRD_OUT"
+
+cleanup
+
+# We deliberately leave the qcow2 clusters as-is (Ubuntu ships them
+# compressed). That keeps the OCI upload small; basis-agent strips the
+# compression locally after pull since cloud-hypervisor can't read
+# compressed clusters at runtime.
+
 echo "Built $OUTPUT_IMAGE"
+echo "Kernel  $KERNEL_OUT"
+echo "Initrd  $INITRD_OUT"
 
 if [[ "$PUSH" == "--push" ]]; then
     echo "Pushing $IMAGE_TAG..."
@@ -148,7 +235,27 @@ if [[ "$PUSH" == "--push" ]]; then
         echo "Error: oras CLI not installed. See https://oras.land/docs/installation/"
         exit 1
     fi
-    (cd "$WORK_DIR" && oras push "$IMAGE_TAG" \
-        "lattice-node-v${K8S_VERSION}.qcow2:application/vnd.lattice.node.v1+qcow2")
-    echo "Pushed $IMAGE_TAG"
+    # Capture the digest of the manifest we're about to push. `oras push`
+    # can report "Pushed" even when the manifest PUT was denied (HEAD
+    # errors are printed but don't fail the process), so we verify the
+    # registry actually serves the digest we just uploaded.
+    PUSH_OUT=$(cd "$WORK_DIR" && oras push "$IMAGE_TAG" \
+        "lattice-node-v${K8S_VERSION}.qcow2:application/vnd.lattice.node.v1+qcow2" \
+        "lattice-node-v${K8S_VERSION}.vmlinuz:application/vnd.lattice.node.v1+kernel" \
+        "lattice-node-v${K8S_VERSION}.initrd:application/vnd.lattice.node.v1+initrd" 2>&1)
+    echo "$PUSH_OUT"
+    LOCAL_DIGEST=$(echo "$PUSH_OUT" | awk '/^Digest:/ {print $2}')
+    if [[ -z "$LOCAL_DIGEST" ]]; then
+        echo "Error: oras push did not report a Digest — push likely failed"
+        exit 1
+    fi
+    REMOTE_DIGEST=$(oras manifest fetch --descriptor "$IMAGE_TAG" 2>/dev/null | jq -r .digest)
+    if [[ "$LOCAL_DIGEST" != "$REMOTE_DIGEST" ]]; then
+        echo "Error: registry is serving a stale manifest for $IMAGE_TAG"
+        echo "  pushed: $LOCAL_DIGEST"
+        echo "  remote: $REMOTE_DIGEST"
+        echo "  → check your oras login / token scopes (write:packages required)"
+        exit 1
+    fi
+    echo "Pushed $IMAGE_TAG (verified digest $REMOTE_DIGEST)"
 fi

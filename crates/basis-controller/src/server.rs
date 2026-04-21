@@ -44,9 +44,7 @@ fn peer_cn<T>(req: &Request<T>) -> Result<String, Status> {
     match tls::request_peer_cn(req) {
         Ok(Some(cn)) => Ok(cn),
         Ok(None) => Err(Status::unauthenticated("TLS required")),
-        Err(e) => Err(Status::unauthenticated(format!(
-            "peer certificate: {e}"
-        ))),
+        Err(e) => Err(Status::unauthenticated(format!("peer certificate: {e}"))),
     }
 }
 
@@ -202,7 +200,14 @@ impl BasisApiService {
 }
 
 /// Total time `CreateMachine` will wait for the agent to report RUNNING.
-const CREATE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+///
+/// Sized for cold starts on a fresh agent: a node-image pull is ~600 MB
+/// plus a qemu-img decompress pass on the qcow2 layer, so the first VM
+/// of a given image easily takes several minutes end-to-end. Subsequent
+/// VMs hit the cache and return in ~20 s. Clients that want to bail
+/// earlier set their own gRPC deadline — this is only the server-side
+/// ceiling.
+const CREATE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[tonic::async_trait]
 impl basis_server::Basis for BasisApiService {
@@ -212,11 +217,13 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<CreateClusterResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
-        info!(name = %req.name, ip_pool = %req.ip_pool, "CreateCluster received");
+        info!(
+            name = %req.name,
+            ip_pool = %req.ip_pool,
+            "CreateCluster received"
+        );
         if req.name.is_empty() || req.ip_pool.is_empty() {
-            return Err(Status::invalid_argument(
-                "name and ip_pool are required",
-            ));
+            return Err(Status::invalid_argument("name and ip_pool are required"));
         }
 
         // Idempotent by name: CAPI reconcilers retry after partial failures
@@ -243,19 +250,21 @@ impl basis_server::Basis for BasisApiService {
 
         let cluster_id = uuid::Uuid::new_v4().to_string();
 
-        // Reserve the control-plane VIP from the pool before inserting the
-        // cluster row so we don't commit a partial cluster on failure.
-        let vip = self
+        // Allocate a VIP from the pool's VIP sub-range before inserting
+        // the cluster row so we don't commit a partial cluster on
+        // failure. The VIP sub-range is disjoint from the VM auto-
+        // allocation range, so this never races a concurrent VM create.
+        let control_plane_endpoint = self
             .db
-            .allocate_ip(&req.ip_pool, IpOwner::ClusterVip(&cluster_id))
+            .allocate_vip(&req.ip_pool, IpOwner::ClusterVip(&cluster_id))
             .await
-            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
         let row = ClusterRow {
             id: cluster_id.clone(),
             name: req.name.clone(),
             ip_pool: req.ip_pool.clone(),
-            control_plane_endpoint: vip.clone(),
+            control_plane_endpoint: control_plane_endpoint.clone(),
             created_at: now_rfc3339(),
         };
         if let Err(e) = self.db.insert_cluster(&row).await {
@@ -289,13 +298,13 @@ impl basis_server::Basis for BasisApiService {
         info!(
             cluster_id = %cluster_id,
             name = %req.name,
-            endpoint = %vip,
+            endpoint = %control_plane_endpoint,
             ip_pool = %req.ip_pool,
             "CreateCluster: new cluster provisioned"
         );
         Ok(Response::new(CreateClusterResponse {
             cluster_id,
-            control_plane_endpoint: vip,
+            control_plane_endpoint,
         }))
     }
 
@@ -349,11 +358,21 @@ impl basis_server::Basis for BasisApiService {
             .get_cluster(&req.cluster_id)
             .await
             .map_err(|e| Status::not_found(e.to_string()))?;
-        Ok(Response::new(Cluster {
-            cluster_id: cluster.id,
-            name: cluster.name,
-            ip_pool: cluster.ip_pool,
-            control_plane_endpoint: cluster.control_plane_endpoint,
+        Ok(Response::new(cluster_row_to_proto(cluster)))
+    }
+
+    async fn list_clusters(
+        &self,
+        request: Request<ListClustersRequest>,
+    ) -> Result<Response<ListClustersResponse>, Status> {
+        require_capi_caller(&request)?;
+        let clusters = self
+            .db
+            .list_clusters()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ListClustersResponse {
+            clusters: clusters.into_iter().map(cluster_row_to_proto).collect(),
         }))
     }
 
@@ -403,7 +422,7 @@ impl basis_server::Basis for BasisApiService {
             );
             return Ok(Response::new(CreateMachineResponse {
                 id: existing.id.clone(),
-                provider_id: provider_id(&existing.host_id, &existing.id),
+                provider_id: provider_id(&existing.id),
                 ip_address: existing.ip_address,
                 host: existing.host_id,
             }));
@@ -469,7 +488,7 @@ impl basis_server::Basis for BasisApiService {
                         })?;
                     Ok(Response::new(CreateMachineResponse {
                         id: existing.id.clone(),
-                        provider_id: provider_id(&existing.host_id, &existing.id),
+                        provider_id: provider_id(&existing.id),
                         ip_address: existing.ip_address,
                         host: existing.host_id,
                     }))
@@ -529,7 +548,7 @@ impl basis_server::Basis for BasisApiService {
                 info!(vm_id = %vm_id, host_id = %host_id, ip = %ip_address, "CreateMachine: agent reported RUNNING");
                 Ok(Response::new(CreateMachineResponse {
                     id: vm_id.clone(),
-                    provider_id: provider_id(&host_id, &vm_id),
+                    provider_id: provider_id(&vm_id),
                     ip_address,
                     host: host_id,
                 }))
@@ -737,7 +756,11 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
 
         let register = match first.payload {
             Some(agent_message::Payload::Register(r)) => r,
-            _ => return Err(Status::invalid_argument("first message must be RegisterHost")),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first message must be RegisterHost",
+                ))
+            }
         };
 
         // Agent's cert CN must match the hostname it's registering as.
@@ -867,13 +890,8 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
             while let Some(result) = inbound.next().await {
                 match result {
                     Ok(msg) => {
-                        if let Err(e) = handle_agent_message(
-                            &db,
-                            &pending_creates,
-                            &agent_host_id,
-                            msg,
-                        )
-                        .await
+                        if let Err(e) =
+                            handle_agent_message(&db, &pending_creates, &agent_host_id, msg).await
                         {
                             warn!(error = %e, host_id = %agent_host_id, "error handling agent message");
                         }
@@ -906,19 +924,15 @@ async fn handle_agent_message(
 ) -> anyhow::Result<()> {
     match msg.payload {
         Some(agent_message::Payload::Heartbeat(hb)) => {
-            db.update_host_heartbeat(&hb.host_id, &now_rfc3339()).await?;
+            db.update_host_heartbeat(&hb.host_id, &now_rfc3339())
+                .await?;
         }
         Some(agent_message::Payload::VmState(report)) => {
             let state = report.state();
             let now = now_rfc3339();
 
-            db.update_vm_state(
-                &report.vm_id,
-                state as i64,
-                &report.error_message,
-                &now,
-            )
-            .await?;
+            db.update_vm_state(&report.vm_id, state as i64, &report.error_message, &now)
+                .await?;
 
             // If this was a pending create, notify the waiter
             if state == MachineState::Running || state == MachineState::Failed {
@@ -941,16 +955,31 @@ async fn handle_agent_message(
     Ok(())
 }
 
-/// CAPI-shaped provider ID for a VM. The CAPI controller treats this as
-/// opaque — we only require that it's unique per VM and round-trippable
-/// back to `(host_id, vm_id)` for debugging.
-fn provider_id(host_id: &str, vm_id: &str) -> String {
-    format!("basis://{host_id}/{vm_id}")
+/// CAPI-shaped provider ID for a VM.
+///
+/// This value has to match what the kubelet inside the guest ends up
+/// reporting on `Node.spec.providerID`. Lattice templates
+/// `provider-id=basis://{{ ds.meta_data.instance_id }}` into kubeadm's
+/// kubelet args, and basis-agent writes `instance-id: <vm_id>` into
+/// cloud-init's meta-data — so the VM's reported providerID is
+/// `basis://<vm_id>`. We return the same here. If the two ever drift,
+/// CAPI's Machine reconciler never binds a NodeRef and the control
+/// plane never comes up.
+fn provider_id(vm_id: &str) -> String {
+    format!("basis://{vm_id}")
+}
+
+fn cluster_row_to_proto(row: ClusterRow) -> Cluster {
+    Cluster {
+        cluster_id: row.id,
+        name: row.name,
+        ip_pool: row.ip_pool,
+        control_plane_endpoint: row.control_plane_endpoint,
+    }
 }
 
 fn vm_to_machine(vm: &VmRow) -> Machine {
-    let gpu_devices: Vec<GpuDevice> =
-        parse_owned_json(&vm.gpu_assignments, "vms.gpu_assignments");
+    let gpu_devices: Vec<GpuDevice> = parse_owned_json(&vm.gpu_assignments, "vms.gpu_assignments");
 
     let gpus = gpu_devices
         .into_iter()
@@ -966,7 +995,7 @@ fn vm_to_machine(vm: &VmRow) -> Machine {
         name: vm.name.clone(),
         cluster_id: vm.cluster_id.clone(),
         host: vm.host_id.clone(),
-        provider_id: provider_id(&vm.host_id, &vm.id),
+        provider_id: provider_id(&vm.id),
         ip_address: vm.ip_address.clone(),
         state: vm.state as i32,
         cpu: vm.cpu as u32,

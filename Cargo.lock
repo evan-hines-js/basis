@@ -375,6 +375,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
+ "basis-client",
  "basis-common",
  "basis-proto",
  "clap",
@@ -391,6 +392,17 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "basis-client"
+version = "0.1.0"
+dependencies = [
+ "basis-common",
+ "basis-proto",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -437,6 +449,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "basis-ctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "basis-client",
+ "basis-common",
+ "basis-proto",
+ "clap",
+ "rustls",
+ "serde",
+ "serde_yaml_ng",
+ "tokio",
 ]
 
 [[package]]

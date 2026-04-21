@@ -1,0 +1,14 @@
+[package]
+name = "basis-client"
+version.workspace = true
+edition.workspace = true
+description = "Typed gRPC client for the Basis controller's CAPI-facing API"
+
+[dependencies]
+basis-proto.workspace = true
+basis-common.workspace = true
+
+tokio.workspace = true
+tonic.workspace = true
+
+thiserror.workspace = true

@@ -11,9 +11,15 @@ use serde::{Deserialize, Serialize};
 pub const API_GROUP: &str = "infrastructure.cluster.x-k8s.io";
 pub const API_VERSION: &str = "v1alpha1";
 
-/// Identifies a cluster that maps 1:1 to a Basis-side cluster. The
-/// `ipPool` is the only real user input — everything else is written
-/// by the reconciler once `CreateCluster` has run.
+/// Identifies a cluster that maps 1:1 to a Basis-side cluster.
+///
+/// User input is two fields: the `ipPool` to draw IPs from, and the
+/// `credentialsRef` that tells the provider how to reach the basis
+/// controller. The `controlPlaneEndpoint` is populated by the
+/// reconciler after basis allocates a VIP from the pool's VIP sub-
+/// range — per CAPI convention, the infrastructure provider is
+/// authoritative for the endpoint and CAPI core propagates it onto
+/// `Cluster.spec.controlPlaneEndpoint` for downstream consumers.
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[kube(
     group = "infrastructure.cluster.x-k8s.io",
@@ -26,14 +32,33 @@ pub const API_VERSION: &str = "v1alpha1";
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BasisClusterSpec {
-    /// Name of the Basis IP pool this cluster draws its VIP and VM IPs from.
+    /// Name of the Basis IP pool this cluster's VM IPs and VIP are
+    /// drawn from.
     pub ip_pool: String,
 
-    /// Set by the BasisCluster reconciler after calling `Basis.CreateCluster`.
-    /// CAPI requires this to be populated on `spec` so KubeadmControlPlane
-    /// can use it as the cluster's apiserver endpoint.
+    /// Reference to the Kubernetes Secret holding this cluster's
+    /// basis-controller connection material. The Secret must have keys
+    /// `serverUrl`, `cert`, `key`, `ca`; the first is the controller's
+    /// gRPC URL, the last three are PEM bytes for the mTLS client
+    /// identity whose CN is `basis-capi-provider`.
+    pub credentials_ref: CredentialsRef,
+
+    /// Populated by the reconciler after `Basis.CreateCluster` returns.
+    /// Never set by the user — if present on first apply, the
+    /// reconciler will overwrite it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane_endpoint: Option<ControlPlaneEndpoint>,
+}
+
+/// Kubernetes-style object reference for a Secret. Namespace is
+/// optional — when omitted, it defaults to the `BasisCluster`'s own
+/// namespace.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsRef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -88,8 +113,15 @@ pub struct BasisMachineSpec {
     pub gpus: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_constraints: Option<GpuConstraints>,
-    /// Set by the provider after CreateMachine succeeds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Set by the provider after CreateMachine succeeds. The JSON field
+    /// is `providerID` (not `providerId`) to match the CAPI contract —
+    /// CAPI's Machine reconciler reads this exact path off the
+    /// infrastructure object to bind a NodeRef.
+    #[serde(
+        default,
+        rename = "providerID",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub provider_id: Option<String>,
 }
 
@@ -105,7 +137,14 @@ pub struct GpuConstraints {
 pub struct BasisMachineStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initialization: Option<InitializationStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Mirrors `spec.providerID`. Kept on status only for observability
+    /// (`kubectl get basismachine` printer column); CAPI reads
+    /// `spec.providerID`.
+    #[serde(
+        default,
+        rename = "providerID",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub provider_id: Option<String>,
     /// Opaque Basis VM ID used on delete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,7 +230,3 @@ pub struct Condition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
 }
-
-/// Default port for the control-plane VIP. kubeadm's apiserver listens
-/// here on control-plane VMs.
-pub const DEFAULT_CONTROL_PLANE_PORT: u16 = 6443;

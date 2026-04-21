@@ -51,10 +51,7 @@ pub enum ResourceError {
         source: serde_yaml_ng::Error,
     },
 
-    #[error(
-        "{path}: unsupported apiVersion '{got}' (expected '{}')",
-        API_VERSION
-    )]
+    #[error("{path}: unsupported apiVersion '{got}' (expected '{}')", API_VERSION)]
     ApiVersion {
         path: std::path::PathBuf,
         got: String,
@@ -106,12 +103,11 @@ where
         });
     }
 
-    let spec: Spec = serde_yaml_ng::from_value(envelope.spec).map_err(|source| {
-        ResourceError::Parse {
+    let spec: Spec =
+        serde_yaml_ng::from_value(envelope.spec).map_err(|source| ResourceError::Parse {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
 
     Ok(Resource {
         api_version: envelope.api_version,

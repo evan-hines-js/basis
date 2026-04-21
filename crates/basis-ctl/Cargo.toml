@@ -1,0 +1,19 @@
+[package]
+name = "basis-ctl"
+version.workspace = true
+edition.workspace = true
+description = "CLI for talking to a Basis controller — the same gRPC surface basis-capi-provider uses, for tests and bring-up"
+
+[dependencies]
+basis-proto.workspace = true
+basis-common.workspace = true
+basis-client.workspace = true
+
+tokio.workspace = true
+rustls.workspace = true
+
+serde.workspace = true
+serde_yaml_ng.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true

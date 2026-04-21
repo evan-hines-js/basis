@@ -49,6 +49,7 @@ pub async fn reconcile_on_startup(
     agent_db: &AgentDb,
     vm_mgr: &Arc<Mutex<VmManager>>,
     net_mgr: &NetworkManager,
+    image_mgr: &crate::image::ImageManager,
 ) -> anyhow::Result<ReconcileReport> {
     let mut report = ReconcileReport {
         recovered: 0,
@@ -80,7 +81,7 @@ pub async fn reconcile_on_startup(
         .map(|vm_record| async move {
             (
                 vm_record.vm_id.clone(),
-                restart_vm(config, vm_record, vm_mgr, net_mgr).await,
+                restart_vm(config, vm_record, vm_mgr, net_mgr, image_mgr).await,
             )
         })
         .buffer_unordered(RESTART_CONCURRENCY)
@@ -152,6 +153,7 @@ async fn restart_vm(
     vm_record: &LocalVmRow,
     vm_mgr: &Arc<Mutex<VmManager>>,
     net_mgr: &NetworkManager,
+    image_mgr: &crate::image::ImageManager,
 ) -> Result<(), RestartError> {
     let vm_dir = config.vms_dir().join(&vm_record.vm_id);
     let disk_path = vm_dir.join("disk.qcow2");
@@ -160,6 +162,14 @@ async fn restart_vm(
     if !disk_path.exists() || !cloud_init_path.exists() {
         return Err(RestartError::DiskMissing);
     }
+
+    // Resolve the kernel + initrd paths out of the image cache. Same
+    // call the create path uses; it's a no-op when the image was
+    // already pulled (the normal case post-reboot).
+    let cached = image_mgr
+        .ensure_cached(&vm_record.image)
+        .await
+        .map_err(|e| RestartError::Other(e.into()))?;
 
     info!(vm_id = %vm_record.vm_id, "restarting VM after node reboot");
 
@@ -183,9 +193,7 @@ async fn restart_vm(
                     // best-effort cleanup
                     let _ = gpu::unbind_vfio(bound).await;
                 }
-                return Err(RestartError::GpuBindFailed(format!(
-                    "GPU {addr}: {e}"
-                )));
+                return Err(RestartError::GpuBindFailed(format!("GPU {addr}: {e}")));
             }
         }
     }
@@ -235,6 +243,8 @@ async fn restart_vm(
         .await
         .create_vm(
             &restart_cmd,
+            &cached.kernel,
+            &cached.initrd,
             &disk_path,
             &cloud_init_path,
             &tap_name,

@@ -55,8 +55,14 @@ impl RunningController {
             name: "default".to_string(),
             cidr: "10.0.10.0/24".to_string(),
             gateway: "10.0.10.1".to_string(),
-            range_start: "10.0.10.10".to_string(),
-            range_end: "10.0.10.250".to_string(),
+            vm_range: basis_controller::config::IpRange {
+                start: "10.0.10.20".to_string(),
+                end: "10.0.10.250".to_string(),
+            },
+            vip_range: basis_controller::config::IpRange {
+                start: "10.0.10.10".to_string(),
+                end: "10.0.10.19".to_string(),
+            },
         }])
         .await
         .unwrap();
@@ -135,7 +141,8 @@ impl Drop for RunningController {
     }
 }
 
-/// Create a cluster via the CAPI API and return its id + VIP.
+/// Create a cluster via the CAPI API and return its id + the VIP the
+/// controller allocated from the pool's vip sub-range.
 async fn create_cluster(running: &RunningController, name: &str) -> (String, String) {
     let mut capi = running.capi_client().await;
     let resp = capi
@@ -175,7 +182,10 @@ async fn register_agent(
     .await
     .unwrap();
 
-    let response = client.stream_messages(ReceiverStream::new(rx)).await.unwrap();
+    let response = client
+        .stream_messages(ReceiverStream::new(rx))
+        .await
+        .unwrap();
     let mut inbound = response.into_inner();
 
     let ack = match inbound.next().await.unwrap().unwrap().command {
@@ -239,8 +249,10 @@ async fn test_create_cluster_reserves_vip() {
     let (cluster_id, vip) = create_cluster(&running, "my-cluster").await;
 
     assert!(!cluster_id.is_empty());
-    // VIP is allocated from the start of the default pool.
-    assert_eq!(vip, "10.0.10.10");
+    // VIP was auto-allocated from the pool's vip sub-range (see the
+    // `IpPool` seeded in `start_with_reconcile`: vip_range is
+    // 10.0.10.10 – 10.0.10.19).
+    assert!(vip.starts_with("10.0.10.1"), "vip={vip}");
 
     // GetCluster returns the same values.
     let mut capi = running.capi_client().await;
@@ -252,7 +264,7 @@ async fn test_create_cluster_reserves_vip() {
         .unwrap()
         .into_inner();
     assert_eq!(got.cluster_id, cluster_id);
-    assert_eq!(got.control_plane_endpoint, "10.0.10.10");
+    assert_eq!(got.control_plane_endpoint, vip);
     assert_eq!(got.ip_pool, "default");
     assert_eq!(got.name, "my-cluster");
 }
@@ -261,7 +273,9 @@ async fn test_create_cluster_reserves_vip() {
 async fn test_create_cluster_is_idempotent_by_name() {
     // CAPI reconcilers retry after partial failures (cluster created in
     // basis but status patch never landed). A second CreateCluster with
-    // the same name must return the existing record, not error.
+    // the same name must return the existing record, not error — and
+    // crucially must return the SAME VIP, otherwise the reconciler would
+    // see drift between basis and the BasisCluster CR.
     let (running, _db) = RunningController::start().await;
     let (first_id, first_vip) = create_cluster(&running, "dup").await;
 
@@ -282,7 +296,7 @@ async fn test_create_cluster_is_idempotent_by_name() {
 async fn test_full_create_delete_flow() {
     let (running, _db) = RunningController::start().await;
     let (cluster_id, vip) = create_cluster(&running, "test-cluster").await;
-    assert_eq!(vip, "10.0.10.10");
+    assert!(vip.starts_with("10.0.10."));
 
     let (agent_tx, mut inbound, _ack) = register_agent(&running, "test-host-1").await;
     let mut capi = running.capi_client().await;
@@ -294,8 +308,10 @@ async fn test_full_create_delete_flow() {
         basic_machine_req("test-vm", &cluster_id),
     )
     .await;
-    // First VM gets the IP immediately after the VIP.
-    assert_eq!(resp.ip_address, "10.0.10.11");
+    // VM allocations come from the pool's vm sub-range (starts at
+    // 10.0.10.20 — see the `IpPool` seeded in
+    // `start_with_reconcile`).
+    assert_eq!(resp.ip_address, "10.0.10.20");
     assert!(resp.provider_id.contains(&resp.id));
 
     // GetMachine / ListMachines
@@ -336,7 +352,7 @@ async fn test_full_create_delete_flow() {
 #[tokio::test]
 async fn test_delete_cluster_cascades_machine_deletes() {
     let (running, db) = RunningController::start().await;
-    let (cluster_id, _vip) = create_cluster(&running, "doomed").await;
+    let (cluster_id, doomed_vip) = create_cluster(&running, "doomed").await;
     let (agent_tx, mut inbound, _ack) = register_agent(&running, "host-a").await;
     let mut capi = running.capi_client().await;
 
@@ -375,9 +391,20 @@ async fn test_delete_cluster_cascades_machine_deletes() {
         tonic::Code::NotFound
     );
 
-    // VIP IP is back in the pool — creating a new cluster reclaims it.
-    let (_id2, vip2) = create_cluster(&running, "reclaim").await;
-    assert_eq!(vip2, "10.0.10.10");
+    // VIP is back in the pool — the next cluster we create reclaims the
+    // same address, proving `release_ips` ran during cluster teardown.
+    // (Both clusters were the only VIP holders and the sub-range
+    // allocator picks the lowest free address.)
+    let mut capi = running.capi_client().await;
+    let resp = capi
+        .create_cluster(CreateClusterRequest {
+            name: "reclaim".to_string(),
+            ip_pool: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.control_plane_endpoint, doomed_vip);
 }
 
 #[tokio::test]
@@ -563,8 +590,7 @@ async fn test_controller_pushes_periodic_reconcile() {
     // controller periodically pushes the authoritative VM list so a VM
     // that was deleted but whose DeleteVm never landed still gets cleaned
     // up without waiting for the agent to reconnect.
-    let (running, _db) =
-        RunningController::start_with_reconcile(Duration::from_millis(150)).await;
+    let (running, _db) = RunningController::start_with_reconcile(Duration::from_millis(150)).await;
     let (_agent_tx, mut inbound, _ack) = register_agent(&running, "reconcile-host").await;
 
     // First ReconcileHostCommand must arrive within a few intervals. With

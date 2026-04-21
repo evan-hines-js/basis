@@ -186,10 +186,7 @@ fn gpu_topology_score(
     // domain. Group 0 does not count as a real NVLink domain.
     if min_group_size > 0 {
         for (group_id, gpus) in &nvlink_groups {
-            if *group_id != 0
-                && gpus.len() >= count
-                && gpus.len() >= min_group_size as usize
-            {
+            if *group_id != 0 && gpus.len() >= count && gpus.len() >= min_group_size as usize {
                 let selected: Vec<GpuInfo> = gpus[..count].iter().map(|g| (*g).clone()).collect();
                 return (3, selected);
             }

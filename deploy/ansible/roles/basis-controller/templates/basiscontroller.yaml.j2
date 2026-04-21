@@ -14,8 +14,12 @@ spec:
     - name: {{ basis_ip_pool.name }}
       cidr: {{ basis_ip_pool.cidr }}
       gateway: {{ basis_ip_pool.gateway }}
-      rangeStart: {{ basis_ip_pool.range_start }}
-      rangeEnd: {{ basis_ip_pool.range_end }}
+      vmRange:
+        start: {{ basis_ip_pool.vm_range_start }}
+        end: {{ basis_ip_pool.vm_range_end }}
+      vipRange:
+        start: {{ basis_ip_pool.vip_range_start }}
+        end: {{ basis_ip_pool.vip_range_end }}
 {% if basis_dns_servers is defined %}
   dnsServers:
 {% for dns in basis_dns_servers %}

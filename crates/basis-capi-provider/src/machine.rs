@@ -30,10 +30,14 @@ use kube::Client;
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use crate::basis_client::{self, BasisClient};
+use basis_client::{ClientError, CreatedMachine, MachineRequest};
+
 use crate::bootstrap;
+use crate::client_cache::{BasisClientCache, CacheError};
 use crate::conditions;
-use crate::crds::{BasisCluster, BasisMachine, Machine as CapiMachine, MachineAddress};
+use crate::crds::{
+    BasisCluster, BasisMachine, CredentialsRef, Machine as CapiMachine, MachineAddress,
+};
 use crate::reconcile_util::{merge_spec, merge_status, namespace_of};
 
 const FINALIZER: &str = "basismachine.infrastructure.cluster.x-k8s.io/finalizer";
@@ -43,7 +47,7 @@ const CLUSTER_LABEL: &str = "cluster.x-k8s.io/cluster-name";
 
 pub struct MachineContext {
     pub client: Client,
-    pub basis: Arc<BasisClient>,
+    pub clients: Arc<BasisClientCache>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,7 +62,10 @@ pub enum MachineError {
     Bootstrap(#[from] bootstrap::BootstrapError),
 
     #[error("basis controller: {0}")]
-    Basis(#[from] basis_client::ClientError),
+    Basis(#[from] ClientError),
+
+    #[error("resolving credentials: {0}")]
+    Credentials(#[from] CacheError),
 
     #[error("missing required field: {0}")]
     Missing(&'static str),
@@ -67,9 +74,9 @@ pub enum MachineError {
     ClusterNotReady(String),
 }
 
-pub async fn run(client: Client, basis: Arc<BasisClient>) -> anyhow::Result<()> {
+pub async fn run(client: Client, clients: Arc<BasisClientCache>) -> anyhow::Result<()> {
     let api: Api<BasisMachine> = Api::all(client.clone());
-    let ctx = Arc::new(MachineContext { client, basis });
+    let ctx = Arc::new(MachineContext { client, clients });
 
     Controller::new(api, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
@@ -117,7 +124,11 @@ async fn apply(
         .cloned()
         .ok_or(MachineError::Missing("cluster-name label"))?;
 
-    let basis_cluster_id = resolve_basis_cluster_id(&ctx.client, namespace, &cluster_name).await?;
+    let ClusterRef {
+        basis_cluster_id,
+        credentials_ref,
+    } = resolve_cluster_ref(&ctx.client, namespace, &cluster_name).await?;
+    let basis = ctx.clients.get(&credentials_ref, namespace).await?;
 
     let bootstrap_secret = find_bootstrap_secret(&ctx.client, namespace, &name).await?;
     let bootstrap_data =
@@ -129,9 +140,22 @@ async fn apply(
     // status/spec, the next call returns the existing row and we finish
     // the patches below.
     info!(machine = %name, cluster_id = %basis_cluster_id, "calling Basis.CreateMachine");
-    let created = ctx
-        .basis
-        .create_machine(basis_cluster_id, name.clone(), &machine.spec, bootstrap_data)
+    let created = basis
+        .create_machine(MachineRequest {
+            cluster_id: basis_cluster_id,
+            name: name.clone(),
+            cpu: machine.spec.cpu,
+            memory_mib: machine.spec.memory_mib,
+            disk_gib: machine.spec.disk_gib,
+            image: machine.spec.image.clone(),
+            bootstrap_data,
+            gpus: machine.spec.gpus,
+            min_gpu_group_size: machine
+                .spec
+                .gpu_constraints
+                .as_ref()
+                .map(|c| c.min_group_size),
+        })
         .await?;
 
     // If status/spec patches fail after a successful CreateMachine, the
@@ -149,7 +173,7 @@ async fn apply(
             error = %e,
             "patches failed after CreateMachine; rolling back basis-side VM",
         );
-        if let Err(rb) = ctx.basis.delete_machine(created.id.clone()).await {
+        if let Err(rb) = basis.delete_machine(created.id.clone()).await {
             warn!(
                 machine = %name,
                 vm_id = %created.id,
@@ -171,7 +195,7 @@ async fn apply(
 async fn write_machine_patches(
     api: &Api<BasisMachine>,
     name: &str,
-    created: &crate::basis_client::CreatedMachine,
+    created: &CreatedMachine,
     machine: &BasisMachine,
     generation: Option<i64>,
 ) -> Result<(), MachineError> {
@@ -180,7 +204,10 @@ async fn write_machine_patches(
         .as_ref()
         .map(|s| s.conditions.clone())
         .unwrap_or_default();
-    conditions::upsert(&mut conditions, conditions::ready_true("VMRunning", generation));
+    conditions::upsert(
+        &mut conditions,
+        conditions::ready_true("VMRunning", generation),
+    );
 
     merge_status(
         api,
@@ -189,7 +216,7 @@ async fn write_machine_patches(
             "status": {
                 "ready": true,
                 "initialization": { "provisioned": true },
-                "providerId": created.provider_id,
+                "providerID": created.provider_id,
                 "basisVmId": created.id,
                 "addresses": [MachineAddress {
                     kind: "InternalIP".to_string(),
@@ -204,7 +231,7 @@ async fn write_machine_patches(
     merge_spec(
         api,
         name,
-        &json!({ "spec": { "providerId": created.provider_id } }),
+        &json!({ "spec": { "providerID": created.provider_id } }),
     )
     .await?;
 
@@ -215,28 +242,54 @@ async fn cleanup(
     machine: Arc<BasisMachine>,
     ctx: Arc<MachineContext>,
 ) -> Result<Action, MachineError> {
-    if let Some(id) = machine.status.as_ref().and_then(|s| s.basis_vm_id.clone()) {
-        info!(vm_id = %id, "deleting VM in Basis controller");
-        ctx.basis.delete_machine(id).await?;
-    }
+    let Some(id) = machine.status.as_ref().and_then(|s| s.basis_vm_id.clone()) else {
+        return Ok(Action::await_change());
+    };
+
+    let namespace = namespace_of(machine.as_ref());
+    let cluster_name = machine
+        .labels()
+        .get(CLUSTER_LABEL)
+        .cloned()
+        .ok_or(MachineError::Missing("cluster-name label"))?;
+    let ClusterRef {
+        credentials_ref, ..
+    } = resolve_cluster_ref(&ctx.client, &namespace, &cluster_name).await?;
+    let basis = ctx.clients.get(&credentials_ref, &namespace).await?;
+
+    info!(vm_id = %id, "deleting VM in Basis controller");
+    basis.delete_machine(id).await?;
     Ok(Action::await_change())
 }
 
-/// Find the BasisCluster matching `cluster_name` and return its
-/// `status.basisClusterId`. The BasisCluster reconciler is responsible
-/// for populating that field by calling `Basis.CreateCluster`.
-async fn resolve_basis_cluster_id(
+/// What the machine reconciler needs off the owning `BasisCluster`:
+/// the basis-side cluster id to call into, plus the credentials ref so
+/// we can resolve a `BasisClient` keyed to the same cluster.
+struct ClusterRef {
+    basis_cluster_id: String,
+    credentials_ref: CredentialsRef,
+}
+
+/// Look up the owning `BasisCluster` and pull out the fields the
+/// machine reconciler needs. The cluster reconciler is responsible for
+/// populating `status.basisClusterId`; if it hasn't yet, we surface
+/// `ClusterNotReady` so the error policy requeues quickly.
+async fn resolve_cluster_ref(
     client: &Client,
     namespace: &str,
     cluster_name: &str,
-) -> Result<String, MachineError> {
+) -> Result<ClusterRef, MachineError> {
     let api: Api<BasisCluster> = Api::namespaced(client.clone(), namespace);
     let cluster = api.get(cluster_name).await?;
-    cluster
+    let basis_cluster_id = cluster
         .status
         .as_ref()
         .and_then(|s| s.basis_cluster_id.clone())
-        .ok_or_else(|| MachineError::ClusterNotReady(cluster_name.to_string()))
+        .ok_or_else(|| MachineError::ClusterNotReady(cluster_name.to_string()))?;
+    Ok(ClusterRef {
+        basis_cluster_id,
+        credentials_ref: cluster.spec.credentials_ref.clone(),
+    })
 }
 
 /// Find the CAPI `Machine` owner of `basis_machine_name` and return its
@@ -262,7 +315,9 @@ async fn find_bootstrap_secret(
         .spec
         .bootstrap
         .data_secret_name
-        .ok_or(MachineError::Missing("Machine.spec.bootstrap.dataSecretName"))
+        .ok_or(MachineError::Missing(
+            "Machine.spec.bootstrap.dataSecretName",
+        ))
 }
 
 fn error_policy(

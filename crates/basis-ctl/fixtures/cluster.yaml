@@ -1,0 +1,6 @@
+apiVersion: basis.dev/v1
+kind: Cluster
+metadata:
+  name: debug
+spec:
+  ipPool: default

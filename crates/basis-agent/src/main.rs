@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use basis_agent::config::{self, Host, HostSpec};
 use basis_agent::db::AgentDb;
 use basis_agent::gpu;
@@ -13,7 +14,6 @@ use basis_agent::reconcile;
 use basis_agent::vm::VmManager;
 use basis_common::gpu::GpuInfo;
 use basis_proto::*;
-use anyhow::Context;
 use clap::Parser;
 use futures::StreamExt;
 use tokio::signal::unix::{signal, SignalKind};
@@ -82,7 +82,10 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let (endpoint, reconnect) = {
             let rt = runtime.read().await;
-            (rt.spec.controller_endpoint.clone(), rt.reconnect_signal.clone())
+            (
+                rt.spec.controller_endpoint.clone(),
+                rt.reconnect_signal.clone(),
+            )
         };
         match run_session(runtime.clone(), reconnect).await {
             Ok(()) => info!("agent session ended cleanly"),
@@ -125,14 +128,11 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
             })
             .collect(),
     ));
-    let vm_mgr = Arc::new(Mutex::new(VmManager::new(
-        spec.vms_dir(),
-        spec.firmware_path.clone(),
-    )));
+    let vm_mgr = Arc::new(Mutex::new(VmManager::new(spec.vms_dir())));
     let net_mgr = Arc::new(net_mgr);
 
     let report =
-        reconcile::reconcile_on_startup(&spec, &agent_db, &vm_mgr, &net_mgr).await?;
+        reconcile::reconcile_on_startup(&spec, &agent_db, &vm_mgr, &net_mgr, &image_mgr).await?;
     info!(
         recovered = report.recovered,
         restarted = report.restarted,
@@ -175,10 +175,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
 /// SIGHUP re-reads the config file, diffs against the running spec,
 /// applies what's safe (reconnect on `controllerEndpoint` change), and
 /// warns loudly about anything that would require a restart.
-fn spawn_reload_loop(
-    config_path: PathBuf,
-    runtime: Arc<tokio::sync::RwLock<AgentRuntime>>,
-) {
+fn spawn_reload_loop(config_path: PathBuf, runtime: Arc<tokio::sync::RwLock<AgentRuntime>>) {
     tokio::spawn(async move {
         let Ok(mut sighup) = signal(SignalKind::hangup()) else {
             warn!("could not install SIGHUP handler; config reload disabled");
@@ -213,7 +210,9 @@ async fn reload_config(
         warn!("spec.dataDir change ignored — restart required");
     }
     if new_spec.network != rt.spec.network {
-        warn!("spec.network change ignored — restart required (VMs have taps on the current bridge)");
+        warn!(
+            "spec.network change ignored — restart required (VMs have taps on the current bridge)"
+        );
     }
     if new_spec.tls != rt.spec.tls {
         warn!("spec.tls change ignored — restart required");
@@ -241,10 +240,7 @@ async fn run_session(
 ) -> anyhow::Result<()> {
     let (endpoint_url, tls) = {
         let rt = runtime.read().await;
-        (
-            rt.spec.controller_endpoint.clone(),
-            rt.spec.tls.clone(),
-        )
+        (rt.spec.controller_endpoint.clone(), rt.spec.tls.clone())
     };
 
     let tls_config = tls.client_config(CONTROLLER_SAN)?;
@@ -378,8 +374,7 @@ fn spawn_periodic_reconciler(
         loop {
             interval.tick().await;
             let rt = runtime.read().await;
-            if let Err(e) =
-                handlers::reconcile_running_vms(&rt.agent_db, &rt.vm_mgr, &sender).await
+            if let Err(e) = handlers::reconcile_running_vms(&rt.agent_db, &rt.vm_mgr, &sender).await
             {
                 warn!(error = %e, "periodic reconcile failed");
             }

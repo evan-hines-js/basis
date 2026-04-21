@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "crates/basis-proto",
     "crates/basis-common",
+    "crates/basis-client",
     "crates/basis-controller",
     "crates/basis-agent",
     "crates/basis-capi-provider",
+    "crates/basis-ctl",
 ]
 
 [workspace.package]
@@ -16,6 +18,7 @@ edition = "2021"
 # Internal crates
 basis-proto = { path = "crates/basis-proto" }
 basis-common = { path = "crates/basis-common" }
+basis-client = { path = "crates/basis-client" }
 basis-controller = { path = "crates/basis-controller" }
 
 # Async runtime

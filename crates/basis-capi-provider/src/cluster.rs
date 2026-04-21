@@ -25,16 +25,16 @@ use kube::{Client, ResourceExt};
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use crate::basis_client::BasisClient;
+use crate::client_cache::{BasisClientCache, CacheError};
 use crate::conditions;
-use crate::crds::{BasisCluster, ControlPlaneEndpoint, DEFAULT_CONTROL_PLANE_PORT};
+use crate::crds::BasisCluster;
 use crate::reconcile_util::{merge_spec, merge_status, namespace_of};
 
 const FINALIZER: &str = "basiscluster.infrastructure.cluster.x-k8s.io/finalizer";
 
 pub struct ClusterContext {
     pub client: Client,
-    pub basis: Arc<BasisClient>,
+    pub clients: Arc<BasisClientCache>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,12 +46,15 @@ pub enum ClusterError {
     Finalizer(String),
 
     #[error("basis controller: {0}")]
-    Basis(#[from] crate::basis_client::ClientError),
+    Basis(#[from] basis_client::ClientError),
+
+    #[error("resolving credentials: {0}")]
+    Credentials(#[from] CacheError),
 }
 
-pub async fn run(client: Client, basis: Arc<BasisClient>) -> anyhow::Result<()> {
+pub async fn run(client: Client, clients: Arc<BasisClientCache>) -> anyhow::Result<()> {
     let api: Api<BasisCluster> = Api::all(client.clone());
-    let ctx = Arc::new(ClusterContext { client, basis });
+    let ctx = Arc::new(ClusterContext { client, clients });
 
     Controller::new(api, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
@@ -91,30 +94,58 @@ async fn apply(
     ctx: Arc<ClusterContext>,
 ) -> Result<Action, ClusterError> {
     let name = cluster.name_any();
-    let api: Api<BasisCluster> = Api::namespaced(ctx.client.clone(), &namespace_of(cluster.as_ref()));
+    let namespace = namespace_of(cluster.as_ref());
+    let api: Api<BasisCluster> = Api::namespaced(ctx.client.clone(), &namespace);
     let generation = cluster.metadata.generation;
 
-    // Server-side CreateCluster is idempotent by name — calling it again
-    // with the same (name, ip_pool) returns the existing cluster_id and
-    // endpoint. That lets us issue the RPC on every reconcile without
-    // worrying about duplicates, which is how we recover from partial
-    // writes below.
-    info!(cluster = %name, ip_pool = %cluster.spec.ip_pool, "calling Basis.CreateCluster");
-    let created = ctx
-        .basis
+    let basis = ctx
+        .clients
+        .get(&cluster.spec.credentials_ref, &namespace)
+        .await?;
+
+    // Server-side `CreateCluster` allocates the VIP and is idempotent
+    // by name: retrying returns the same `(cluster_id, endpoint)` pair,
+    // so we can issue the RPC on every reconcile and self-heal from
+    // partial writes below without ever creating duplicate clusters.
+    info!(
+        cluster = %name,
+        ip_pool = %cluster.spec.ip_pool,
+        "calling Basis.CreateCluster"
+    );
+    let created = basis
         .create_cluster(name.clone(), cluster.spec.ip_pool.clone())
         .await?;
 
-    // Write status FIRST — `basisClusterId` is the durable marker that a
-    // basis-side cluster exists under this name. If the spec patch below
-    // fails, the next reconcile still calls CreateCluster (idempotent)
-    // and reaches the spec write again.
+    // Write the allocated endpoint to spec first: CAPI core watches
+    // `BasisCluster.spec.controlPlaneEndpoint` and propagates the value
+    // onto `Cluster.spec.controlPlaneEndpoint`, which is what every
+    // downstream controller (kubeadm control plane, kube-vip patcher,
+    // etc.) keys off of. Status writes go second so a crash between
+    // the two is self-healing: next reconcile re-applies spec
+    // idempotently and finishes the status patch.
+    merge_spec(
+        &api,
+        &name,
+        &json!({
+            "spec": {
+                "controlPlaneEndpoint": {
+                    "host": created.control_plane_endpoint,
+                    "port": KUBE_API_PORT,
+                }
+            }
+        }),
+    )
+    .await?;
+
     let mut conditions = cluster
         .status
         .as_ref()
         .map(|s| s.conditions.clone())
         .unwrap_or_default();
-    conditions::upsert(&mut conditions, conditions::ready_true("Provisioned", generation));
+    conditions::upsert(
+        &mut conditions,
+        conditions::ready_true("Provisioned", generation),
+    );
 
     merge_status(
         &api,
@@ -130,32 +161,32 @@ async fn apply(
     )
     .await?;
 
-    // Spec carries controlPlaneEndpoint because KubeadmControlPlane reads
-    // it from there.
-    merge_spec(
-        &api,
-        &name,
-        &json!({
-            "spec": {
-                "controlPlaneEndpoint": ControlPlaneEndpoint {
-                    host: created.control_plane_endpoint.clone(),
-                    port: DEFAULT_CONTROL_PLANE_PORT,
-                }
-            }
-        }),
-    )
-    .await?;
-
     Ok(Action::requeue(Duration::from_secs(300)))
 }
+
+/// kubeadm's apiserver always listens on 6443. We don't expose this
+/// as a spec knob because the kube-vip static pod manifest the control
+/// plane ships is hard-wired to the same number — making it
+/// configurable would require threading the port through bootstrap
+/// data templating and buys nothing for a kubeadm cluster.
+const KUBE_API_PORT: u16 = 6443;
 
 async fn cleanup(
     cluster: Arc<BasisCluster>,
     ctx: Arc<ClusterContext>,
 ) -> Result<Action, ClusterError> {
-    if let Some(id) = cluster.status.as_ref().and_then(|s| s.basis_cluster_id.clone()) {
+    if let Some(id) = cluster
+        .status
+        .as_ref()
+        .and_then(|s| s.basis_cluster_id.clone())
+    {
+        let namespace = namespace_of(cluster.as_ref());
+        let basis = ctx
+            .clients
+            .get(&cluster.spec.credentials_ref, &namespace)
+            .await?;
         info!(cluster_id = %id, "calling Basis.DeleteCluster");
-        ctx.basis.delete_cluster(id).await?;
+        basis.delete_cluster(id).await?;
     }
     Ok(Action::await_change())
 }

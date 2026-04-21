@@ -15,8 +15,14 @@ spec:
     - name: default
       cidr: 192.168.1.0/24
       gateway: 192.168.1.1
-      # Carve out a range that does NOT overlap with your router's DHCP.
-      # Basis will reserve one address as each cluster's control-plane VIP
-      # and hand the rest out as VM IPs.
-      rangeStart: 192.168.1.210
-      rangeEnd: 192.168.1.250
+      # Both sub-ranges must sit OUTSIDE your router's DHCP range and
+      # must not overlap with each other. The controller auto-picks VM
+      # IPs from `vmRange` and control-plane VIPs from `vipRange`. Size
+      # `vipRange` to the number of clusters you expect to run at once
+      # (one VIP per cluster).
+      vmRange:
+        start: 192.168.1.220
+        end: 192.168.1.250
+      vipRange:
+        start: 192.168.1.210
+        end: 192.168.1.219

@@ -43,7 +43,13 @@ impl NetworkManager {
         // Attach physical NIC to bridge
         run_cmd(
             "ip",
-            &["link", "set", &self.physical_nic, "master", &self.bridge_name],
+            &[
+                "link",
+                "set",
+                &self.physical_nic,
+                "master",
+                &self.bridge_name,
+            ],
         )
         .await?;
 
@@ -61,7 +67,11 @@ impl NetworkManager {
         let tap_name = tap_name_for_vm(vm_id);
 
         run_cmd("ip", &["tuntap", "add", &tap_name, "mode", "tap"]).await?;
-        run_cmd("ip", &["link", "set", &tap_name, "master", &self.bridge_name]).await?;
+        run_cmd(
+            "ip",
+            &["link", "set", &tap_name, "master", &self.bridge_name],
+        )
+        .await?;
         run_cmd("ip", &["link", "set", &tap_name, "up"]).await?;
 
         info!(tap = %tap_name, vm_id = %vm_id, "tap device created");
@@ -84,8 +94,11 @@ impl NetworkManager {
             // writes are idempotent when state is already correct, so
             // failures here mean the link layer is inconsistent (kernel
             // refusal, namespace mismatch) and should not be silenced.
-            if let Err(e) =
-                run_cmd("ip", &["link", "set", &tap_name, "master", &self.bridge_name]).await
+            if let Err(e) = run_cmd(
+                "ip",
+                &["link", "set", &tap_name, "master", &self.bridge_name],
+            )
+            .await
             {
                 warn!(tap = %tap_name, error = %e, "failed to re-attach existing tap to bridge");
             }

@@ -31,11 +31,9 @@ impl TestPki {
         let ca_pem = ca_cert.pem();
 
         let server_key = KeyPair::generate().unwrap();
-        let mut server_params =
-            CertificateParams::new(vec![server_san.to_string()]).unwrap();
+        let mut server_params = CertificateParams::new(vec![server_san.to_string()]).unwrap();
         server_params.distinguished_name = dn(server_san);
-        server_params.subject_alt_names =
-            vec![SanType::DnsName(server_san.try_into().unwrap())];
+        server_params.subject_alt_names = vec![SanType::DnsName(server_san.try_into().unwrap())];
         let server_cert = server_params
             .signed_by(&server_key, &ca_cert, &ca_key)
             .unwrap();
@@ -68,9 +66,7 @@ impl TestPki {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.distinguished_name = dn(cn);
-        let cert = params
-            .signed_by(&key, &self.ca_cert, &self.ca_key)
-            .unwrap();
+        let cert = params.signed_by(&key, &self.ca_cert, &self.ca_key).unwrap();
         (cert.pem(), key.serialize_pem())
     }
 }

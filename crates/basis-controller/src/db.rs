@@ -137,8 +137,10 @@ impl Db {
                 name TEXT PRIMARY KEY,
                 cidr TEXT NOT NULL,
                 gateway TEXT NOT NULL,
-                range_start TEXT NOT NULL,
-                range_end TEXT NOT NULL
+                vm_range_start TEXT NOT NULL,
+                vm_range_end TEXT NOT NULL,
+                vip_range_start TEXT NOT NULL,
+                vip_range_end TEXT NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -171,19 +173,27 @@ impl Db {
 
     pub async fn upsert_ip_pool(&self, pool: &IpPool) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO ip_pools (name, cidr, gateway, range_start, range_end)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO ip_pools (
+                name, cidr, gateway,
+                vm_range_start, vm_range_end,
+                vip_range_start, vip_range_end
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(name) DO UPDATE SET
                 cidr = excluded.cidr,
                 gateway = excluded.gateway,
-                range_start = excluded.range_start,
-                range_end = excluded.range_end",
+                vm_range_start = excluded.vm_range_start,
+                vm_range_end = excluded.vm_range_end,
+                vip_range_start = excluded.vip_range_start,
+                vip_range_end = excluded.vip_range_end",
         )
         .bind(&pool.name)
         .bind(&pool.cidr)
         .bind(&pool.gateway)
-        .bind(&pool.range_start)
-        .bind(&pool.range_end)
+        .bind(&pool.vm_range.start)
+        .bind(&pool.vm_range.end)
+        .bind(&pool.vip_range.start)
+        .bind(&pool.vip_range.end)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -197,55 +207,82 @@ impl Db {
             .ok_or_else(|| DbError::NotFound(format!("ip pool '{name}'")))
     }
 
-    /// Allocate the next available IP from `pool_name`, recording the
-    /// supplied owner as its owner.
+    /// Allocate the next available VM IP from `pool_name`'s VM range
+    /// and record the supplied owner. VIPs use [`Self::allocate_vip`] —
+    /// the two sub-ranges are disjoint so VM allocation never races a
+    /// pending VIP reservation.
     pub async fn allocate_ip(
         &self,
         pool_name: &str,
         owner: IpOwner<'_>,
     ) -> Result<String, DbError> {
         let pool = self.get_ip_pool(pool_name).await?;
+        self.allocate_from_range(pool_name, &pool.vm_range(), owner)
+            .await
+    }
 
-        let start: std::net::Ipv4Addr = pool
-            .range_start
-            .parse()
-            .map_err(|e| DbError::Conflict(format!("bad range_start: {e}")))?;
-        let end: std::net::Ipv4Addr = pool
-            .range_end
-            .parse()
-            .map_err(|e| DbError::Conflict(format!("bad range_end: {e}")))?;
+    /// Allocate the next available control-plane VIP from `pool_name`'s
+    /// VIP range. Used by `CreateCluster` server-side; callers don't
+    /// supply an address.
+    pub async fn allocate_vip(
+        &self,
+        pool_name: &str,
+        owner: IpOwner<'_>,
+    ) -> Result<String, DbError> {
+        let pool = self.get_ip_pool(pool_name).await?;
+        self.allocate_from_range(pool_name, &pool.vip_range(), owner)
+            .await
+    }
 
-        let start_u32 = u32::from(start);
-        let end_u32 = u32::from(end);
-
+    async fn allocate_from_range(
+        &self,
+        pool_name: &str,
+        range: &ParsedRange,
+        owner: IpOwner<'_>,
+    ) -> Result<String, DbError> {
         let allocated: Vec<String> =
             sqlx::query_scalar("SELECT ip_address FROM ip_allocations WHERE pool_name = ?")
                 .bind(pool_name)
                 .fetch_all(&self.pool)
                 .await?;
-
         let allocated_set: std::collections::HashSet<String> = allocated.into_iter().collect();
 
-        for ip_u32 in start_u32..=end_u32 {
+        for ip_u32 in range.start..=range.end {
             let candidate = std::net::Ipv4Addr::from(ip_u32).to_string();
             if !allocated_set.contains(&candidate) {
-                sqlx::query(
-                    "INSERT INTO ip_allocations (ip_address, pool_name, owner_id, owner_kind)
-                     VALUES (?, ?, ?, ?)",
-                )
-                .bind(&candidate)
-                .bind(pool_name)
-                .bind(owner.id())
-                .bind(owner.kind())
-                .execute(&self.pool)
-                .await?;
+                self.insert_allocation(pool_name, &candidate, owner).await?;
                 return Ok(candidate);
             }
         }
 
         Err(DbError::Conflict(format!(
-            "no available IPs in pool '{pool_name}'"
+            "no available IPs in pool '{pool_name}' sub-range"
         )))
+    }
+
+    async fn insert_allocation(
+        &self,
+        pool_name: &str,
+        ip: &str,
+        owner: IpOwner<'_>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO ip_allocations (ip_address, pool_name, owner_id, owner_kind)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(ip)
+        .bind(pool_name)
+        .bind(owner.id())
+        .bind(owner.kind())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+                DbError::Conflict(format!("IP '{ip}' already allocated"))
+            }
+            other => DbError::Sqlx(other),
+        })?;
+        Ok(())
     }
 
     /// Release every IP held by this owner.
@@ -367,23 +404,19 @@ impl Db {
     }
 
     pub async fn list_hosts(&self) -> Result<Vec<HostRow>, DbError> {
-        Ok(
-            sqlx::query_as::<_, HostRow>("SELECT * FROM hosts")
-                .fetch_all(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_as::<_, HostRow>("SELECT * FROM hosts")
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     /// Refresh `last_heartbeat` and flip the host back to healthy. Capacity
     /// isn't stored per-host — scheduler computes it from VM allocations.
     pub async fn update_host_heartbeat(&self, host_id: &str, now: &str) -> Result<(), DbError> {
-        let result = sqlx::query(
-            "UPDATE hosts SET last_heartbeat = ?, healthy = 1 WHERE id = ?",
-        )
-        .bind(now)
-        .bind(host_id)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("UPDATE hosts SET last_heartbeat = ?, healthy = 1 WHERE id = ?")
+            .bind(now)
+            .bind(host_id)
+            .execute(&self.pool)
+            .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("host '{host_id}'")));
@@ -445,13 +478,13 @@ impl Db {
         cluster_id: &str,
         name: &str,
     ) -> Result<Option<VmRow>, DbError> {
-        Ok(sqlx::query_as::<_, VmRow>(
-            "SELECT * FROM vms WHERE cluster_id = ? AND name = ?",
+        Ok(
+            sqlx::query_as::<_, VmRow>("SELECT * FROM vms WHERE cluster_id = ? AND name = ?")
+                .bind(cluster_id)
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(cluster_id)
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?)
     }
 
     pub async fn list_vms(&self, cluster_id: Option<&str>) -> Result<Vec<VmRow>, DbError> {
@@ -484,15 +517,14 @@ impl Db {
         error_message: &str,
         now: &str,
     ) -> Result<(), DbError> {
-        let result = sqlx::query(
-            "UPDATE vms SET state = ?, error_message = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(state)
-        .bind(error_message)
-        .bind(now)
-        .bind(vm_id)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("UPDATE vms SET state = ?, error_message = ?, updated_at = ? WHERE id = ?")
+                .bind(state)
+                .bind(error_message)
+                .bind(now)
+                .bind(vm_id)
+                .execute(&self.pool)
+                .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("vm '{vm_id}'")));
@@ -510,12 +542,11 @@ impl Db {
 
     /// Mark hosts as unhealthy if their last heartbeat is older than the cutoff.
     pub async fn mark_stale_hosts_unhealthy(&self, cutoff: &str) -> Result<Vec<String>, DbError> {
-        let stale: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM hosts WHERE healthy = 1 AND last_heartbeat < ?",
-        )
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?;
+        let stale: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM hosts WHERE healthy = 1 AND last_heartbeat < ?")
+                .bind(cutoff)
+                .fetch_all(&self.pool)
+                .await?;
 
         if !stale.is_empty() {
             sqlx::query("UPDATE hosts SET healthy = 0 WHERE healthy = 1 AND last_heartbeat < ?")
@@ -574,8 +605,38 @@ pub struct IpPoolRow {
     pub name: String,
     pub cidr: String,
     pub gateway: String,
-    pub range_start: String,
-    pub range_end: String,
+    pub vm_range_start: String,
+    pub vm_range_end: String,
+    pub vip_range_start: String,
+    pub vip_range_end: String,
+}
+
+impl IpPoolRow {
+    pub fn vm_range(&self) -> ParsedRange {
+        ParsedRange::parse(&self.vm_range_start, &self.vm_range_end)
+            .expect("vm_range validated on upsert")
+    }
+    pub fn vip_range(&self) -> ParsedRange {
+        ParsedRange::parse(&self.vip_range_start, &self.vip_range_end)
+            .expect("vip_range validated on upsert")
+    }
+}
+
+/// Inclusive IPv4 range expressed as host-order `u32`s — the shape the
+/// allocator actually iterates over. Built from `IpPoolRow` on demand.
+#[derive(Debug, Clone, Copy)]
+pub struct ParsedRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl ParsedRange {
+    fn parse(start: &str, end: &str) -> Result<Self, std::net::AddrParseError> {
+        Ok(Self {
+            start: u32::from(start.parse::<std::net::Ipv4Addr>()?),
+            end: u32::from(end.parse::<std::net::Ipv4Addr>()?),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -630,12 +691,19 @@ mod tests {
     }
 
     fn make_pool(name: &str) -> IpPool {
+        use crate::config::IpRange;
         IpPool {
             name: name.to_string(),
             cidr: "10.0.10.0/24".to_string(),
             gateway: "10.0.10.1".to_string(),
-            range_start: "10.0.10.10".to_string(),
-            range_end: "10.0.10.15".to_string(),
+            vm_range: IpRange {
+                start: "10.0.10.10".to_string(),
+                end: "10.0.10.15".to_string(),
+            },
+            vip_range: IpRange {
+                start: "10.0.10.200".to_string(),
+                end: "10.0.10.210".to_string(),
+            },
         }
     }
 
@@ -710,7 +778,9 @@ mod tests {
         h.healthy = false;
         db.upsert_host(&h).await.unwrap();
 
-        db.update_host_heartbeat("h1", "2025-01-01T01:00:00Z").await.unwrap();
+        db.update_host_heartbeat("h1", "2025-01-01T01:00:00Z")
+            .await
+            .unwrap();
 
         let host = db.get_host("h1").await.unwrap();
         assert_eq!(host.last_heartbeat, "2025-01-01T01:00:00Z");
@@ -755,7 +825,9 @@ mod tests {
     #[tokio::test]
     async fn test_cluster_insert_and_get() {
         let db = test_db().await;
-        db.insert_cluster(&make_cluster("c1", "cluster-a")).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "cluster-a"))
+            .await
+            .unwrap();
         let c = db.get_cluster("c1").await.unwrap();
         assert_eq!(c.name, "cluster-a");
         assert_eq!(c.ip_pool, "default");
@@ -764,7 +836,9 @@ mod tests {
     #[tokio::test]
     async fn test_cluster_duplicate_name_is_conflict() {
         let db = test_db().await;
-        db.insert_cluster(&make_cluster("c1", "cluster-a")).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "cluster-a"))
+            .await
+            .unwrap();
         let err = db
             .insert_cluster(&make_cluster("c2", "cluster-a"))
             .await
@@ -775,7 +849,9 @@ mod tests {
     #[tokio::test]
     async fn test_cluster_delete() {
         let db = test_db().await;
-        db.insert_cluster(&make_cluster("c1", "cluster-a")).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "cluster-a"))
+            .await
+            .unwrap();
         db.delete_cluster("c1").await.unwrap();
         assert!(matches!(
             db.get_cluster("c1").await,
@@ -789,7 +865,9 @@ mod tests {
     async fn test_vm_insert_and_get() {
         let db = test_db().await;
         db.upsert_host(&make_host("h1", "node-1")).await.unwrap();
-        db.insert_cluster(&make_cluster("c1", "cluster-a")).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "cluster-a"))
+            .await
+            .unwrap();
 
         let vm = make_vm("vm1", "h1", "c1");
         db.insert_vm(&vm).await.unwrap();
@@ -812,8 +890,12 @@ mod tests {
     async fn test_list_vms_by_cluster() {
         let db = test_db().await;
         db.upsert_host(&make_host("h1", "node-1")).await.unwrap();
-        db.insert_cluster(&make_cluster("ca", "cluster-a")).await.unwrap();
-        db.insert_cluster(&make_cluster("cb", "cluster-b")).await.unwrap();
+        db.insert_cluster(&make_cluster("ca", "cluster-a"))
+            .await
+            .unwrap();
+        db.insert_cluster(&make_cluster("cb", "cluster-b"))
+            .await
+            .unwrap();
 
         db.insert_vm(&make_vm("vm1", "h1", "ca")).await.unwrap();
         db.insert_vm(&make_vm("vm2", "h1", "ca")).await.unwrap();
@@ -837,7 +919,9 @@ mod tests {
         let db = test_db().await;
         db.upsert_host(&make_host("h1", "node-1")).await.unwrap();
         db.upsert_host(&make_host("h2", "node-2")).await.unwrap();
-        db.insert_cluster(&make_cluster("c1", "cluster-a")).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "cluster-a"))
+            .await
+            .unwrap();
 
         db.insert_vm(&make_vm("vm1", "h1", "c1")).await.unwrap();
         db.insert_vm(&make_vm("vm2", "h1", "c1")).await.unwrap();
@@ -854,7 +938,9 @@ mod tests {
     async fn test_update_vm_state() {
         let db = test_db().await;
         db.upsert_host(&make_host("h1", "node-1")).await.unwrap();
-        db.insert_cluster(&make_cluster("c1", "cluster-a")).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "cluster-a"))
+            .await
+            .unwrap();
         db.insert_vm(&make_vm("vm1", "h1", "c1")).await.unwrap();
 
         db.update_vm_state(
@@ -890,7 +976,9 @@ mod tests {
     async fn test_delete_vm() {
         let db = test_db().await;
         db.upsert_host(&make_host("h1", "node-1")).await.unwrap();
-        db.insert_cluster(&make_cluster("c1", "cluster-a")).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "cluster-a"))
+            .await
+            .unwrap();
         db.insert_vm(&make_vm("vm1", "h1", "c1")).await.unwrap();
 
         db.delete_vm("vm1").await.unwrap();
@@ -907,7 +995,8 @@ mod tests {
 
         let pool = db.get_ip_pool("default").await.unwrap();
         assert_eq!(pool.gateway, "10.0.10.1");
-        assert_eq!(pool.range_start, "10.0.10.10");
+        assert_eq!(pool.vm_range_start, "10.0.10.10");
+        assert_eq!(pool.vip_range_start, "10.0.10.200");
     }
 
     #[tokio::test]
@@ -977,37 +1066,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cluster_vip_is_separate_allocation() {
+    async fn test_vip_and_vm_ranges_are_disjoint() {
         let db = test_db().await;
         db.upsert_ip_pool(&make_pool("default")).await.unwrap();
 
         let vip = db
-            .allocate_ip("default", IpOwner::ClusterVip("c1"))
+            .allocate_vip("default", IpOwner::ClusterVip("c1"))
             .await
             .unwrap();
-        assert_eq!(vip, "10.0.10.10");
+        assert_eq!(vip, "10.0.10.200", "VIPs come from vip_range");
 
-        // Subsequent VM allocations take the NEXT free IP, not the VIP.
-        let vm_ip = db
-            .allocate_ip("default", IpOwner::Vm("vm1"))
+        let vm_ip = db.allocate_ip("default", IpOwner::Vm("vm1")).await.unwrap();
+        assert_eq!(
+            vm_ip, "10.0.10.10",
+            "VM IPs come from vm_range, never encroach on VIP range"
+        );
+
+        // Exhaust the VM range (6 IPs: .10..=.15) — VIP allocation still works
+        // because it lives in a disjoint range. This is the whole point of the
+        // split: a busy cluster can't starve VIP reservations.
+        for i in 1..6 {
+            db.allocate_ip("default", IpOwner::Vm(&format!("vm-fill-{i}")))
+                .await
+                .unwrap();
+        }
+        let vip2 = db
+            .allocate_vip("default", IpOwner::ClusterVip("c2"))
             .await
             .unwrap();
-        assert_eq!(vm_ip, "10.0.10.11");
+        assert_eq!(vip2, "10.0.10.201");
 
-        // Releasing the VM does not release the VIP.
-        db.release_ips(IpOwner::Vm("vm1")).await.unwrap();
-        let vm_ip2 = db
-            .allocate_ip("default", IpOwner::Vm("vm2"))
-            .await
-            .unwrap();
-        assert_eq!(vm_ip2, "10.0.10.11");
-
-        // Releasing the VIP makes its IP available again.
+        // Releasing a VIP frees its IP for the next VIP allocation; does not
+        // free anything in the VM range.
         db.release_ips(IpOwner::ClusterVip("c1")).await.unwrap();
-        let reused = db
-            .allocate_ip("default", IpOwner::Vm("vm3"))
+        let vip3 = db
+            .allocate_vip("default", IpOwner::ClusterVip("c3"))
             .await
             .unwrap();
-        assert_eq!(reused, "10.0.10.10");
+        assert_eq!(vip3, "10.0.10.200");
     }
 }

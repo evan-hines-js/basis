@@ -1,0 +1,12 @@
+apiVersion: basis.dev/v1
+kind: Machine
+metadata:
+  name: debug-0
+spec:
+  cluster: debug
+  cpu: 2
+  memoryMib: 2048
+  diskGib: 40
+  image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
+  bootstrapDataFile: ./bootstrap-debug.yaml
+  gpus: 0

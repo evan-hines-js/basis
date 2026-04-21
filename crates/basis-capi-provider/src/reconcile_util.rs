@@ -5,8 +5,8 @@
 
 use kube::api::{Api, Patch, PatchParams};
 use kube::Resource;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::fmt::Debug;
 
 /// Namespace of a CAPI-provider-managed CR, with the same fallback CAPI

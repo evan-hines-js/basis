@@ -11,6 +11,7 @@ service Basis {
   rpc CreateCluster(CreateClusterRequest) returns (CreateClusterResponse);
   rpc DeleteCluster(DeleteClusterRequest) returns (DeleteClusterResponse);
   rpc GetCluster(GetClusterRequest) returns (Cluster);
+  rpc ListClusters(ListClustersRequest) returns (ListClustersResponse);
 
   rpc CreateMachine(CreateMachineRequest) returns (CreateMachineResponse);
   rpc DeleteMachine(DeleteMachineRequest) returns (DeleteMachineResponse);
@@ -32,14 +33,17 @@ message CreateClusterRequest {
   // controller. Used in logs and as the `cluster` label on VMs.
   string name = 1;
   // Name of the IP pool (configured in controller.toml) to allocate
-  // VIPs and VM IPs from for this cluster.
+  // VM IPs and a control-plane VIP from for this cluster.
   string ip_pool = 2;
 }
 
 message CreateClusterResponse {
   string cluster_id = 1;
-  // Reserved control-plane endpoint VIP. kube-vip on the first control
-  // plane node claims this address via gratuitous ARP.
+  // Control-plane endpoint VIP, allocated by the controller from the
+  // pool's `vip_range` sub-range. kube-vip inside the first control-
+  // plane guest claims this address via gratuitous ARP. The caller
+  // records this on its `InfrastructureCluster` CR so the rest of CAPI
+  // can read it from `Cluster.spec.controlPlaneEndpoint`.
   string control_plane_endpoint = 2;
 }
 
@@ -58,6 +62,12 @@ message Cluster {
   string name = 2;
   string ip_pool = 3;
   string control_plane_endpoint = 4;
+}
+
+message ListClustersRequest {}
+
+message ListClustersResponse {
+  repeated Cluster clusters = 1;
 }
 
 // --- Machine messages ---

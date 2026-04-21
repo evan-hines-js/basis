@@ -32,12 +32,6 @@ pub struct HostSpec {
     pub network: NetworkSpec,
     pub tls: TlsConfig,
 
-    /// Path to the cloud-hypervisor firmware blob used to boot guest
-    /// VMs. VMs boot in UEFI mode from their disk, which lets stock
-    /// Ubuntu/Debian cloud images run unmodified (no kernel extraction).
-    #[serde(default = "default_firmware_path")]
-    pub firmware_path: PathBuf,
-
     /// Credentials for private OCI registries the agent pulls VM images
     /// from. Omit or leave empty for public-only pulls. Entries are
     /// matched against the registry portion of the image reference
@@ -53,10 +47,6 @@ pub struct RegistryCredentials {
     pub host: String,
     pub username: String,
     pub password: String,
-}
-
-fn default_firmware_path() -> PathBuf {
-    PathBuf::from("/usr/share/cloud-hypervisor/hypervisor-fw")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

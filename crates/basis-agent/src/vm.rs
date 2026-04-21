@@ -27,16 +27,14 @@ struct TrackedVm {
 
 pub struct VmManager {
     pub vms_dir: PathBuf,
-    firmware_path: PathBuf,
     tracked: HashMap<String, TrackedVm>,
 }
 
 impl VmManager {
-    pub fn new(vms_dir: PathBuf, firmware_path: PathBuf) -> Self {
+    pub fn new(vms_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&vms_dir).ok();
         Self {
             vms_dir,
-            firmware_path,
             tracked: HashMap::new(),
         }
     }
@@ -51,6 +49,8 @@ impl VmManager {
     pub async fn create_vm(
         &mut self,
         cmd: &CreateVmCommand,
+        kernel_path: &Path,
+        initrd_path: &Path,
         disk_path: &Path,
         cloud_init_path: &Path,
         tap_name: &str,
@@ -62,19 +62,42 @@ impl VmManager {
         let socket_path = vm_dir.join("cloud-hypervisor.sock");
         let unit_name = unit_name_for_vm(&cmd.vm_id);
 
-        // Cloud-hypervisor takes multiple values for `--disk` as
-        // space-separated arguments after a single flag — NOT as repeated
-        // `--disk` flags. Same shape for `--device` below.
+        // Direct kernel boot: we pass the guest kernel, initramfs, and a
+        // hardcoded command line to cloud-hypervisor, bypassing the EFI
+        // firmware / shim / grub chain entirely. Rationale lives in
+        // `image.rs`'s module doc; the practical effect is that boot is
+        // deterministic and doesn't depend on the minimal UEFI firmware
+        // exposing services Ubuntu's bootloader chain requires.
+        //
+        // `root=/dev/vda1` is the Ubuntu cloud image layout (partition 1
+        // is the rootfs); `console=ttyS0` lets the guest kernel print
+        // through the serial `--serial=tty` cloud-hypervisor attaches
+        // into the systemd journal.
+        //
+        // `--disk` takes multiple values as space-separated arguments
+        // after a single flag (NOT as repeated `--disk` flags). Same
+        // shape for `--device` below.
+        //
+        // `image_type=qcow2` + `backing_files=on` on the overlay are
+        // required as of cloud-hypervisor v51: `backing_files` defaults
+        // off (landlock-friendly), and a device-manager autodetect path
+        // forces it off again for qcow2 unless `image_type` is set
+        // explicitly. The cidata ISO is raw; autodetect is correct there.
         let mut ch_args = vec![
             format!("--api-socket={}", socket_path.to_string_lossy()),
             format!("--cpus=boot={}", cmd.cpu),
             format!("--memory=size={}M", cmd.memory_mib),
-            format!("--firmware={}", self.firmware_path.to_string_lossy()),
+            format!("--kernel={}", kernel_path.to_string_lossy()),
+            format!("--initramfs={}", initrd_path.to_string_lossy()),
+            "--cmdline=root=/dev/vda1 ro console=ttyS0".to_string(),
             format!("--net=tap={tap_name},mac={}", generate_mac(&cmd.vm_id)),
             "--serial=tty".to_string(),
             "--console=off".to_string(),
             "--disk".to_string(),
-            format!("path={}", disk_path.to_string_lossy()),
+            format!(
+                "path={},image_type=qcow2,backing_files=on",
+                disk_path.to_string_lossy()
+            ),
             format!("path={}", cloud_init_path.to_string_lossy()),
         ];
 
@@ -121,13 +144,8 @@ impl VmManager {
             )));
         }
 
-        self.tracked.insert(
-            cmd.vm_id.clone(),
-            TrackedVm {
-                unit_name,
-                vm_dir,
-            },
-        );
+        self.tracked
+            .insert(cmd.vm_id.clone(), TrackedVm { unit_name, vm_dir });
 
         Ok(())
     }
@@ -209,7 +227,10 @@ impl VmManager {
             }
         }
 
-        info!(count = running_vm_ids.len(), "reconciled running VMs from systemd");
+        info!(
+            count = running_vm_ids.len(),
+            "reconciled running VMs from systemd"
+        );
         Ok(running_vm_ids)
     }
 

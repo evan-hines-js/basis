@@ -5,10 +5,11 @@
 //! into gRPC calls to the Basis controller. No state is stored here — the
 //! CRDs hold user intent, the Basis controller holds infrastructure truth.
 
-pub mod basis_client;
 pub mod bootstrap;
+pub mod client_cache;
 pub mod cluster;
 pub mod conditions;
 pub mod crds;
 pub mod machine;
 pub mod reconcile_util;
+pub mod startup;

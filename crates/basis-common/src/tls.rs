@@ -37,31 +37,51 @@ pub struct TlsConfig {
 }
 
 impl TlsConfig {
-    /// Build a tonic server TLS config from the files on disk.
-    ///
-    /// mTLS is always required — setting a client CA forces clients to present
-    /// a certificate that chains to this CA.
-    pub fn server_config(&self) -> Result<ServerTlsConfig, TlsError> {
-        let cert_pem = read(&self.cert)?;
-        let key_pem = read(&self.key)?;
-        let ca_pem = read(&self.ca)?;
-
-        Ok(ServerTlsConfig::new()
-            .identity(Identity::from_pem(cert_pem, key_pem))
-            .client_ca_root(Certificate::from_pem(ca_pem)))
+    /// Load the three files into an in-memory `TlsIdentity`. The server
+    /// and client config helpers below both go through this — file
+    /// reading happens in exactly one place.
+    pub fn load_identity(&self) -> Result<TlsIdentity, TlsError> {
+        Ok(TlsIdentity {
+            cert: read(&self.cert)?,
+            key: read(&self.key)?,
+            ca: read(&self.ca)?,
+        })
     }
 
-    /// Build a tonic client TLS config. `domain_name` must match the SAN on
-    /// the controller's server certificate.
-    pub fn client_config(&self, domain_name: &str) -> Result<ClientTlsConfig, TlsError> {
-        let cert_pem = read(&self.cert)?;
-        let key_pem = read(&self.key)?;
-        let ca_pem = read(&self.ca)?;
+    pub fn server_config(&self) -> Result<ServerTlsConfig, TlsError> {
+        Ok(self.load_identity()?.server_config())
+    }
 
-        Ok(ClientTlsConfig::new()
-            .identity(Identity::from_pem(cert_pem, key_pem))
-            .ca_certificate(Certificate::from_pem(ca_pem))
-            .domain_name(domain_name))
+    pub fn client_config(&self, domain_name: &str) -> Result<ClientTlsConfig, TlsError> {
+        Ok(self.load_identity()?.client_config(domain_name))
+    }
+}
+
+/// PEM bytes for a client identity + CA root. Used when TLS material
+/// comes from a Kubernetes Secret or another in-memory source rather
+/// than a file on disk, so nothing has to stage bytes into temp files
+/// to hand them back to tonic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsIdentity {
+    pub cert: Vec<u8>,
+    pub key: Vec<u8>,
+    pub ca: Vec<u8>,
+}
+
+impl TlsIdentity {
+    /// mTLS server config — clients must present a cert chaining to `ca`.
+    pub fn server_config(&self) -> ServerTlsConfig {
+        ServerTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert, &self.key))
+            .client_ca_root(Certificate::from_pem(&self.ca))
+    }
+
+    /// Client config. `domain_name` must match a SAN on the server cert.
+    pub fn client_config(&self, domain_name: &str) -> ClientTlsConfig {
+        ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert, &self.key))
+            .ca_certificate(Certificate::from_pem(&self.ca))
+            .domain_name(domain_name)
     }
 }
 

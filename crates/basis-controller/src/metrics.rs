@@ -88,16 +88,16 @@ impl Metrics {
         registry.register(Box::new(host_cpu_total.clone()))?;
 
         let host_cpu_available = IntGaugeVec::new(
-            Opts::new(
-                "basis_host_cpu_available",
-                "Unallocated vCPUs on each host",
-            ),
+            Opts::new("basis_host_cpu_available", "Unallocated vCPUs on each host"),
             &["host"],
         )?;
         registry.register(Box::new(host_cpu_available.clone()))?;
 
         let host_memory_mib_total = IntGaugeVec::new(
-            Opts::new("basis_host_memory_mib_total", "Total RAM (MiB) on each host"),
+            Opts::new(
+                "basis_host_memory_mib_total",
+                "Total RAM (MiB) on each host",
+            ),
             &["host"],
         )?;
         registry.register(Box::new(host_memory_mib_total.clone()))?;
@@ -255,9 +255,13 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
     metrics.clusters.set(clusters.len() as i64);
 
     metrics.hosts.reset();
-    let (healthy, unhealthy) = hosts
-        .iter()
-        .fold((0i64, 0i64), |(h, u), row| if row.healthy { (h + 1, u) } else { (h, u + 1) });
+    let (healthy, unhealthy) = hosts.iter().fold((0i64, 0i64), |(h, u), row| {
+        if row.healthy {
+            (h + 1, u)
+        } else {
+            (h, u + 1)
+        }
+    });
     metrics.hosts.with_label_values(&["true"]).set(healthy);
     metrics.hosts.with_label_values(&["false"]).set(unhealthy);
 
@@ -297,27 +301,45 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
     // displays human-readable names instead of UUIDs.
     for host in &hosts {
         let h = host.hostname.as_str();
-        let usage = usage_by_host.get(host.id.as_str()).copied().unwrap_or_default();
+        let usage = usage_by_host
+            .get(host.id.as_str())
+            .copied()
+            .unwrap_or_default();
 
-        metrics.host_cpu_total.with_label_values(&[h]).set(host.total_cpu);
+        metrics
+            .host_cpu_total
+            .with_label_values(&[h])
+            .set(host.total_cpu);
         metrics
             .host_cpu_available
             .with_label_values(&[h])
             .set((host.total_cpu - usage.cpu).max(0));
-        metrics.host_memory_mib_total.with_label_values(&[h]).set(host.total_memory_mib);
+        metrics
+            .host_memory_mib_total
+            .with_label_values(&[h])
+            .set(host.total_memory_mib);
         metrics
             .host_memory_mib_available
             .with_label_values(&[h])
             .set((host.total_memory_mib - usage.mem).max(0));
-        metrics.host_disk_gib_total.with_label_values(&[h]).set(host.total_disk_gib);
+        metrics
+            .host_disk_gib_total
+            .with_label_values(&[h])
+            .set(host.total_disk_gib);
         metrics
             .host_disk_gib_available
             .with_label_values(&[h])
             .set((host.total_disk_gib - usage.disk).max(0));
 
         let inventory: Vec<GpuInfo> = parse_owned_json(&host.gpu_inventory, "hosts.gpu_inventory");
-        metrics.host_gpus_total.with_label_values(&[h]).set(inventory.len() as i64);
-        metrics.host_gpus_assigned.with_label_values(&[h]).set(usage.gpus);
+        metrics
+            .host_gpus_total
+            .with_label_values(&[h])
+            .set(inventory.len() as i64);
+        metrics
+            .host_gpus_assigned
+            .with_label_values(&[h])
+            .set(usage.gpus);
 
         metrics
             .host_last_heartbeat_age_seconds
@@ -345,7 +367,9 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
     }
     for vm in &vms {
         let state = state_label(vm.state);
-        *vm_counts.entry((state, vm.cluster_id.as_str())).or_insert(0) += 1;
+        *vm_counts
+            .entry((state, vm.cluster_id.as_str()))
+            .or_insert(0) += 1;
 
         let host_name = host_id_to_name
             .get(vm.host_id.as_str())
@@ -474,8 +498,12 @@ mod tests {
     async fn refresh_populates_gauges() {
         let db = Db::open(":memory:".as_ref()).await.unwrap();
 
-        db.upsert_host(&make_host("h1", "node-a", 32, true)).await.unwrap();
-        db.upsert_host(&make_host("h2", "node-b", 16, false)).await.unwrap();
+        db.upsert_host(&make_host("h1", "node-a", 32, true))
+            .await
+            .unwrap();
+        db.upsert_host(&make_host("h2", "node-b", 16, false))
+            .await
+            .unwrap();
         db.insert_cluster(&make_cluster("c1")).await.unwrap();
         db.insert_vm(&make_vm("v1", "h1", "c1", 2)).await.unwrap(); // RUNNING
         db.insert_vm(&make_vm("v2", "h1", "c1", 1)).await.unwrap(); // CREATING
@@ -486,8 +514,14 @@ mod tests {
         assert_eq!(metrics.clusters.get(), 1);
         assert_eq!(metrics.hosts.with_label_values(&["true"]).get(), 1);
         assert_eq!(metrics.hosts.with_label_values(&["false"]).get(), 1);
-        assert_eq!(metrics.host_cpu_total.with_label_values(&["node-a"]).get(), 32);
-        assert_eq!(metrics.host_cpu_total.with_label_values(&["node-b"]).get(), 16);
+        assert_eq!(
+            metrics.host_cpu_total.with_label_values(&["node-a"]).get(),
+            32
+        );
+        assert_eq!(
+            metrics.host_cpu_total.with_label_values(&["node-b"]).get(),
+            16
+        );
         assert_eq!(metrics.vms.with_label_values(&["RUNNING", "c1"]).get(), 1);
         assert_eq!(metrics.vms.with_label_values(&["CREATING", "c1"]).get(), 1);
     }
@@ -495,7 +529,9 @@ mod tests {
     #[tokio::test]
     async fn refresh_drops_labels_for_deleted_vms() {
         let db = Db::open(":memory:".as_ref()).await.unwrap();
-        db.upsert_host(&make_host("h1", "node-a", 32, true)).await.unwrap();
+        db.upsert_host(&make_host("h1", "node-a", 32, true))
+            .await
+            .unwrap();
         db.insert_cluster(&make_cluster("c1")).await.unwrap();
         db.insert_vm(&make_vm("v1", "h1", "c1", 2)).await.unwrap();
 
