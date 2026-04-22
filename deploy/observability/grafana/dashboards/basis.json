@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Basis controller + agent state. Stuck-VM detection, per-host capacity, scheduler flow, stream health.",
+  "description": "Basis controller + agent state. Every panel is backed by a metric the controller actually emits (see crates/basis-controller/src/metrics.rs).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -32,7 +32,6 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -52,7 +51,6 @@
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
         "textMode": "auto"
       },
-      "pluginVersion": "10.0.0",
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
@@ -120,7 +118,7 @@
           "refId": "A"
         }
       ],
-      "title": "VMs pending",
+      "title": "VMs in flight",
       "type": "stat"
     },
     {
@@ -187,17 +185,8 @@
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "max": 100,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 70 },
-              { "color": "red", "value": 90 }
-            ]
-          },
+          "color": { "mode": "palette-classic" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
           "unit": "percent"
         }
       },
@@ -213,7 +202,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "100 * sum(basis_host_gpus_assigned) / sum(basis_host_gpus_total)",
+          "expr": "100 * sum(basis_host_gpus_assigned) / clamp_min(sum(basis_host_gpus_total), 1)",
           "refId": "A"
         }
       ],
@@ -223,35 +212,26 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
-      "id": 101,
+      "id": 200,
       "panels": [],
-      "title": "Flow & throughput",
+      "title": "Flow",
       "type": "row"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "VM creation results by outcome (success, failed, etc). Emitted at the site where CreateMachine returns.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisPlacement": "auto",
-            "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": { "mode": "normal" }
-          },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 },
           "unit": "ops"
         }
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 6 },
-      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "id": 10,
       "options": {
-        "legend": { "calcs": ["mean"], "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
       },
       "targets": [
         {
@@ -261,223 +241,246 @@
           "refId": "A"
         }
       ],
-      "title": "VM creation rate",
+      "title": "VM creation rate (by result)",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Scheduler placement decisions by outcome. `placed` means a host was selected; anything else (insufficient_capacity, no_gpu, etc.) is a rejection and worth investigating if sustained.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineWidth": 1,
-            "pointSize": 5,
-            "showPoints": "never",
-            "stacking": { "mode": "none" }
-          },
-          "unit": "reqps"
-        }
-      },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 6 },
-      "id": 8,
-      "options": {
-        "legend": { "calcs": ["mean"], "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum by (method) (rate(basis_grpc_requests_total[5m]))",
-          "legendFormat": "{{method}}",
-          "refId": "A"
-        }
-      ],
-      "title": "gRPC request rate",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 30,
-            "lineWidth": 1,
-            "pointSize": 5,
-            "showPoints": "never",
-            "stacking": { "mode": "none" }
-          },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 },
           "unit": "ops"
         }
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
-      "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "id": 11,
       "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "single" }
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum by (outcome) (rate(basis_scheduler_decisions_total{outcome!=\"placed\"}[5m]))",
+          "expr": "sum by (outcome) (rate(basis_scheduler_decisions_total[5m]))",
           "legendFormat": "{{outcome}}",
           "refId": "A"
         }
       ],
-      "title": "Scheduler failures",
+      "title": "Scheduler decisions (by outcome)",
       "type": "timeseries"
     },
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
-      "id": 102,
+      "id": 300,
       "panels": [],
       "title": "Per-host capacity",
       "type": "row"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Assigned vCPU per host over time. Solid line is sum(vm.cpu) assigned to the host. Dashed 'physical' line is the host's logical CPU count (beyond this the kernel time-slices). Dashed 'overcommit' line is physical × basis_cpu_overcommit_ratio — the scheduler's hard ceiling.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "max": 100,
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          },
           "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 70 },
-              { "color": "red", "value": 90 }
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*physical.*" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 }
             ]
           },
-          "unit": "percent"
-        }
+          {
+            "matcher": { "id": "byRegexp", "options": ".*overcommit.*" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 15 },
-      "id": 10,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "id": 20,
       "options": {
-        "displayMode": "gradient",
-        "minVizHeight": 10,
-        "minVizWidth": 0,
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "showUnfilled": true,
-        "valueMode": "color"
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "100 * (basis_host_cpu_total - basis_host_cpu_available) / basis_host_cpu_total",
-          "legendFormat": "{{host}}",
+          "expr": "basis_host_cpu_total - basis_host_cpu_available",
+          "legendFormat": "{{host}} assigned",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_host_cpu_total",
+          "legendFormat": "{{host}} physical",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_host_cpu_total * scalar(basis_cpu_overcommit_ratio)",
+          "legendFormat": "{{host}} overcommit",
+          "refId": "C"
         }
       ],
-      "title": "CPU used % by host",
-      "type": "bargauge"
+      "title": "CPU assigned by host",
+      "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Assigned RAM per host (MiB). Solid line is sum(vm.memory_mib) assigned to the host. Dashed 'max' is the host's physical RAM — memory is never overcommitted.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "max": 100,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 70 },
-              { "color": "red", "value": 90 }
-            ]
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never",
+            "spanNulls": true
           },
-          "unit": "percent"
-        }
+          "min": 0,
+          "unit": "mbytes"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*max.*" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 15 },
-      "id": 11,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "id": 21,
       "options": {
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "showUnfilled": true,
-        "valueMode": "color"
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "100 * (basis_host_memory_mib_total - basis_host_memory_mib_available) / basis_host_memory_mib_total",
-          "legendFormat": "{{host}}",
+          "expr": "basis_host_memory_mib_total - basis_host_memory_mib_available",
+          "legendFormat": "{{host}} assigned",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_host_memory_mib_total",
+          "legendFormat": "{{host}} max",
+          "refId": "B"
         }
       ],
-      "title": "Memory used % by host",
-      "type": "bargauge"
+      "title": "Memory assigned by host",
+      "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Assigned disk per host (GiB). Solid line is sum(vm.disk_gib). Dashed 'max' is the thin pool size reported at agent registration; sum(vm.disk_gib) is virtual so assigned is a conservative upper bound on physical use. Disk is never overcommitted.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "max": 100,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "blue", "value": null },
-              { "color": "yellow", "value": 75 },
-              { "color": "red", "value": 95 }
-            ]
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never",
+            "spanNulls": true
           },
-          "unit": "percent"
-        }
+          "min": 0,
+          "unit": "gbytes"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*max.*" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 15 },
-      "id": 12,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "id": 22,
       "options": {
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "showUnfilled": true,
-        "valueMode": "color"
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "100 * basis_host_gpus_assigned / basis_host_gpus_total",
-          "legendFormat": "{{host}}",
+          "expr": "basis_host_disk_gib_total - basis_host_disk_gib_available",
+          "legendFormat": "{{host}} assigned",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_host_disk_gib_total",
+          "legendFormat": "{{host}} max",
+          "refId": "B"
         }
       ],
-      "title": "GPU allocated % by host",
-      "type": "bargauge"
+      "title": "Disk assigned by host",
+      "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Seconds since the controller last received a heartbeat from each host. One line per host. Dashed reference line at 90s — the point at which the controller flips a host to unhealthy and the scheduler stops placing VMs on it (see controller.rs).",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": { "mode": "line+area" }
+          },
+          "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 30 },
+              { "color": "transparent", "value": null },
               { "color": "red", "value": 90 }
             ]
           },
           "unit": "s"
         }
       },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 15 },
-      "id": 13,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "id": 23,
       "options": {
-        "displayMode": "basic",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "showUnfilled": true,
-        "valueMode": "color"
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
@@ -488,49 +491,72 @@
         }
       ],
       "title": "Heartbeat age by host",
-      "type": "bargauge"
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "1 if an agent stream for the host is currently open to the controller, 0 otherwise. Transient drops are expected during agent restarts; persistent 0 means the agent cannot reach the controller.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "max": 1,
+          "min": 0,
+          "unit": "none"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "id": 24,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_agent_connected",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Agent stream connected",
+      "type": "timeseries"
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
-      "id": 103,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "id": 400,
       "panels": [],
       "title": "Stuck states",
       "type": "row"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "description": "VMs that have been in a non-terminal state longer than 2 minutes. Top candidates for investigation.",
+      "description": "VMs that have been in PENDING/CREATING/STOPPING for more than 2 minutes. Expected to be empty; any entry is worth investigating (kubeadm bootstrap hang, systemd unit failure, agent crash).",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "custom": { "align": "auto", "displayMode": "auto" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "yellow", "value": null },
-              { "color": "red", "value": 300 }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "Value" },
-            "properties": [
-              { "id": "displayName", "value": "Age" },
-              { "id": "unit", "value": "s" }
-            ]
-          }
-        ]
+          "noValue": "no stuck VMs",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }] },
+          "unit": "s"
+        }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
-      "id": 14,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 30,
       "options": {
         "cellHeight": "sm",
         "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
-        "showHeader": true,
-        "sortBy": [{ "desc": true, "displayName": "Age" }]
+        "showHeader": true
       },
+      "pluginVersion": "10.0.0",
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
@@ -540,21 +566,14 @@
           "refId": "A"
         }
       ],
-      "title": "Stuck VMs",
+      "title": "Stuck VMs (> 2 min in non-terminal state)",
       "transformations": [
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
-            "indexByName": {
-              "vm_id": 0,
-              "name": 1,
-              "state": 2,
-              "host": 3,
-              "cluster": 4,
-              "Value": 5
-            },
-            "renameByName": {}
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true },
+            "indexByName": { "name": 0, "state": 1, "cluster": 2, "host": 3, "Value": 4 },
+            "renameByName": { "Value": "age (s)" }
           }
         }
       ],
@@ -562,35 +581,21 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "description": "Hosts whose last heartbeat is older than 60 seconds.",
+      "description": "Hosts whose last heartbeat is older than 60 seconds. Expected to be empty.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "custom": { "align": "auto", "displayMode": "auto" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "yellow", "value": null },
-              { "color": "red", "value": 90 }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "Value" },
-            "properties": [
-              { "id": "displayName", "value": "Age" },
-              { "id": "unit", "value": "s" }
-            ]
-          }
-        ]
+          "noValue": "all hosts healthy",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }] },
+          "unit": "s"
+        }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
-      "id": 15,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 31,
       "options": {
         "cellHeight": "sm",
-        "showHeader": true,
-        "sortBy": [{ "desc": true, "displayName": "Age" }]
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true
       },
       "targets": [
         {
@@ -601,212 +606,24 @@
           "refId": "A"
         }
       ],
-      "title": "Stale hosts",
+      "title": "Stale hosts (heartbeat > 60s)",
       "transformations": [
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
-            "indexByName": { "host": 0, "Value": 1 }
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true },
+            "indexByName": { "host": 0, "Value": 1 },
+            "renameByName": { "Value": "age (s)" }
           }
         }
       ],
       "type": "table"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
-      "id": 104,
-      "panels": [],
-      "title": "Latency",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "description": "Distribution of wall time from PENDING → RUNNING across all VM creations.",
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "scaleDistribution": { "type": "linear" } }
-        }
-      },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 33 },
-      "id": 16,
-      "options": {
-        "calculate": false,
-        "cellGap": 1,
-        "color": { "exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "reverse": false, "scale": "exponential", "scheme": "Oranges", "steps": 64 },
-        "exemplars": { "color": "rgba(255,0,255,0.7)" },
-        "filterValues": { "le": 1e-9 },
-        "legend": { "show": true },
-        "rowsFrame": { "layout": "auto" },
-        "tooltip": { "show": true, "yHistogram": false },
-        "yAxis": { "axisPlacement": "left", "reverse": false, "unit": "s" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum by (le) (rate(basis_vm_time_to_running_seconds_bucket[5m]))",
-          "format": "heatmap",
-          "legendFormat": "{{le}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Time to RUNNING",
-      "type": "heatmap"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never" },
-          "unit": "s"
-        }
-      },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 33 },
-      "id": 17,
-      "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "histogram_quantile(0.95, sum by (method, le) (rate(basis_grpc_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "{{method}} p95",
-          "refId": "A"
-        }
-      ],
-      "title": "gRPC p95 by method",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "description": "Wall time from controller sending a command to the agent's ack/state report.",
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never" },
-          "unit": "s"
-        }
-      },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 33 },
-      "id": 18,
-      "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "histogram_quantile(0.95, sum by (type, le) (rate(basis_agent_command_rtt_seconds_bucket[5m])))",
-          "legendFormat": "{{type}} p95",
-          "refId": "A"
-        }
-      ],
-      "title": "Agent command RTT p95",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
-      "id": 105,
-      "panels": [],
-      "title": "Agent stream",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 1 }
-            ]
-          }
-        }
-      },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 42 },
-      "id": 19,
-      "options": {
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "showUnfilled": true,
-        "valueMode": "color"
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "basis_agent_connected",
-          "legendFormat": "{{host}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Agents connected",
-      "type": "bargauge"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "description": "Agent reconnects over the last 5 minutes, per host.",
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "showPoints": "never" },
-          "unit": "short"
-        }
-      },
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 42 },
-      "id": 20,
-      "options": {
-        "legend": { "calcs": ["sum"], "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum by (host) (increase(basis_agent_stream_reconnects_total[5m]))",
-          "legendFormat": "{{host}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Agent reconnects (5m)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "showPoints": "never" },
-          "unit": "short"
-        }
-      },
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 42 },
-      "id": 21,
-      "options": {
-        "legend": { "calcs": ["last"], "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum by (host) (basis_agent_commands_in_flight)",
-          "legendFormat": "{{host}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Commands in-flight by host",
-      "type": "timeseries"
     }
   ],
   "refresh": "30s",
-  "schemaVersion": 39,
+  "schemaVersion": 38,
   "style": "dark",
-  "tags": ["basis", "infrastructure"],
+  "tags": ["basis"],
   "templating": {
     "list": [
       {
@@ -850,6 +667,6 @@
   "timezone": "browser",
   "title": "Basis Cluster",
   "uid": "basis-cluster",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

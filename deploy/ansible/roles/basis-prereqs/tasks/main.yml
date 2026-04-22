@@ -22,7 +22,75 @@
       - genisoimage         # cidata ISO generation
       - iproute2            # ip(8) for bridge/tap management
       - curl                # cloud-hypervisor HTTP API
+      - lvm2                # VM-disk thin pool management
     state: present
+
+# --- LVM thin pool for VM disks -----------------------------------------
+# Every VM's rootfs is a thin snapshot of a golden image LV, attached
+# raw to cloud-hypervisor with direct=on. No host FS journal or qcow2
+# metadata on the fsync path.
+
+- name: Require basis_lvm_devices to be set
+  ansible.builtin.assert:
+    that:
+      - basis_lvm_devices | length > 0
+    fail_msg: >-
+      basis_lvm_devices must be set to one or more dedicated block
+      devices (e.g. [/dev/sdb, /dev/sdc]). Every basis VM gets a thin
+      snapshot LV from this pool. Each device must be completely
+      unused — wipe existing filesystems or zpools first with
+      `wipefs -a`. See group_vars/all.yml for details.
+
+- name: Enable issue_discards in /etc/lvm/lvm.conf
+  # Required for end-to-end TRIM: guest discard → LV → PV → SSD. Without
+  # this, freed thin-pool extents are never TRIMmed and the SSD degrades
+  # badly under container image churn.
+  ansible.builtin.lineinfile:
+    path: /etc/lvm/lvm.conf
+    regexp: '^\s*#?\s*issue_discards\s*='
+    line: '    issue_discards = 1'
+    backrefs: false
+
+- name: Check whether the basis volume group already exists
+  ansible.builtin.command: "vgs --noheadings --options vg_name {{ basis_lvm_vg }}"
+  register: basis_vg_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Create volume group {{ basis_lvm_vg }} spanning {{ basis_lvm_devices | join(', ') }}
+  # Idempotent: if the VG already exists, this is a no-op. First run does
+  # pvcreate + vgcreate across every listed device. Will refuse if any
+  # device has an unrecognized filesystem — operator must `wipefs -a`
+  # each device first (intentional guardrail, not a bug).
+  community.general.lvg:
+    vg: "{{ basis_lvm_vg }}"
+    pvs: "{{ basis_lvm_devices | join(',') }}"
+    state: present
+
+- name: Check whether the basis thin pool already exists
+  ansible.builtin.command: >-
+    lvs --noheadings --options lv_name {{ basis_lvm_vg }}/{{ basis_lvm_thinpool }}
+  register: basis_pool_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Create thin pool {{ basis_lvm_vg }}/{{ basis_lvm_thinpool }}
+  # --extents 95%FREE leaves 5% in the VG for metadata growth and any
+  # future non-pool allocations. --poolmetadatasize 1G is the upper
+  # recommended size; sizing this too small causes silent pool corruption
+  # when metadata fills.
+  ansible.builtin.command: >-
+    lvcreate
+    --thinpool {{ basis_lvm_vg }}/{{ basis_lvm_thinpool }}
+    --extents 95%FREE
+    --chunksize {{ basis_lvm_chunk_size }}
+    --poolmetadatasize 1G
+    --zero {{ 'y' if basis_lvm_zero_allocation else 'n' }}
+  when: basis_pool_check.rc != 0
+  changed_when: true
+# ------------------------------------------------------------------------
 
 - name: Check installed cloud-hypervisor version
   ansible.builtin.command: "{{ basis_bin_dir }}/cloud-hypervisor --version"

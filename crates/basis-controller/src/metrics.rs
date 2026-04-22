@@ -21,7 +21,7 @@ use basis_common::gpu::GpuInfo;
 use basis_common::json::parse_owned_json;
 use basis_proto::MachineState;
 use prometheus::{
-    Encoder, GaugeVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, Gauge, GaugeVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +51,11 @@ pub struct Metrics {
     pub host_last_heartbeat_age_seconds: GaugeVec,
     pub vm_age_in_state_seconds: GaugeVec,
 
+    /// Controller-wide CPU overcommit ratio. Set once at construction —
+    /// the dashboard computes effective CPU capacity as
+    /// `basis_host_cpu_total * scalar(basis_cpu_overcommit_ratio)`.
+    pub cpu_overcommit_ratio: Gauge,
+
     // --- Gauges (event-driven from the agent stream) ---
     pub agent_connected: IntGaugeVec,
 
@@ -60,7 +65,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new() -> Result<Arc<Self>, prometheus::Error> {
+    pub fn new(cpu_overcommit_ratio: f32) -> Result<Arc<Self>, prometheus::Error> {
         let registry = Registry::new();
 
         let clusters = IntGauge::with_opts(Opts::new(
@@ -162,6 +167,13 @@ impl Metrics {
         )?;
         registry.register(Box::new(vm_age_in_state_seconds.clone()))?;
 
+        let cpu_overcommit_ratio_gauge = Gauge::with_opts(Opts::new(
+            "basis_cpu_overcommit_ratio",
+            "CPU overcommit multiplier applied by the scheduler to each host's physical CPU count",
+        ))?;
+        cpu_overcommit_ratio_gauge.set(cpu_overcommit_ratio as f64);
+        registry.register(Box::new(cpu_overcommit_ratio_gauge.clone()))?;
+
         let agent_connected = IntGaugeVec::new(
             Opts::new(
                 "basis_agent_connected",
@@ -204,6 +216,7 @@ impl Metrics {
             host_gpus_assigned,
             host_last_heartbeat_age_seconds,
             vm_age_in_state_seconds,
+            cpu_overcommit_ratio: cpu_overcommit_ratio_gauge,
             agent_connected,
             scheduler_decisions_total,
             vm_create_result_total,
@@ -508,7 +521,7 @@ mod tests {
         db.insert_vm(&make_vm("v1", "h1", "c1", 2)).await.unwrap(); // RUNNING
         db.insert_vm(&make_vm("v2", "h1", "c1", 1)).await.unwrap(); // CREATING
 
-        let metrics = Metrics::new().unwrap();
+        let metrics = Metrics::new(1.0).unwrap();
         refresh(&metrics, &db).await.unwrap();
 
         assert_eq!(metrics.clusters.get(), 1);
@@ -535,7 +548,7 @@ mod tests {
         db.insert_cluster(&make_cluster("c1")).await.unwrap();
         db.insert_vm(&make_vm("v1", "h1", "c1", 2)).await.unwrap();
 
-        let metrics = Metrics::new().unwrap();
+        let metrics = Metrics::new(1.0).unwrap();
         refresh(&metrics, &db).await.unwrap();
         assert_eq!(metrics.vms.with_label_values(&["RUNNING", "c1"]).get(), 1);
 
@@ -550,11 +563,21 @@ mod tests {
 
     #[test]
     fn render_emits_prometheus_text() {
-        let metrics = Metrics::new().unwrap();
+        let metrics = Metrics::new(1.0).unwrap();
         metrics.clusters.set(3);
         let body = String::from_utf8(metrics.render()).unwrap();
         assert!(body.contains("basis_clusters 3"));
         assert!(body.contains("# HELP basis_clusters"));
+    }
+
+    #[test]
+    fn cpu_overcommit_ratio_is_exported() {
+        let metrics = Metrics::new(4.0).unwrap();
+        let body = String::from_utf8(metrics.render()).unwrap();
+        assert!(
+            body.contains("basis_cpu_overcommit_ratio 4"),
+            "rendered metrics did not contain the ratio gauge:\n{body}",
+        );
     }
 
     #[test]

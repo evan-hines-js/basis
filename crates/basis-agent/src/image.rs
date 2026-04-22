@@ -11,6 +11,12 @@
 //! alongside each other, keyed by media type. Layers are streamed to
 //! `.partial` side files and atomically renamed so a failed or
 //! interrupted pull never leaves a truncated cache entry.
+//!
+//! Host-tool contract: the manager shells out to `qemu-img` and an
+//! ISO-9660 producer (`mkisofs` or `genisoimage`). Which producer is
+//! used is resolved once via [`validate_tools`] at agent startup and
+//! baked into the manager — no runtime fallback — so an operator can't
+//! end up with two machines silently using different tool versions.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +31,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::info;
 
+use crate::lvm;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
     #[error("invalid image reference '{0}': {1}")]
@@ -36,11 +44,37 @@ pub enum ImageError {
     #[error("image manifest missing required layer with media type '{0}'")]
     MissingLayer(&'static str),
 
-    #[error("overlay creation failed: {0}")]
-    OverlayFailed(String),
-
     #[error("cloud-init ISO creation failed: {0}")]
     CloudInitFailed(String),
+
+    #[error("lvm: {0}")]
+    Lvm(#[from] lvm::LvmError),
+
+    #[error("qemu-img info failed: {0}")]
+    ImageInfo(String),
+
+    #[error(
+        "creating images directory {path}: {source} — check that spec.dataDir in host.yaml \
+         points at a writable filesystem and that basis-prereqs has run on this host"
+    )]
+    ImagesDirUnwritable {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "no ISO-9660 producer found on $PATH: {0} — install `genisoimage` (Debian/Ubuntu) or \
+         `cdrkit-genisoimage` / `xorriso` (EL/Fedora); basis-prereqs ansible role normally \
+         handles this"
+    )]
+    IsoToolMissing(String),
+
+    #[error(
+        "qemu-img not found on $PATH: {0} — install `qemu-utils` (Debian/Ubuntu) or \
+         `qemu-img` (EL/Fedora); basis-prereqs ansible role normally handles this"
+    )]
+    QemuImgMissing(String),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -52,11 +86,71 @@ const MEDIA_TYPE_QCOW2: &str = "application/vnd.lattice.node.v1+qcow2";
 const MEDIA_TYPE_KERNEL: &str = "application/vnd.lattice.node.v1+kernel";
 const MEDIA_TYPE_INITRD: &str = "application/vnd.lattice.node.v1+initrd";
 
-/// Paths to a node image's three cached artifacts on disk.
+/// A cached node image. `kernel` and `initrd` are file paths
+/// cloud-hypervisor boots directly; `image_hash` is the stable prefix
+/// used to name the golden LV in the LVM thin pool — per-VM rootfs LVs
+/// are thin snapshots of `/dev/basis/image-<image_hash>`.
 pub struct CachedImage {
-    pub rootfs: PathBuf,
+    pub image_hash: String,
     pub kernel: PathBuf,
     pub initrd: PathBuf,
+}
+
+/// Name of the ISO-9660 producer resolved at startup. `mkisofs` and
+/// `genisoimage` accept the same flags for the subset of options we use
+/// (`-output`, `-volid`, `-joliet`, `-rock`), so only the binary name
+/// varies. Storing the resolved name in the manager keeps every ISO
+/// creation deterministic — no silent tool switch between VMs.
+#[derive(Debug, Clone)]
+pub struct IsoTool(&'static str);
+
+impl IsoTool {
+    pub fn command(&self) -> &'static str {
+        self.0
+    }
+}
+
+/// Resolve host-side tools the manager depends on. Call at agent startup
+/// before `ImageManager::new`; failure here should abort the agent rather
+/// than let VM creation fail per-request with a confusing error.
+///
+/// Returns the chosen ISO producer. Deterministic preference order:
+///   1. `genisoimage` — default on Debian/Ubuntu, the platform the
+///      basis-prereqs role actually installs.
+///   2. `mkisofs` — still available on a few distros as a cdrtools
+///      symlink to genisoimage.
+///
+/// Also confirms `qemu-img` is on $PATH, which is needed for qcow2→raw
+/// conversion into the LVM thin pool and for reading qcow2 virtual size.
+pub async fn validate_tools() -> Result<IsoTool, ImageError> {
+    use tokio::process::Command;
+
+    async fn have(cmd: &str) -> bool {
+        Command::new(cmd)
+            .arg("--version")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    if !have("qemu-img").await {
+        return Err(ImageError::QemuImgMissing(
+            "`qemu-img --version` did not succeed".to_string(),
+        ));
+    }
+
+    let tool = if have("genisoimage").await {
+        IsoTool("genisoimage")
+    } else if have("mkisofs").await {
+        IsoTool("mkisofs")
+    } else {
+        return Err(ImageError::IsoToolMissing(
+            "tried genisoimage, mkisofs".to_string(),
+        ));
+    };
+    info!(tool = tool.command(), "ISO producer resolved");
+    Ok(tool)
 }
 
 pub struct ImageManager {
@@ -64,6 +158,9 @@ pub struct ImageManager {
     /// Per-registry credentials, keyed by registry host (e.g., "ghcr.io").
     /// Empty map means every pull is anonymous.
     auth: HashMap<String, RegistryAuth>,
+    /// ISO-9660 producer resolved at startup. Fixed for the lifetime of
+    /// the agent — see [`validate_tools`].
+    iso_tool: IsoTool,
     /// Per-image-ref locks. When N CreateVm commands arrive at once for
     /// the same image, one winner takes the lock and pulls; the others
     /// await it, find the cache populated, and return without touching
@@ -72,36 +169,49 @@ pub struct ImageManager {
 }
 
 impl ImageManager {
-    pub fn new(images_dir: PathBuf) -> Self {
-        Self::with_auth(images_dir, HashMap::new())
+    pub fn new(images_dir: PathBuf, iso_tool: IsoTool) -> Result<Self, ImageError> {
+        Self::with_auth(images_dir, HashMap::new(), iso_tool)
     }
 
-    pub fn with_auth(images_dir: PathBuf, auth: HashMap<String, RegistryAuth>) -> Self {
-        std::fs::create_dir_all(&images_dir).ok();
-        Self {
+    pub fn with_auth(
+        images_dir: PathBuf,
+        auth: HashMap<String, RegistryAuth>,
+        iso_tool: IsoTool,
+    ) -> Result<Self, ImageError> {
+        std::fs::create_dir_all(&images_dir).map_err(|e| ImageError::ImagesDirUnwritable {
+            path: images_dir.clone(),
+            source: e,
+        })?;
+        Ok(Self {
             images_dir,
             auth,
+            iso_tool,
             pull_locks: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
-    /// Ensure the rootfs, kernel, and initrd for `image_ref` are cached
-    /// locally. Fetches any missing layer; no-op if all three are
-    /// already present. Concurrent callers for the same `image_ref`
-    /// serialize on a per-ref lock so only one pull runs.
+    /// Ensure the kernel, initrd, and golden rootfs LV for `image_ref`
+    /// are ready locally. Pulls missing layers, decompresses the qcow2,
+    /// and converts it once into a raw thin LV at `/dev/basis/image-<hash>`
+    /// that per-VM snapshots branch from. Concurrent callers for the
+    /// same `image_ref` serialize on a per-ref lock so only one
+    /// pull+convert runs.
     pub async fn ensure_cached(&self, image_ref: &str) -> Result<CachedImage, ImageError> {
         let prefix = image_ref_to_prefix(image_ref);
         let rootfs = self.images_dir.join(format!("{prefix}.qcow2"));
         let kernel = self.images_dir.join(format!("{prefix}.vmlinuz"));
         let initrd = self.images_dir.join(format!("{prefix}.initrd"));
 
-        // Fast path: everything cached. Exists-check is racy against a
-        // concurrent puller still writing a `.partial`, but that's what
-        // the per-image lock below is for — if any file is missing we
-        // take the lock and re-check under it.
-        if rootfs.exists() && kernel.exists() && initrd.exists() {
+        // Fast path: qcow2 download + golden LV both already ready.
+        // Exists-checks are racy against a concurrent puller; the
+        // per-image lock below is the real serialization.
+        if rootfs.exists()
+            && kernel.exists()
+            && initrd.exists()
+            && lvm::image_lv_path(&prefix).exists()
+        {
             return Ok(CachedImage {
-                rootfs,
+                image_hash: prefix,
                 kernel,
                 initrd,
             });
@@ -110,29 +220,28 @@ impl ImageManager {
         let lock = self.lock_for(image_ref).await;
         let _guard = lock.lock().await;
 
-        // Re-check under the lock. If we raced an earlier puller, the
-        // cache is now populated and we return without hitting the
-        // network.
-        if rootfs.exists() && kernel.exists() && initrd.exists() {
-            return Ok(CachedImage {
-                rootfs,
-                kernel,
-                initrd,
-            });
+        // Pull any missing OCI layers (qcow2/kernel/initrd). No-op if
+        // an earlier puller already populated them.
+        if !rootfs.exists() || !kernel.exists() || !initrd.exists() {
+            info!(image = %image_ref, "pulling image");
+            self.pull_oci(
+                image_ref,
+                &[
+                    (MEDIA_TYPE_QCOW2, rootfs.as_path()),
+                    (MEDIA_TYPE_KERNEL, kernel.as_path()),
+                    (MEDIA_TYPE_INITRD, initrd.as_path()),
+                ],
+            )
+            .await?;
         }
 
-        info!(image = %image_ref, "pulling image");
-        self.pull_oci(
-            image_ref,
-            &[
-                (MEDIA_TYPE_QCOW2, rootfs.as_path()),
-                (MEDIA_TYPE_KERNEL, kernel.as_path()),
-                (MEDIA_TYPE_INITRD, initrd.as_path()),
-            ],
-        )
-        .await?;
+        // Convert qcow2 → raw into a golden thin LV. Idempotent: if the
+        // LV is already populated (marked RO), this is a no-op.
+        let virtual_size_gib = qcow2_virtual_size_gib(&rootfs).await?;
+        lvm::ensure_image_lv(&prefix, &rootfs, virtual_size_gib).await?;
+
         Ok(CachedImage {
-            rootfs,
+            image_hash: prefix,
             kernel,
             initrd,
         })
@@ -214,42 +323,6 @@ impl ImageManager {
         Ok(())
     }
 
-    /// Create a qcow2 copy-on-write overlay backed by the base image.
-    pub async fn create_overlay(
-        &self,
-        base_image: &Path,
-        vm_dir: &Path,
-        disk_gib: u32,
-    ) -> Result<PathBuf, ImageError> {
-        std::fs::create_dir_all(vm_dir)?;
-        let overlay_path = vm_dir.join("disk.qcow2");
-
-        let output = Command::new("qemu-img")
-            .args([
-                "create",
-                "-f",
-                "qcow2",
-                "-F",
-                "qcow2",
-                "-b",
-                &base_image.to_string_lossy(),
-                &overlay_path.to_string_lossy(),
-                &format!("{disk_gib}G"),
-            ])
-            .output()
-            .await
-            .map_err(|e| ImageError::OverlayFailed(e.to_string()))?;
-
-        if !output.status.success() {
-            return Err(ImageError::OverlayFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
-        }
-
-        info!(path = %overlay_path.display(), "created qcow2 overlay");
-        Ok(overlay_path)
-    }
-
     /// Create a cloud-init ISO (cidata) with network config and userdata.
     ///
     /// `instance_id` must be unique per VM: kubeadm's kubelet arg
@@ -303,7 +376,10 @@ impl ImageManager {
         std::fs::write(cidata_dir.join("network-config"), &network_config)?;
 
         let iso_path = vm_dir.join("cidata.iso");
-        let output = Command::new("mkisofs")
+        // Use the tool resolved at startup (see `validate_tools`). No
+        // runtime fallback: silently switching producers between VMs
+        // would make incident debugging miserable.
+        let output = Command::new(self.iso_tool.command())
             .args([
                 "-output",
                 &iso_path.to_string_lossy(),
@@ -314,30 +390,20 @@ impl ImageManager {
                 &cidata_dir.to_string_lossy(),
             ])
             .output()
-            .await;
-
-        // Fallback to genisoimage if mkisofs not available
-        let output = match output {
-            Ok(o) if o.status.success() => o,
-            _ => Command::new("genisoimage")
-                .args([
-                    "-output",
-                    &iso_path.to_string_lossy(),
-                    "-volid",
-                    "cidata",
-                    "-joliet",
-                    "-rock",
-                    &cidata_dir.to_string_lossy(),
-                ])
-                .output()
-                .await
-                .map_err(|e| ImageError::CloudInitFailed(e.to_string()))?,
-        };
+            .await
+            .map_err(|e| {
+                ImageError::CloudInitFailed(format!(
+                    "spawning {}: {e}",
+                    self.iso_tool.command()
+                ))
+            })?;
 
         if !output.status.success() {
-            return Err(ImageError::CloudInitFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+            return Err(ImageError::CloudInitFailed(format!(
+                "{} failed: {}",
+                self.iso_tool.command(),
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
         std::fs::remove_dir_all(&cidata_dir).ok();
@@ -352,6 +418,28 @@ impl ImageManager {
 /// `ensure_cached`.
 fn image_ref_to_prefix(image_ref: &str) -> String {
     image_ref.replace(['/', ':', '.'], "_")
+}
+
+/// Read the qcow2's declared virtual size in GiB (rounded up). Used to
+/// size the golden LV so per-VM snapshots inherit the image's layout.
+async fn qcow2_virtual_size_gib(qcow2: &Path) -> Result<u64, ImageError> {
+    let out = Command::new("qemu-img")
+        .args(["info", "--output=json", &qcow2.to_string_lossy()])
+        .output()
+        .await
+        .map_err(|e| ImageError::ImageInfo(e.to_string()))?;
+    if !out.status.success() {
+        return Err(ImageError::ImageInfo(
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| ImageError::ImageInfo(format!("parsing qemu-img info output: {e}")))?;
+    let bytes = v["virtual-size"]
+        .as_u64()
+        .ok_or_else(|| ImageError::ImageInfo("virtual-size missing from qemu-img info".into()))?;
+    // Round up to whole GiB — lvcreate --virtualsize takes integer gigabytes.
+    Ok(bytes.div_ceil(1 << 30))
 }
 
 /// Run `qemu-img convert -O qcow2 src dst`, which rewrites compressed

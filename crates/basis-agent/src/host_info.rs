@@ -1,12 +1,8 @@
-//! Host resource discovery: CPU count, total memory, available disk.
+//! Host resource discovery: CPU count, total memory, VM-disk capacity.
 //!
 //! Captured once at agent startup and reported on registration. The
 //! controller's `available_*` accounting is derived from running VMs, not
 //! re-polled here.
-
-use std::path::Path;
-
-use tracing::warn;
 
 pub struct HostResources {
     pub total_cpu: u32,
@@ -15,11 +11,15 @@ pub struct HostResources {
 }
 
 impl HostResources {
-    pub fn discover(data_dir: &Path) -> Self {
+    /// `thin_pool_data_total_bytes` comes from `lvm::validate_pool` at
+    /// startup. VMs don't live on a filesystem anymore — df on data_dir
+    /// would report the OS disk's free space, which is irrelevant to
+    /// VM-disk capacity. Pool data total is the authoritative number.
+    pub fn discover(thin_pool_data_total_bytes: u64) -> Self {
         Self {
             total_cpu: num_cpus(),
             total_memory_mib: total_memory_mib(),
-            total_disk_gib: disk_space_gib(data_dir),
+            total_disk_gib: thin_pool_data_total_bytes / (1 << 30),
         }
     }
 }
@@ -48,30 +48,4 @@ fn total_memory_mib() -> u64 {
         }
     }
     0
-}
-
-/// Available disk space for the agent's data directory, in GiB.
-///
-/// Uses `df --output=avail -B1` so we don't need a platform-specific
-/// statvfs binding. Returns 0 if df is unavailable or errors.
-fn disk_space_gib(path: &Path) -> u64 {
-    let output = std::process::Command::new("df")
-        .args(["--output=avail", "-B1", &path.to_string_lossy()])
-        .output();
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        Ok(_) | Err(_) => {
-            warn!("df failed; reporting 0 disk available");
-            return 0;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .nth(1)
-        .and_then(|line| line.trim().parse::<u64>().ok())
-        .map(|bytes| bytes / (1024 * 1024 * 1024))
-        .unwrap_or(0)
 }

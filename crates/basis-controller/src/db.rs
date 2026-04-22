@@ -19,6 +19,18 @@ pub enum DbError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    #[error(
+        "ip pool '{pool}' has malformed {field} = '{value}' in the controller DB: {reason} \
+         — controller.toml validation should have caught this, so the DB has likely been \
+         edited out-of-band; fix the row or re-seed from a validated config"
+    )]
+    MalformedIpPool {
+        pool: String,
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
 }
 
 /// Every IP allocation is owned by exactly one thing. Two kinds today —
@@ -217,8 +229,8 @@ impl Db {
         owner: IpOwner<'_>,
     ) -> Result<String, DbError> {
         let pool = self.get_ip_pool(pool_name).await?;
-        self.allocate_from_range(pool_name, &pool.vm_range(), owner)
-            .await
+        let range = pool.vm_range()?;
+        self.allocate_from_range(pool_name, &range, owner).await
     }
 
     /// Allocate the next available control-plane VIP from `pool_name`'s
@@ -230,8 +242,8 @@ impl Db {
         owner: IpOwner<'_>,
     ) -> Result<String, DbError> {
         let pool = self.get_ip_pool(pool_name).await?;
-        self.allocate_from_range(pool_name, &pool.vip_range(), owner)
-            .await
+        let range = pool.vip_range()?;
+        self.allocate_from_range(pool_name, &range, owner).await
     }
 
     async fn allocate_from_range(
@@ -612,13 +624,41 @@ pub struct IpPoolRow {
 }
 
 impl IpPoolRow {
-    pub fn vm_range(&self) -> ParsedRange {
-        ParsedRange::parse(&self.vm_range_start, &self.vm_range_end)
-            .expect("vm_range validated on upsert")
+    /// Parse the VM sub-range. Returns `DbError::MalformedIpPool` if the
+    /// stored strings are not valid IPv4 addresses — `controller.toml`
+    /// validation catches this at startup, so the error should only
+    /// surface if the DB has been edited out-of-band.
+    pub fn vm_range(&self) -> Result<ParsedRange, DbError> {
+        ParsedRange::parse(&self.vm_range_start, &self.vm_range_end).map_err(|(field, reason)| {
+            DbError::MalformedIpPool {
+                pool: self.name.clone(),
+                field,
+                value: match field {
+                    "vm_range_start" => self.vm_range_start.clone(),
+                    _ => self.vm_range_end.clone(),
+                },
+                reason,
+            }
+        })
     }
-    pub fn vip_range(&self) -> ParsedRange {
-        ParsedRange::parse(&self.vip_range_start, &self.vip_range_end)
-            .expect("vip_range validated on upsert")
+    pub fn vip_range(&self) -> Result<ParsedRange, DbError> {
+        ParsedRange::parse(&self.vip_range_start, &self.vip_range_end).map_err(|(field, reason)| {
+            DbError::MalformedIpPool {
+                pool: self.name.clone(),
+                // ParsedRange::parse reports "vm_range_start" / "vm_range_end";
+                // rewrite to the VIP field names for the VIP accessor.
+                field: if field == "vm_range_start" {
+                    "vip_range_start"
+                } else {
+                    "vip_range_end"
+                },
+                value: match field {
+                    "vm_range_start" => self.vip_range_start.clone(),
+                    _ => self.vip_range_end.clone(),
+                },
+                reason,
+            }
+        })
     }
 }
 
@@ -631,10 +671,18 @@ pub struct ParsedRange {
 }
 
 impl ParsedRange {
-    fn parse(start: &str, end: &str) -> Result<Self, std::net::AddrParseError> {
+    /// Parse both ends of the range. Returns the field name + reason
+    /// on failure so the caller can produce a field-qualified error.
+    fn parse(start: &str, end: &str) -> Result<Self, (&'static str, String)> {
+        let s: std::net::Ipv4Addr = start
+            .parse()
+            .map_err(|e: std::net::AddrParseError| ("vm_range_start", e.to_string()))?;
+        let e: std::net::Ipv4Addr = end
+            .parse()
+            .map_err(|e: std::net::AddrParseError| ("vm_range_end", e.to_string()))?;
         Ok(Self {
-            start: u32::from(start.parse::<std::net::Ipv4Addr>()?),
-            end: u32::from(end.parse::<std::net::Ipv4Addr>()?),
+            start: u32::from(s),
+            end: u32::from(e),
         })
     }
 }

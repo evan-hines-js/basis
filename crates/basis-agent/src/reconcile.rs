@@ -18,6 +18,7 @@ const RESTART_CONCURRENCY: usize = 4;
 use crate::config::HostSpec;
 use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
+use crate::lvm;
 use crate::network::NetworkManager;
 use crate::vm::VmManager;
 
@@ -87,13 +88,23 @@ pub async fn reconcile_on_startup(
         .buffer_unordered(RESTART_CONCURRENCY)
         .map(|(vm_id, result)| match result {
             Ok(()) => RestartOutcome::Restarted,
-            Err(RestartError::DiskMissing) => {
+            Err(RestartError::DiskMissing { vm_id: id, lv_path, cidata_path }) => {
                 // Disk files missing (directory or qcow2/ISO gone) — keep
                 // the DB record so an operator can see it and let the
-                // controller reconciliation pass clean it up.
+                // controller reconciliation pass clean it up. Log with
+                // enough detail that an operator can diagnose whether
+                // the thin pool was reinitialized or the cidata dir was
+                // wiped.
                 warn!(
-                    vm_id = %vm_id,
-                    "VM disk files missing after reboot, cannot restart — reporting FAILED to controller"
+                    vm_id = %id,
+                    lv_path = %lv_path.display(),
+                    cidata_path = %cidata_path.display(),
+                    lv_exists = lv_path.exists(),
+                    cidata_exists = cidata_path.exists(),
+                    "VM disk artifacts missing after reboot — cannot restart. \
+                     If lv_exists=false: the thin pool may have been reinitialized; \
+                     check `lvs basis/pool`. If cidata_exists=false: dataDir was wiped; \
+                     check mounts on spec.dataDir. Reporting FAILED to controller."
                 );
                 RestartOutcome::Lost
             }
@@ -133,11 +144,65 @@ pub async fn reconcile_on_startup(
         }
     }
 
+    // --- Case 4: orphaned LVs with no DB record and no systemd unit ---
+    // Can happen if the agent crashed between `lvcreate` and `insert_vm`
+    // on a previous session. The LV is taking space in the thin pool
+    // and will never be reused (VM id wouldn't recur), so reclaim it.
+    match lvm::list_vm_lvs().await {
+        Ok(lvs) => {
+            for vm_id in lvs {
+                if !known_ids.contains(&vm_id) && !running_set.contains(vm_id.as_str()) {
+                    warn!(vm_id = %vm_id, "orphaned LV (no DB record, no systemd unit), removing");
+                    if let Err(e) = lvm::remove_vm_lv(&vm_id).await {
+                        warn!(vm_id = %vm_id, error = %e, "failed to remove orphan LV");
+                    } else {
+                        report.orphans += 1;
+                    }
+                }
+            }
+        }
+        Err(e) => warn!(error = %e, "could not list VM LVs for orphan cleanup"),
+    }
+
+    // --- Case 5: orphan tap devices on the bridge ---
+    // Same failure mode as orphan LVs but one layer up: delete_tap can
+    // fail mid-shutdown, or the agent can crash between create_tap and
+    // insert_vm. Tap names are a hash of vm_id, so we enumerate every
+    // bas* tap on the bridge and diff against the set of expected tap
+    // names (known VMs + currently-running units).
+    match net_mgr.list_basis_taps().await {
+        Ok(taps) => {
+            let expected: std::collections::HashSet<String> = known_ids
+                .iter()
+                .chain(running_vm_ids.iter())
+                .map(|id| crate::network::tap_name(id))
+                .collect();
+            let orphans: Vec<String> = taps
+                .into_iter()
+                .filter(|t| !expected.contains(t))
+                .collect();
+            if !orphans.is_empty() {
+                warn!(count = orphans.len(), "removing orphan taps");
+                net_mgr.delete_taps_by_name(&orphans).await;
+                report.orphans += orphans.len() as u32;
+            }
+        }
+        Err(e) => warn!(error = %e, "could not list bridge taps for orphan cleanup"),
+    }
+
     Ok(report)
 }
 
 enum RestartError {
-    DiskMissing,
+    /// VM disk artifacts are gone after a reboot. Either the LVM thin
+    /// pool was reinitialized (operator ran `lvremove` or re-provisioned
+    /// the VG) or the cloud-init ISO directory was wiped. Non-recoverable
+    /// at the agent layer — CAPI needs to see FAILED and reschedule.
+    DiskMissing {
+        vm_id: String,
+        lv_path: std::path::PathBuf,
+        cidata_path: std::path::PathBuf,
+    },
     GpuBindFailed(String),
     Other(anyhow::Error),
 }
@@ -156,11 +221,19 @@ async fn restart_vm(
     image_mgr: &crate::image::ImageManager,
 ) -> Result<(), RestartError> {
     let vm_dir = config.vms_dir().join(&vm_record.vm_id);
-    let disk_path = vm_dir.join("disk.qcow2");
+    let disk_path = lvm::vm_lv_path(&vm_record.vm_id);
     let cloud_init_path = vm_dir.join("cidata.iso");
 
+    // `Path::exists` works on block devices — the thin LV shows up as
+    // `/dev/basis/vm-<id>` while active. Missing LV means either the
+    // thin pool was reinitialized or the operator removed the LV; we
+    // can't restart from that state.
     if !disk_path.exists() || !cloud_init_path.exists() {
-        return Err(RestartError::DiskMissing);
+        return Err(RestartError::DiskMissing {
+            vm_id: vm_record.vm_id.clone(),
+            lv_path: disk_path,
+            cidata_path: cloud_init_path,
+        });
     }
 
     // Resolve the kernel + initrd paths out of the image cache. Same

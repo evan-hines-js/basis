@@ -9,6 +9,7 @@ use basis_agent::gpu;
 use basis_agent::handlers;
 use basis_agent::host_info::HostResources;
 use basis_agent::image::ImageManager;
+use basis_agent::lvm;
 use basis_agent::network::NetworkManager;
 use basis_agent::reconcile;
 use basis_agent::vm::VmManager;
@@ -104,13 +105,50 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     std::fs::create_dir_all(spec.images_dir())?;
     std::fs::create_dir_all(spec.vms_dir())?;
 
-    let agent_db = AgentDb::open(&spec.data_dir.join("agent.db")).await?;
-    info!("agent database ready");
-
     let net_mgr = NetworkManager::new(
         spec.network.bridge.clone(),
         spec.network.physical_nic.clone(),
     );
+
+    // Run every host-level preflight in parallel so the agent either
+    // comes up with all its invariants satisfied, or fails with a
+    // specific, actionable error. Silent fallback at any of these
+    // layers — thin pool missing, NIC missing, IOMMU off, qemu-img
+    // absent — would let a VM be "created" on a host that can't run
+    // it, so we fail loudly instead. Each validator's error message
+    // includes remediation (usually "run basis-prereqs").
+    //
+    // NOTE: `tokio::try_join!` short-circuits on the first failure, so
+    // in the "everything is broken" case the operator only sees one
+    // error at a time. That's fine — once they fix it, the agent
+    // restarts and the next layer's error surfaces.
+    let (pool_capacity, iso_tool, (), ()) = tokio::try_join!(
+        async {
+            lvm::validate_pool()
+                .await
+                .context("validating LVM thin pool (run basis-prereqs ansible role)")
+        },
+        async {
+            basis_agent::image::validate_tools()
+                .await
+                .context("validating host image tools (qemu-img + genisoimage/mkisofs)")
+        },
+        async {
+            gpu::validate_iommu()
+                .await
+                .context("validating kernel IOMMU (intel_iommu=on / amd_iommu=on)")
+        },
+        async {
+            net_mgr
+                .validate_bridge()
+                .await
+                .context("validating host network (bridge + physical NIC)")
+        },
+    )?;
+
+    let agent_db = AgentDb::open(&spec.data_dir.join("agent.db")).await?;
+    info!("agent database ready");
+
     net_mgr.ensure_bridge().await?;
 
     let image_mgr = Arc::new(ImageManager::with_auth(
@@ -127,7 +165,8 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
                 )
             })
             .collect(),
-    ));
+        iso_tool,
+    )?);
     let vm_mgr = Arc::new(Mutex::new(VmManager::new(spec.vms_dir())));
     let net_mgr = Arc::new(net_mgr);
 
@@ -142,7 +181,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         "reconciliation complete"
     );
 
-    let host_resources = HostResources::discover(&spec.data_dir);
+    let host_resources = HostResources::discover(pool_capacity.data_total_bytes);
     // Fail loudly on GPU discovery errors. On a GPU host, silently
     // registering with 0 GPUs means the scheduler packs CPU workloads
     // onto it and customers never see their GPUs — the exact failure
@@ -346,6 +385,20 @@ fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>, host_id: String) {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
+            // Log pool capacity locally every heartbeat. Metadata free is
+            // the silent killer of thin pools — when it fills up the pool
+            // goes read-only and every running VM's disk errors out. No
+            // prometheus yet, so the journal is the warning channel.
+            match lvm::pool_capacity().await {
+                Ok(c) => info!(
+                    pool_data_free_gib = c.data_free_bytes / (1 << 30),
+                    pool_data_total_gib = c.data_total_bytes / (1 << 30),
+                    pool_metadata_free_mib = c.metadata_free_bytes / (1 << 20),
+                    pool_metadata_total_mib = c.metadata_total_bytes / (1 << 20),
+                    "thin pool capacity"
+                ),
+                Err(e) => warn!(error = %e, "reading thin pool capacity"),
+            }
             let msg = AgentMessage {
                 payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
                     host_id: host_id.clone(),

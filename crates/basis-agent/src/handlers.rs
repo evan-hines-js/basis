@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
 use crate::image::ImageManager;
+use crate::lvm;
 use crate::network::NetworkManager;
 use crate::vm::{unit_name_for_vm, VmManager};
 
@@ -38,9 +39,8 @@ pub async fn create_vm(
 
     let base = image_mgr.ensure_cached(&cmd.image).await?;
 
-    let disk_path = image_mgr
-        .create_overlay(&base.rootfs, &vm_dir_path, cmd.disk_gib)
-        .await?;
+    let disk_path =
+        lvm::create_vm_lv(&cmd.vm_id, &base.image_hash, cmd.disk_gib as u64).await?;
 
     let cloud_init_path = image_mgr
         .create_cloud_init_iso(
@@ -120,6 +120,12 @@ pub async fn delete_vm(
     }
     if let Err(e) = vm_mgr.lock().await.delete_vm(vm_id).await {
         warn!(vm_id, error = %e, "failed to stop VM");
+    }
+    // LV removal goes after the systemd stop: cloud-hypervisor won't
+    // release its exclusive open on `/dev/basis/vm-<id>` until the
+    // process exits, and lvremove on a held LV is EBUSY.
+    if let Err(e) = lvm::remove_vm_lv(vm_id).await {
+        warn!(vm_id, error = %e, "failed to remove VM LV");
     }
     if let Err(e) = agent_db.delete_vm(vm_id).await {
         warn!(vm_id, error = %e, "failed to remove local VM record");

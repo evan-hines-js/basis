@@ -74,11 +74,12 @@ impl RunningController {
         let addr = listener.local_addr().unwrap();
 
         let shutdown = CancellationToken::new();
-        let metrics = basis_controller::metrics::Metrics::new().unwrap();
+        let metrics = basis_controller::metrics::Metrics::new(1.0).unwrap();
         let server = basis_controller::server::BasisServer::new(
             db.clone(),
             metrics,
             vec!["1.1.1.1".to_string()],
+            1.0,
         )
         .with_reconcile_interval(reconcile_interval);
         let server_shutdown = shutdown.clone();

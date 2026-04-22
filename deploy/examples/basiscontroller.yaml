@@ -26,3 +26,7 @@ spec:
       vipRange:
         start: 192.168.1.210
         end: 192.168.1.219
+  # CPU overcommit: assigned vCPU is allowed to exceed the host's logical
+  # CPU count by this factor. Memory and disk stay strict. 1.0 = no
+  # overcommit. 4.0 is typical for k8s workload VMs.
+  cpuOvercommitRatio: 4.0

@@ -13,8 +13,61 @@ pub enum GpuError {
     #[error("vfio unbind failed for {pci_address}: {reason}")]
     UnbindFailed { pci_address: String, reason: String },
 
+    #[error(
+        "iommu group unreadable for {pci_address}: {reason} — check kernel IOMMU is enabled \
+         (`intel_iommu=on` or `amd_iommu=on` on the kernel cmdline) and that the device is \
+         actually present; run basis-prereqs to install the vfio modules"
+    )]
+    IommuGroupMissing { pci_address: String, reason: String },
+
+    #[error(
+        "nvidia-smi topology discovery failed: {0} — this is only fatal on NVIDIA hosts; \
+         AMD-only hosts should not attempt topology discovery"
+    )]
+    TopologyDiscoveryFailed(String),
+
+    #[error(
+        "kernel IOMMU not enabled: {0} — add `intel_iommu=on` or `amd_iommu=on` to the kernel \
+         command line (GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub), run `update-grub`, \
+         reboot, and confirm `/sys/kernel/iommu_groups` is populated"
+    )]
+    IommuDisabled(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Validate that the kernel IOMMU subsystem is enabled.
+///
+/// Fail-fast on startup so a GPU host that's missing `intel_iommu=on` /
+/// `amd_iommu=on` surfaces a clear config error *before* the controller
+/// tries to schedule a VM onto a device that will fail VFIO bind. The
+/// check is "is `/sys/kernel/iommu_groups` non-empty?" — if IOMMU is off,
+/// the directory exists but is empty; if IOMMU is on, every PCI device
+/// shows up as a subdirectory here even on CPU-only hosts.
+pub async fn validate_iommu() -> Result<(), GpuError> {
+    let path = Path::new("/sys/kernel/iommu_groups");
+    if !path.exists() {
+        return Err(GpuError::IommuDisabled(format!(
+            "{} does not exist",
+            path.display()
+        )));
+    }
+    let mut entries = tokio::fs::read_dir(path)
+        .await
+        .map_err(|e| GpuError::IommuDisabled(format!("reading {}: {e}", path.display())))?;
+    if entries
+        .next_entry()
+        .await
+        .map_err(|e| GpuError::IommuDisabled(format!("iterating {}: {e}", path.display())))?
+        .is_none()
+    {
+        return Err(GpuError::IommuDisabled(format!(
+            "{} is empty (kernel booted without IOMMU)",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Discover GPUs on the host and their NVLink topology.
@@ -48,7 +101,10 @@ pub async fn discover_gpus() -> Result<Vec<GpuInfo>, GpuError> {
         };
 
         let model = extract_model_name(line);
-        let iommu_group = read_iommu_group(pci_addr).await.unwrap_or_default();
+        // A GPU without a readable IOMMU group is unbindable by VFIO — reporting
+        // it to the controller would let the scheduler hand out a device that
+        // fails at bind time with a confusing error. Fail discovery instead.
+        let iommu_group = read_iommu_group(pci_addr).await?;
 
         gpus.push(GpuInfo {
             pci_address: pci_addr.to_string(),
@@ -89,7 +145,7 @@ pub async fn bind_vfio(pci_address: &str) -> Result<String, GpuError> {
         if let Some(driver) = &current_driver {
             if driver == "vfio-pci" {
                 // Already bound — idempotent path.
-                let iommu_group = read_iommu_group(pci_address).await.unwrap_or_default();
+                let iommu_group = read_iommu_group(pci_address).await?;
                 return Ok(format!("/dev/vfio/{iommu_group}"));
             }
 
@@ -115,7 +171,7 @@ pub async fn bind_vfio(pci_address: &str) -> Result<String, GpuError> {
         }
     })?;
 
-    let iommu_group = read_iommu_group(pci_address).await.unwrap_or_default();
+    let iommu_group = read_iommu_group(pci_address).await?;
     let vfio_path = format!("/dev/vfio/{iommu_group}");
 
     info!(pci_address, vfio_path = %vfio_path, "bound GPU to vfio-pci");
@@ -155,11 +211,16 @@ pub async fn unbind_vfio(pci_address: &str) -> Result<(), GpuError> {
 
 async fn read_iommu_group(pci_address: &str) -> Result<String, GpuError> {
     let link = format!("/sys/bus/pci/devices/{pci_address}/iommu_group");
-    let target = std::fs::read_link(&link)?;
-    let group = target.file_name().ok_or_else(|| GpuError::BindFailed {
+    let target = std::fs::read_link(&link).map_err(|e| GpuError::IommuGroupMissing {
         pci_address: pci_address.to_string(),
-        reason: format!("iommu_group symlink has no file name: {}", target.display()),
+        reason: format!("readlink({link}): {e}"),
     })?;
+    let group = target
+        .file_name()
+        .ok_or_else(|| GpuError::IommuGroupMissing {
+            pci_address: pci_address.to_string(),
+            reason: format!("iommu_group symlink has no file name: {}", target.display()),
+        })?;
     Ok(group.to_string_lossy().into_owned())
 }
 
@@ -183,13 +244,10 @@ async fn nvlink_groups_from_nvidia_smi() -> Result<HashMap<String, u32>, GpuErro
         .output()
         .await?;
     if !topo.status.success() {
-        return Err(GpuError::BindFailed {
-            pci_address: String::new(),
-            reason: format!(
-                "nvidia-smi topo -m failed: {}",
-                String::from_utf8_lossy(&topo.stderr)
-            ),
-        });
+        return Err(GpuError::TopologyDiscoveryFailed(format!(
+            "nvidia-smi topo -m failed: {}",
+            String::from_utf8_lossy(&topo.stderr)
+        )));
     }
 
     let pci = Command::new("nvidia-smi")
@@ -197,13 +255,10 @@ async fn nvlink_groups_from_nvidia_smi() -> Result<HashMap<String, u32>, GpuErro
         .output()
         .await?;
     if !pci.status.success() {
-        return Err(GpuError::BindFailed {
-            pci_address: String::new(),
-            reason: format!(
-                "nvidia-smi --query-gpu failed: {}",
-                String::from_utf8_lossy(&pci.stderr)
-            ),
-        });
+        return Err(GpuError::TopologyDiscoveryFailed(format!(
+            "nvidia-smi --query-gpu failed: {}",
+            String::from_utf8_lossy(&pci.stderr)
+        )));
     }
 
     let pci_stdout = String::from_utf8_lossy(&pci.stdout);

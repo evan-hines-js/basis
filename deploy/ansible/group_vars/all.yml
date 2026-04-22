@@ -3,13 +3,46 @@
 basis_bin_dir: /usr/local/bin
 basis_config_dir: /etc/basis
 basis_tls_dir: "{{ basis_config_dir }}/tls"
-# VM overlays, cached OCI images, and cloud-init ISOs all live here. Put
-# this on an enterprise SSD with power-loss protection — guest etcd
-# fsyncs hit this disk directly, and consumer SSD tail latency produces
-# multi-second WAL commits that cascade into lease-expiry storms across
-# the whole control plane. `/ent-zfspool` on the current homelab is a
-# pre-mounted ZFS pool on Intel DC S-series drives.
-basis_data_dir: /ent-zfspool/basis
+# Small persistent state: agent SQLite DB, cached OCI image artifacts,
+# cloud-init ISOs, systemd unit files. NOT the VM disk hot path — that
+# goes on the LVM thin pool below. Can sit on the OS disk.
+basis_data_dir: /var/lib/basis
+
+# Dedicated block devices for the VM-disk LVM thin pool. Every VM gets a
+# thin snapshot LV from this pool attached raw to cloud-hypervisor with
+# O_DIRECT — no host filesystem journal, no qcow2 metadata in the write
+# path. This is the hot path for guest etcd fsync, container image
+# extracts, and kubelet state writes.
+#
+# MUST be enterprise SSDs with power-loss protection. Consumer SSDs
+# turn etcd into a lease-expiry storm under image-pull load.
+#
+# Multiple devices become PVs in the same VG. The thin pool is allocated
+# linearly (not striped): most per-VM LVs land on a single PV, so tail
+# fsync latency is bounded by the slowest drive in the write path —
+# single-drive, not multi-drive-max, which is what etcd fsync wants.
+# Capacity sums across devices.
+#
+# First apply: pvcreate + vgcreate on each device. Subsequent applies
+# are idempotent (skip if VG exists). Each device must be completely
+# unused — wipe any existing filesystem/pool first:
+#
+#   zpool destroy ent-zfspool    # if repurposing from ZFS
+#   wipefs -a /dev/sdb /dev/sdc /dev/sdd /dev/sde
+#
+# Point at disks you don't mind destroying.
+basis_lvm_devices: []  # REQUIRED, e.g. [/dev/sdb, /dev/sdc, /dev/sdd, /dev/sde]
+basis_lvm_vg: basis
+basis_lvm_thinpool: pool
+# 256 KiB is a middle ground: 64K (default) thrashes metadata on large
+# container image extracts; 1 MiB amplifies writes for etcd's 4K fsyncs.
+# 256K handles both acceptably. Don't change without measuring.
+basis_lvm_chunk_size: 256K
+# Skip zeroing on block allocation — the chunk gets overwritten by image
+# data on first write anyway, so zeroing just doubles the first-write
+# cost. Safe for single-tenant k8s VMs; unsafe in multi-tenant settings
+# where previously-freed data must not leak across VMs.
+basis_lvm_zero_allocation: false
 
 # Controller bind + well-known server SAN. `basis_controller_san` must
 # match the SAN we put on the controller's server cert AND the value the
@@ -21,6 +54,13 @@ basis_controller_san: basis-controller
 # Prometheus at /metrics; no TLS, no auth — bind to a network that only
 # your Prometheus can reach.
 basis_controller_metrics_port: 9443
+
+# How much the scheduler is allowed to overcommit CPU on each host: the
+# sum of assigned vCPU may exceed the host's logical CPUs by this factor.
+# Memory and disk are always strict. 1.0 disables overcommit; 4.0 is
+# typical for k8s workload VMs where most containers are idle most of
+# the time. Must be >= 1.0.
+basis_cpu_overcommit_ratio: 4.0
 
 # Where the playbook finds binaries on the control node. Build with
 # `cargo build --release` before running.

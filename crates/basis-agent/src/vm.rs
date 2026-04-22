@@ -1,3 +1,30 @@
+//! Cloud-hypervisor process lifecycle.
+//!
+//! Each VM is a `cloud-hypervisor` child process launched as a systemd
+//! transient *service* via `systemd-run`. Using systemd rather than
+//! parenting the process to the agent directly means:
+//!   * VMs survive agent restarts (upgrades, crashes, config reloads).
+//!   * `journalctl -u basis-vm-<id>` is the one-stop debug surface.
+//!   * cgroups accounting is per-VM out of the box.
+//!
+//! Service, not scope: `--scope` would block `systemd-run` until the VM
+//! exited (it attaches the process to the caller's session); a service
+//! forks the VM under systemd's supervision and `systemd-run` returns
+//! immediately. `--remain-after-exit` keeps the unit visible after the
+//! VM dies so `systemctl status` and the journal can be consulted for
+//! root cause.
+//!
+//! Boot path: direct kernel boot with a pre-extracted `vmlinuz` +
+//! `initrd` (see `image.rs` for why we skip UEFI/shim/grub). The rootfs
+//! is a raw LVM thin snapshot attached with `image_type=raw,direct=on`
+//! — `lvm.rs` owns the storage rationale; the `--disk` flag comments
+//! below explain the cloud-hypervisor-specific gotchas.
+//!
+//! Delete is intentionally not idempotent at the `systemctl` level —
+//! we always attempt a graceful shutdown via the API socket first and
+//! fall back to `systemctl stop`. The directory cleanup is best-effort
+//! because the VM dir is regenerated on next create anyway.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -78,25 +105,55 @@ impl VmManager {
         // after a single flag (NOT as repeated `--disk` flags). Same
         // shape for `--device` below.
         //
-        // `image_type=qcow2` + `backing_files=on` on the overlay are
-        // required as of cloud-hypervisor v51: `backing_files` defaults
-        // off (landlock-friendly), and a device-manager autodetect path
-        // forces it off again for qcow2 unless `image_type` is set
-        // explicitly. The cidata ISO is raw; autodetect is correct there.
+        // Rootfs disk is a raw LVM thin LV (see `lvm.rs`), attached with:
+        //   image_type=raw   MUST be set explicitly. When omitted,
+        //                    cloud-hypervisor autodetects the disk type
+        //                    and, for auto-detected raw images, silently
+        //                    rejects guest writes to sector 0 as a
+        //                    safety measure (PR #7728). That breaks
+        //                    cloud-init's growpart on first boot —
+        //                    sfdisk writes the new partition table to
+        //                    sector 0, the write gets rejected, growpart
+        //                    reverts, /dev/vda1 stays at the image's
+        //                    original size, the guest fills up in
+        //                    minutes. Declaring image_type explicitly
+        //                    bypasses autodetect and re-enables sector-0
+        //                    writes.
+        //   direct=on        O_DIRECT; bypass host page cache. Required
+        //                    for etcd durability — with the cache in the
+        //                    path, fsync can return before data hits the
+        //                    SSD, silently corrupting the WAL on a host
+        //                    crash.
+        //   num_queues=cpus  One virtio-blk queue per vCPU so kubelet,
+        //                    containerd, and etcd can all do I/O in
+        //                    parallel without contending on a single
+        //                    queue lock. Cloud-hypervisor's default is 1.
+        //   queue_size=256   Generous ring depth for small-write
+        //                    workloads like etcd's 4K fsyncs.
+        //
+        // The cidata ISO is a tiny raw file on the host FS — no tuning
+        // needed; it's read once at boot and never touched again.
         let mut ch_args = vec![
             format!("--api-socket={}", socket_path.to_string_lossy()),
             format!("--cpus=boot={}", cmd.cpu),
             format!("--memory=size={}M", cmd.memory_mib),
             format!("--kernel={}", kernel_path.to_string_lossy()),
             format!("--initramfs={}", initrd_path.to_string_lossy()),
-            "--cmdline=root=/dev/vda1 ro console=ttyS0".to_string(),
+            // transparent_hugepage=never: etcd's own docs call this out —
+            // THP defragmentation stalls the mutator for seconds at a
+            // time, which pushes WAL fsync latency past raft election
+            // timeouts and kicks off leader flaps. "never" > "madvise"
+            // because containerd's heap is large enough that even madvise
+            // scanning is enough to hurt.
+            "--cmdline=root=/dev/vda1 ro console=ttyS0 transparent_hugepage=never".to_string(),
             format!("--net=tap={tap_name},mac={}", generate_mac(&cmd.vm_id)),
             "--serial=tty".to_string(),
             "--console=off".to_string(),
             "--disk".to_string(),
             format!(
-                "path={},image_type=qcow2,backing_files=on",
-                disk_path.to_string_lossy()
+                "path={},image_type=raw,direct=on,num_queues={},queue_size=256",
+                disk_path.to_string_lossy(),
+                cmd.cpu
             ),
             format!("path={}", cloud_init_path.to_string_lossy()),
         ];

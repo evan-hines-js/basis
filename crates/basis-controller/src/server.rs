@@ -62,6 +62,7 @@ pub struct BasisServer {
     db: Db,
     metrics: Arc<Metrics>,
     dns_servers: Arc<Vec<String>>,
+    cpu_overcommit_ratio: f32,
     reconcile_interval: std::time::Duration,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_creates: Arc<DashMap<String, PendingCreate>>,
@@ -73,11 +74,17 @@ pub struct BasisServer {
 const DEFAULT_AGENT_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl BasisServer {
-    pub fn new(db: Db, metrics: Arc<Metrics>, dns_servers: Vec<String>) -> Self {
+    pub fn new(
+        db: Db,
+        metrics: Arc<Metrics>,
+        dns_servers: Vec<String>,
+        cpu_overcommit_ratio: f32,
+    ) -> Self {
         Self {
             db,
             metrics,
             dns_servers: Arc::new(dns_servers),
+            cpu_overcommit_ratio,
             reconcile_interval: DEFAULT_AGENT_RECONCILE_INTERVAL,
             agents: Arc::new(DashMap::new()),
             pending_creates: Arc::new(DashMap::new()),
@@ -128,6 +135,7 @@ impl BasisServer {
             db: self.db.clone(),
             metrics: self.metrics.clone(),
             dns_servers: self.dns_servers.clone(),
+            cpu_overcommit_ratio: self.cpu_overcommit_ratio,
             agents: self.agents.clone(),
             pending_creates: self.pending_creates.clone(),
         });
@@ -150,6 +158,7 @@ struct BasisApiService {
     db: Db,
     metrics: Arc<Metrics>,
     dns_servers: Arc<Vec<String>>,
+    cpu_overcommit_ratio: f32,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_creates: Arc<DashMap<String, PendingCreate>>,
 }
@@ -672,7 +681,7 @@ impl BasisApiService {
         }
 
         let sched_req = ScheduleRequest::from(req);
-        match scheduler::schedule(&hosts, &vms_by_host, &sched_req) {
+        match scheduler::schedule(&hosts, &vms_by_host, &sched_req, self.cpu_overcommit_ratio) {
             Ok((host_id, gpus)) => {
                 self.metrics
                     .scheduler_decisions_total
@@ -704,6 +713,7 @@ impl BasisApiService {
                     memory_mib = req.memory_mib,
                     disk_gib = req.disk_gib,
                     gpus = req.gpus,
+                    cpu_overcommit_ratio = self.cpu_overcommit_ratio,
                     "scheduler rejected VM: no capacity"
                 );
                 Err(Status::resource_exhausted(msg))

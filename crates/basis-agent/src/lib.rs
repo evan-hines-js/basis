@@ -4,6 +4,7 @@ pub mod gpu;
 pub mod handlers;
 pub mod host_info;
 pub mod image;
+pub mod lvm;
 pub mod network;
 pub mod reconcile;
 pub mod vm;

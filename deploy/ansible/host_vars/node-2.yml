@@ -1,0 +1,13 @@
+---
+# poweredge-md (10.0.0.206): four 186 GB enterprise SSDs (sdb-sde)
+# previously held `ent-zfspool`, now repurposed as a single LVM-thin
+# pool for VM disks. The OS lives on sda (pve-root); sdf/sdg are not
+# part of the pool.
+#
+# `wipefs -a /dev/sdb /dev/sdc /dev/sdd /dev/sde` was run after
+# `zpool destroy ent-zfspool` before the first apply.
+basis_lvm_devices:
+  - /dev/sdb
+  - /dev/sdc
+  - /dev/sdd
+  - /dev/sde

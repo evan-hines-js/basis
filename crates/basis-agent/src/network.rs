@@ -1,3 +1,28 @@
+//! Host-network plumbing for VM guests.
+//!
+//! Every VM gets a tap device attached to a single host bridge; the
+//! bridge in turn masters the physical NIC, so guests share L2 with the
+//! host. Tap names are a 10-hex-digit hash of the VM id (`bas<hex>`) to
+//! fit Linux's 15-char IFNAMSIZ limit while staying deterministic across
+//! restarts.
+//!
+//! Fail-fast philosophy:
+//!   * `validate_bridge` runs at agent startup and refuses to continue if
+//!     the configured physical NIC is missing or the bridge name is
+//!     already held by something we didn't create.
+//!   * `ensure_tap` is idempotent *in the success case*, but propagates
+//!     any real failure (bridge attach, link-up) up to the caller — a
+//!     tap that isn't on the bridge is a VM with no network, and a VM
+//!     reporting Running with no network is the worst possible failure
+//!     mode.
+//!   * Delete paths are best-effort: a missing tap is the state we
+//!     wanted anyway, so we log and continue rather than fail.
+//!
+//! All commands go through `iproute2` via `tokio::process::Command` —
+//! no netlink bindings. The overhead is one fork+exec per operation,
+//! which is negligible next to VM-create latency and is easy to trace
+//! via `strace` / journal.
+
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -5,6 +30,25 @@ use tracing::{info, warn};
 pub enum NetworkError {
     #[error("bridge setup failed: {0}")]
     BridgeFailed(String),
+
+    #[error(
+        "physical NIC '{nic}' not found — set spec.network.physicalNic in host.yaml to an \
+         interface visible in `ip link show`; agent cannot continue without it"
+    )]
+    PhysicalNicMissing { nic: String },
+
+    #[error(
+        "bridge '{bridge}' exists but already has master '{current_master}', not '{expected}' \
+         — either pick a different bridge name in host.yaml or move the NIC manually"
+    )]
+    BridgeOwnedByOther {
+        bridge: String,
+        current_master: String,
+        expected: String,
+    },
+
+    #[error("tap '{tap}' inconsistent: {reason}")]
+    TapInconsistent { tap: String, reason: String },
 
     #[error("command failed: {0}")]
     CommandFailed(#[from] std::io::Error),
@@ -21,6 +65,69 @@ impl NetworkManager {
             bridge_name,
             physical_nic,
         }
+    }
+
+    /// Fail-fast preflight for the host's network config. Called on agent
+    /// startup *before* `ensure_bridge`, so a missing NIC or a bridge
+    /// collision surfaces as a config error, not a confusing `ip link`
+    /// failure partway through tap creation.
+    ///
+    /// Checks:
+    ///   1. The configured physical NIC exists (`ip link show <nic>`).
+    ///   2. If the bridge name already resolves to a link, it is actually
+    ///      a bridge *and* our physical NIC is its master (or no master
+    ///      yet — `ensure_bridge` will attach it). A pre-existing bridge
+    ///      attached to a *different* NIC would silently steal traffic
+    ///      from guests on the next reboot.
+    pub async fn validate_bridge(&self) -> Result<(), NetworkError> {
+        let nic_check = Command::new("ip")
+            .args(["link", "show", &self.physical_nic])
+            .output()
+            .await?;
+        if !nic_check.status.success() {
+            return Err(NetworkError::PhysicalNicMissing {
+                nic: self.physical_nic.clone(),
+            });
+        }
+
+        // `ip -o link show master <bridge>` prints one line per slave. If
+        // the bridge doesn't exist, the command fails — that's fine
+        // (ensure_bridge will create it). If the bridge exists but has a
+        // master that isn't our physical NIC, abort: a pre-existing
+        // bridge attached to a different NIC would silently redirect
+        // guest traffic.
+        let slaves = Command::new("ip")
+            .args(["-o", "link", "show", "master", &self.bridge_name])
+            .output()
+            .await?;
+        if slaves.status.success() && !slaves.stdout.is_empty() {
+            let text = String::from_utf8_lossy(&slaves.stdout);
+            // Each line: "<idx>: <ifname>@... <flags> ..."
+            let current: Vec<String> = text
+                .lines()
+                .filter_map(|l| l.split_whitespace().nth(1))
+                .map(|s| s.trim_end_matches(':').trim_end_matches('@').to_string())
+                .collect();
+            // `bas*` slaves are our own taps; ignore them. Any non-tap
+            // slave that isn't our expected physical NIC is a conflict.
+            let stranger = current
+                .iter()
+                .find(|s| !s.starts_with(TAP_PREFIX) && s.as_str() != self.physical_nic);
+            if let Some(stranger) = stranger {
+                return Err(NetworkError::BridgeOwnedByOther {
+                    bridge: self.bridge_name.clone(),
+                    current_master: stranger.clone(),
+                    expected: self.physical_nic.clone(),
+                });
+            }
+        }
+
+        info!(
+            bridge = %self.bridge_name,
+            nic = %self.physical_nic,
+            "network preflight passed"
+        );
+        Ok(())
     }
 
     /// Ensure the host bridge exists and is connected to the physical NIC.
@@ -91,20 +198,27 @@ impl NetworkManager {
 
         if exists.status.success() {
             // Already exists — make sure it's up and on our bridge. These
-            // writes are idempotent when state is already correct, so
-            // failures here mean the link layer is inconsistent (kernel
-            // refusal, namespace mismatch) and should not be silenced.
-            if let Err(e) = run_cmd(
+            // writes are idempotent when state is already correct, so a
+            // real failure here means the link layer is inconsistent
+            // (kernel refusal, namespace mismatch). Returning Ok with a
+            // dangling tap would produce a VM that reports Running while
+            // having no network, which is the one failure mode the
+            // controller can't detect. Propagate instead.
+            run_cmd(
                 "ip",
                 &["link", "set", &tap_name, "master", &self.bridge_name],
             )
             .await
-            {
-                warn!(tap = %tap_name, error = %e, "failed to re-attach existing tap to bridge");
-            }
-            if let Err(e) = run_cmd("ip", &["link", "set", &tap_name, "up"]).await {
-                warn!(tap = %tap_name, error = %e, "failed to bring existing tap up");
-            }
+            .map_err(|e| NetworkError::TapInconsistent {
+                tap: tap_name.clone(),
+                reason: format!("re-attach to bridge {}: {e}", self.bridge_name),
+            })?;
+            run_cmd("ip", &["link", "set", &tap_name, "up"])
+                .await
+                .map_err(|e| NetworkError::TapInconsistent {
+                    tap: tap_name.clone(),
+                    reason: format!("link up: {e}"),
+                })?;
             info!(tap = %tap_name, vm_id = %vm_id, "tap device already exists, ensured up");
             return Ok(tap_name);
         }
@@ -122,7 +236,62 @@ impl NetworkManager {
         }
         Ok(())
     }
+
+    /// Enumerate every `bas*` tap currently attached to our bridge. Used
+    /// by reconcile to find orphans whose VMs the controller has long
+    /// forgotten. Tap names are a hash of vm_id, so we can't reverse one
+    /// into its VM — the caller diffs this list against its set of
+    /// expected tap names and removes the rest.
+    pub async fn list_basis_taps(&self) -> Result<Vec<String>, NetworkError> {
+        // `bridge link show` prints lines like:
+        //   7: basc1e39a6c74: <...> master vmbr0 state disabled ...
+        let out = Command::new("bridge")
+            .args(["link", "show"])
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Err(NetworkError::BridgeFailed(
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            ));
+        }
+        let mut taps = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // Only lines that reference our bridge.
+            if !line.contains(&format!("master {}", self.bridge_name)) {
+                continue;
+            }
+            // Pull the interface name from "<idx>: <name>: <flags> ..."
+            let Some(name) = line.split_whitespace().nth(1) else {
+                continue;
+            };
+            let name = name.trim_end_matches(':');
+            if name.starts_with(TAP_PREFIX) {
+                taps.push(name.to_string());
+            }
+        }
+        Ok(taps)
+    }
+
+    /// Delete every tap in `names` via `ip link delete`. Best-effort:
+    /// logs failures but returns Ok — a missing tap is fine (the state
+    /// we want is "gone") and a race with another delete is harmless.
+    pub async fn delete_taps_by_name(&self, names: &[String]) {
+        for tap in names {
+            if let Err(e) = run_cmd("ip", &["link", "delete", tap]).await {
+                warn!(tap, error = %e, "failed to delete orphan tap");
+            } else {
+                info!(tap, "deleted orphan tap");
+            }
+        }
+    }
 }
+
+/// Public so reconcile can compute the expected set for orphan detection.
+pub fn tap_name(vm_id: &str) -> String {
+    tap_name_for_vm(vm_id)
+}
+
+const TAP_PREFIX: &str = "bas";
 
 /// Generate a tap device name from a VM ID.
 /// Tap names are limited to 15 chars on Linux, so we use a short prefix + hash.

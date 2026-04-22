@@ -33,7 +33,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let config = BasisControllerSpec::load(&cli.config)?;
-    info!(listen = %config.listen, data_dir = %config.data_dir.display(), "loaded config");
+    config.validate()?;
+    info!(
+        listen = %config.listen,
+        data_dir = %config.data_dir.display(),
+        cpu_overcommit_ratio = config.cpu_overcommit_ratio,
+        "loaded config",
+    );
 
     std::fs::create_dir_all(&config.data_dir)?;
 
@@ -45,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
 
-    let metrics = Metrics::new()?;
+    let metrics = Metrics::new(config.cpu_overcommit_ratio)?;
 
     let health_db = db.clone();
     let health_shutdown = shutdown.clone();
@@ -77,9 +83,14 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&config.listen).await?;
     let tls_config = config.tls.server_config()?;
-    basis_controller::server::BasisServer::new(db, metrics, config.dns_servers)
-        .serve(listener, tls_config, shutdown)
-        .await?;
+    basis_controller::server::BasisServer::new(
+        db,
+        metrics,
+        config.dns_servers,
+        config.cpu_overcommit_ratio,
+    )
+    .serve(listener, tls_config, shutdown)
+    .await?;
 
     Ok(())
 }
