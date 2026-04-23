@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::TryStreamExt;
 use oci_client::client::ClientConfig;
@@ -32,6 +33,26 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::lvm;
+
+/// TCP-level connect deadline to the registry. Default is the OS
+/// setting (~75s of SYN retries on Linux) which is far too long for a
+/// reachable-or-not probe. 10s is enough to tolerate a slow handshake
+/// without hanging the create path when the registry is unreachable.
+const OCI_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard timeout on the manifest fetch. Manifests are small (a few KB)
+/// so a healthy fetch completes in under a second; anything past 30s
+/// is either a slow-loris rate-limit or a non-existent repo that the
+/// registry is taking its time 404-ing. Callers retry on failure, so
+/// this just caps the tail.
+const OCI_MANIFEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle timeout between successive blob chunks. Applied per-chunk so a
+/// legitimately-large pull (hundreds of MB) isn't killed for taking
+/// minutes as long as bytes keep arriving. Once no bytes arrive for
+/// this long we abort — a stalled stream is indistinguishable from a
+/// dropped connection.
+const OCI_BLOB_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
@@ -283,11 +304,23 @@ impl ImageManager {
             .cloned()
             .unwrap_or(RegistryAuth::Anonymous);
 
-        let client = Client::new(ClientConfig::default());
-        let (manifest, _digest) = client
-            .pull_image_manifest(&reference, &auth)
-            .await
-            .map_err(|e| ImageError::PullFailed(format!("fetching manifest: {e}")))?;
+        let client = Client::new(ClientConfig {
+            connect_timeout: Some(OCI_CONNECT_TIMEOUT),
+            ..ClientConfig::default()
+        });
+
+        let manifest = tokio::time::timeout(
+            OCI_MANIFEST_TIMEOUT,
+            client.pull_image_manifest(&reference, &auth),
+        )
+        .await
+        .map_err(|_| {
+            ImageError::PullFailed(format!(
+                "fetching manifest for '{image_ref}': timed out after {OCI_MANIFEST_TIMEOUT:?}"
+            ))
+        })?
+        .map(|(m, _digest)| m)
+        .map_err(|e| ImageError::PullFailed(format!("fetching manifest: {e}")))?;
 
         for (media_type, dest) in targets {
             if dest.exists() {
@@ -305,16 +338,34 @@ impl ImageManager {
             // later run mistakes for valid.
             let tmp = dest.with_extension("partial");
             let mut out = tokio::fs::File::create(&tmp).await?;
-            let mut stream = client
-                .pull_blob_stream(&reference, layer)
-                .await
-                .map_err(|e| ImageError::PullFailed(format!("fetching blob: {e}")))?;
-            while let Some(chunk) = stream
-                .try_next()
-                .await
-                .map_err(|e| ImageError::PullFailed(format!("reading blob: {e}")))?
-            {
-                out.write_all(&chunk).await?;
+            let mut stream = tokio::time::timeout(
+                OCI_MANIFEST_TIMEOUT,
+                client.pull_blob_stream(&reference, layer),
+            )
+            .await
+            .map_err(|_| {
+                ImageError::PullFailed(format!(
+                    "initiating blob pull for '{media_type}': timed out after {OCI_MANIFEST_TIMEOUT:?}"
+                ))
+            })?
+            .map_err(|e| ImageError::PullFailed(format!("fetching blob: {e}")))?;
+            // Per-chunk stall timeout: the stream must make progress at
+            // least once per `OCI_BLOB_CHUNK_TIMEOUT` or we abort.
+            // Applied inside the loop so a legitimately-long pull (lots
+            // of chunks) is bounded only by its actual transfer time.
+            loop {
+                match tokio::time::timeout(OCI_BLOB_CHUNK_TIMEOUT, stream.try_next()).await {
+                    Err(_) => {
+                        return Err(ImageError::PullFailed(format!(
+                            "blob stream for '{media_type}' stalled — no bytes in {OCI_BLOB_CHUNK_TIMEOUT:?}"
+                        )));
+                    }
+                    Ok(Err(e)) => {
+                        return Err(ImageError::PullFailed(format!("reading blob: {e}")));
+                    }
+                    Ok(Ok(None)) => break,
+                    Ok(Ok(Some(chunk))) => out.write_all(&chunk).await?,
+                }
             }
             out.flush().await?;
             drop(out);

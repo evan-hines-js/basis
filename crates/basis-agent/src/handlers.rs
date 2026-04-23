@@ -39,13 +39,15 @@ use crate::vm::{unit_name_for_vm, BootArtifacts, VmManager};
 /// startup reconcile killed as an orphan.
 ///
 /// Because the DB row exists before the systemd unit, the periodic
-/// `reconcile_running_vms` would otherwise see a row for a VM that
-/// isn't yet in `VmManager::tracked` and wrongly report FAILED during
+/// `report_local_vm_states` would otherwise see a row for a VM whose
+/// systemd unit hasn't spawned yet and wrongly report FAILED during
 /// the create window — surfaced to the controller's in-flight RPC as
 /// "VM creation failed: systemd scope gone". We bracket the whole
-/// create flow with [`VmManager::mark_pending`] / `clear_pending` so
-/// `is_running` returns true for the duration of the spawn; the
-/// reconciler then considers the VM live and doesn't interfere.
+/// create flow with [`VmManager::mark_pending`] / `clear_pending`;
+/// the reporter skips pending VMs (their authoritative state comes
+/// from `spawn_create` on completion), and the orphan sweep also
+/// treats pending vm_ids as live so it won't reclaim in-flight
+/// resources.
 pub async fn create_vm(
     cmd: &CreateVmCommand,
     image_mgr: &ImageManager,
@@ -359,16 +361,33 @@ pub async fn report_local_vm_states(
     sender: &mpsc::Sender<AgentMessage>,
 ) -> anyhow::Result<()> {
     for vm in agent_db.list_vms().await? {
-        let (state, err) = if vm_mgr.is_running(&vm.vm_id).await {
+        // Skip VMs whose create is mid-flight. `spawn_create` will
+        // send the authoritative state once `systemd-run` returns;
+        // reporting Running here (while the systemd unit is only
+        // "pending start") would let the controller prematurely
+        // resolve its pending CreateMachine, which in turn lets a
+        // subsequent DeleteMachine race with the still-pending start
+        // job and produce `systemd-run: Job canceled`.
+        if vm_mgr.is_pending(&vm.vm_id).await {
+            continue;
+        }
+        // `has_live_process` reads `SubState` directly from systemd so
+        // we catch guest-level crashes (virtio failure, kernel panic,
+        // OOM). Without this, a `cloud-hypervisor` that exited cleanly
+        // with `--remain-after-exit` would look "active" to any
+        // in-memory check and the VM would report `Running` forever
+        // while the guest is dead, blocking CAPI from triggering
+        // replacement.
+        let (state, err) = if vm_mgr.has_live_process(&vm.vm_id).await {
             (MachineState::Running, String::new())
         } else {
             warn!(
                 vm_id = %vm.vm_id,
-                "VM present in local DB but not running — reporting FAILED"
+                "VM process is not running — reporting FAILED"
             );
             (
                 MachineState::Failed,
-                "vm exited unexpectedly (systemd scope gone)".to_string(),
+                "cloud-hypervisor process exited".to_string(),
             )
         };
         send_vm_state(sender, vm.vm_id, state, err, false).await;

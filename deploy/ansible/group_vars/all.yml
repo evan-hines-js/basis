@@ -105,6 +105,23 @@ basis_agent_registries: []
 # segment as Proxmox's VMs.
 basis_bridge: vmbr0
 
+# NIC the agent attaches to its bridge. Autodetected per host by
+# basis-prereqs: picks the bridge's non-tap slave if the bridge already
+# exists, otherwise the default-route interface. This keeps detection
+# correct *after* the first netplan apply has moved the host IP onto
+# the bridge (when ansible_default_ipv4.interface would otherwise
+# resolve to the bridge itself). Override in host_vars or inventory for
+# nodes with multiple NICs or a non-default routing setup.
+basis_physical_nic: ""
+
+# Whether basis-prereqs manages /etc/netplan/60-basis-bridge.yaml to put
+# the host IP on {{ basis_bridge }} with the physical NIC as a member.
+# Required on any host where the physical NIC currently owns the IP —
+# otherwise basis-agent's `ip link set <nic> master <bridge>` strips the
+# IP and locks you out. Set to false if you manage bridge networking
+# yourself (e.g., already running on Proxmox where vmbr0 is preconfigured).
+basis_manage_netplan: true
+
 # Cloud Hypervisor release to install. A static x86_64 binary from the
 # official GitHub release.
 cloud_hypervisor_version: "51.1"

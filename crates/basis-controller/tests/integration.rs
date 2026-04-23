@@ -211,7 +211,7 @@ fn basic_machine_req(name: &str, cluster_id: &str) -> CreateMachineRequest {
 }
 
 /// Drive the CreateMachine dance: agent receives CreateVm, reports RUNNING,
-/// CreateMachine returns. Returns the VM id and the CreateMachine response.
+/// CreateMachine returns. Returns the CreateMachine response.
 async fn drive_create_to_running(
     agent_tx: &mpsc::Sender<AgentMessage>,
     inbound: &mut tonic::Streaming<ControllerCommand>,
@@ -223,25 +223,95 @@ async fn drive_create_to_running(
         tokio::spawn(async move { capi.create_machine(req).await })
     };
 
+    let vm_id = expect_create_vm(inbound).await;
+    report_vm_state(agent_tx, &vm_id, MachineState::Running, "", false).await;
+    create_handle.await.unwrap().unwrap().into_inner()
+}
+
+/// Drive DeleteMachine: agent receives DeleteVm, reports STOPPED,
+/// DeleteMachine returns. Now that teardown is synchronous, every
+/// delete-in-a-test needs this to avoid hitting the server-side
+/// `DELETE_MACHINE_TIMEOUT`.
+async fn drive_delete_to_stopped(
+    agent_tx: &mpsc::Sender<AgentMessage>,
+    inbound: &mut tonic::Streaming<ControllerCommand>,
+    delete: impl std::future::Future<Output = Result<tonic::Response<DeleteMachineResponse>, tonic::Status>>
+        + Send
+        + 'static,
+) -> tonic::Response<DeleteMachineResponse> {
+    let handle = tokio::spawn(delete);
+    let vm_id = expect_delete_vm(inbound).await;
+    report_vm_state(agent_tx, &vm_id, MachineState::Stopped, "", false).await;
+    handle.await.unwrap().unwrap()
+}
+
+/// Drive DeleteCluster: consume any number of cascading DeleteVm
+/// commands, sending STOPPED for each. Returns once DeleteCluster
+/// resolves — which only happens after every cascaded delete is
+/// confirmed by the agent.
+async fn drive_delete_cluster_to_stopped(
+    agent_tx: &mpsc::Sender<AgentMessage>,
+    inbound: &mut tonic::Streaming<ControllerCommand>,
+    delete: impl std::future::Future<Output = Result<tonic::Response<DeleteClusterResponse>, tonic::Status>>
+        + Send
+        + 'static,
+) -> tonic::Response<DeleteClusterResponse> {
+    let handle = tokio::spawn(delete);
+    tokio::pin!(handle);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut handle => {
+                return result.unwrap().unwrap();
+            }
+            cmd = inbound.next() => {
+                let cmd = cmd.unwrap().unwrap();
+                match &cmd.command {
+                    Some(controller_command::Command::DeleteVm(c)) => {
+                        let vm_id = c.vm_id.clone();
+                        report_vm_state(agent_tx, &vm_id, MachineState::Stopped, "", false).await;
+                    }
+                    other => panic!("expected DeleteVm during cluster cascade, got {:?}", other),
+                }
+            }
+        }
+    }
+}
+
+async fn expect_create_vm(inbound: &mut tonic::Streaming<ControllerCommand>) -> String {
     let cmd = inbound.next().await.unwrap().unwrap();
-    let vm_id = match &cmd.command {
+    match &cmd.command {
         Some(controller_command::Command::CreateVm(c)) => c.vm_id.clone(),
         other => panic!("expected CreateVm, got {:?}", other),
-    };
+    }
+}
 
+async fn expect_delete_vm(inbound: &mut tonic::Streaming<ControllerCommand>) -> String {
+    let cmd = inbound.next().await.unwrap().unwrap();
+    match &cmd.command {
+        Some(controller_command::Command::DeleteVm(c)) => c.vm_id.clone(),
+        other => panic!("expected DeleteVm, got {:?}", other),
+    }
+}
+
+async fn report_vm_state(
+    agent_tx: &mpsc::Sender<AgentMessage>,
+    vm_id: &str,
+    state: MachineState,
+    error_message: &str,
+    transient: bool,
+) {
     agent_tx
         .send(AgentMessage {
             payload: Some(agent_message::Payload::VmState(ReportVmStateRequest {
-                vm_id: vm_id.clone(),
-                state: MachineState::Running as i32,
-                error_message: String::new(),
-                transient: false,
+                vm_id: vm_id.to_string(),
+                state: state as i32,
+                error_message: error_message.to_string(),
+                transient,
             })),
         })
         .await
         .unwrap();
-
-    create_handle.await.unwrap().unwrap().into_inner()
 }
 
 #[tokio::test]
@@ -295,7 +365,7 @@ async fn test_create_cluster_is_idempotent_by_name() {
 
 #[tokio::test]
 async fn test_full_create_delete_flow() {
-    let (running, _db) = RunningController::start().await;
+    let (running, db) = RunningController::start().await;
     let (cluster_id, vip) = create_cluster(&running, "test-cluster").await;
     assert!(vip.starts_with("10.0.10."));
 
@@ -336,18 +406,21 @@ async fn test_full_create_delete_flow() {
         .into_inner();
     assert_eq!(list.machines.len(), 1);
 
-    // Delete
-    capi.delete_machine(DeleteMachineRequest {
-        id: resp.id.clone(),
-    })
-    .await
-    .unwrap();
+    // Delete. Synchronous on the server side: DeleteMachine blocks
+    // until the agent reports STOPPED, so we have to drive the agent
+    // to completion.
+    let vm_id = resp.id.clone();
+    let delete_fut = {
+        let mut capi = capi.clone();
+        async move {
+            capi.delete_machine(DeleteMachineRequest { id: vm_id })
+                .await
+        }
+    };
+    drive_delete_to_stopped(&agent_tx, &mut inbound, delete_fut).await;
 
-    let delete_cmd = inbound.next().await.unwrap().unwrap();
-    match &delete_cmd.command {
-        Some(controller_command::Command::DeleteVm(c)) => assert_eq!(c.vm_id, resp.id),
-        other => panic!("expected DeleteVm, got {:?}", other),
-    }
+    // VM row is gone after the agent confirmed.
+    assert!(db.get_vm(&resp.id).await.is_err());
 }
 
 #[tokio::test]
@@ -365,20 +438,20 @@ async fn test_delete_cluster_cascades_machine_deletes() {
     )
     .await;
 
-    capi.delete_cluster(DeleteClusterRequest {
-        cluster_id: cluster_id.clone(),
-    })
-    .await
-    .unwrap();
+    // DeleteCluster is synchronous: it won't return until every
+    // cascaded VM's agent has reported STOPPED, so we have to feed
+    // the confirmation while the RPC is in flight.
+    let delete_fut = {
+        let mut capi = capi.clone();
+        let cluster_id = cluster_id.clone();
+        async move {
+            capi.delete_cluster(DeleteClusterRequest { cluster_id })
+                .await
+        }
+    };
+    drive_delete_cluster_to_stopped(&agent_tx, &mut inbound, delete_fut).await;
 
-    // Agent receives a DeleteVm for the machine.
-    let cmd = inbound.next().await.unwrap().unwrap();
-    match &cmd.command {
-        Some(controller_command::Command::DeleteVm(c)) => assert_eq!(c.vm_id, vm.id),
-        other => panic!("expected DeleteVm, got {:?}", other),
-    }
-
-    // VM row is gone.
+    // VM row is gone once the cascade completed.
     assert!(db.get_vm(&vm.id).await.is_err());
 
     // Cluster row is gone.

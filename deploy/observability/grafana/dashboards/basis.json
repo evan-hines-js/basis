@@ -29,189 +29,180 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Current VM count per state.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 1 }
-            ]
-          }
-        }
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "lineWidth": 1
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "RUNNING" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#56a64b" } }] },
+          { "matcher": { "id": "byName", "options": "CREATING" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#5794f2" } }] },
+          { "matcher": { "id": "byName", "options": "PENDING" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#8ab8ff" } }] },
+          { "matcher": { "id": "byName", "options": "STOPPING" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#ff9830" } }] },
+          { "matcher": { "id": "byName", "options": "STOPPED" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#8e8e8e" } }] },
+          { "matcher": { "id": "byName", "options": "FAILED" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#e02f44" } }] }
+        ]
       },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 1 },
       "id": 1,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
+        "barRadius": 0,
+        "barWidth": 0.6,
+        "groupWidth": 0.7,
+        "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false },
+        "orientation": "vertical",
+        "showValue": "always",
+        "stacking": "none",
+        "tooltip": { "mode": "single", "sort": "none" },
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum(basis_hosts{healthy=\"true\"})",
+          "expr": "sum by (state) (basis_vms)",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{state}}",
           "refId": "A"
         }
       ],
-      "title": "Healthy hosts",
-      "type": "stat"
+      "title": "VM states",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true }
+          }
+        }
+      ],
+      "type": "barchart"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Per-host health over time. One row per host, coloured by heartbeat age — green under 60s (healthy), yellow 60–90s (approaching stale), red ≥90s (controller flips the host to unhealthy and the scheduler stops placing on it). Tooltip shows the exact age in seconds.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#56a64b", "value": null },
+              { "color": "#ff9830", "value": 60 },
+              { "color": "#e02f44", "value": 90 }
+            ]
+          },
+          "unit": "s"
         }
       },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 1 },
       "id": 2,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
+        "alignValue": "left",
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "never",
+        "tooltip": { "mode": "single", "sort": "none" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum(basis_vms{state=\"RUNNING\"})",
+          "expr": "basis_host_last_heartbeat_age_seconds",
+          "legendFormat": "{{host}}",
           "refId": "A"
         }
       ],
-      "title": "VMs running",
-      "type": "stat"
+      "title": "Hosts (heartbeat state by host)",
+      "type": "state-timeline"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 }
-            ]
-          }
-        }
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
-      "id": 3,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum(basis_vms{state=~\"PENDING|CREATING|STOPPING\"})",
-          "refId": "A"
-        }
-      ],
-      "title": "VMs in flight",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
-            ]
-          }
-        }
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
-      "id": 4,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum(basis_vms{state=\"FAILED\"})",
-          "refId": "A"
-        }
-      ],
-      "title": "VMs failed",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Number of clusters registered with the controller.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never"
+          },
+          "min": 0,
+          "unit": "short"
         }
       },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 8 },
       "id": 5,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
+        "legend": { "calcs": ["last"], "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "single", "sort": "none" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
           "expr": "basis_clusters",
+          "legendFormat": "clusters",
           "refId": "A"
         }
       ],
       "title": "Clusters",
-      "type": "stat"
+      "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Fraction of GPU devices currently assigned to VMs across all healthy hosts. `clamp_min(total, 1)` guards the divide when no GPU hosts are registered.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never"
+          },
+          "max": 100,
+          "min": 0,
           "unit": "percent"
         }
       },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
       "id": 6,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
+        "legend": { "calcs": ["last"], "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "single", "sort": "none" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
           "expr": "100 * sum(basis_host_gpus_assigned) / clamp_min(sum(basis_host_gpus_total), 1)",
+          "legendFormat": "gpu",
           "refId": "A"
         }
       ],
       "title": "GPU utilization",
-      "type": "stat"
+      "type": "timeseries"
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
       "id": 200,
       "panels": [],
       "title": "Flow",
@@ -219,7 +210,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "description": "VM creation results by outcome (success, failed, etc). Emitted at the site where CreateMachine returns.",
+      "description": "Successful CreateMachine rate (ops/s). A sudden drop while Failures climbs means basis is shedding load or broken.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -227,7 +218,7 @@
           "unit": "ops"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "id": 10,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -236,12 +227,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum by (result) (rate(basis_vm_create_result_total[5m]))",
-          "legendFormat": "{{result}}",
+          "expr": "sum(rate(basis_vm_create_result_total{result=\"placed\"}[5m]))",
+          "legendFormat": "placed",
           "refId": "A"
         }
       ],
-      "title": "VM creation rate (by result)",
+      "title": "VM creation throughput",
       "type": "timeseries"
     },
     {
@@ -254,7 +245,7 @@
           "unit": "ops"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "id": 11,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -272,8 +263,54 @@
       "type": "timeseries"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "CreateMachine failure rate, broken out by terminal result (everything except `placed`). `busy` is agent backpressure and self-recovers; any other result at a sustained non-zero rate warrants investigation — `no_capacity` means the scheduler couldn't place, `vm_failed` means the agent reported a real fault, `timeout` means the controller gave up on a slow agent.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": { "mode": "none", "group": "A" }
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "busy" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#ff9830" } }] },
+          { "matcher": { "id": "byName", "options": "no_capacity" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#fade2a" } }] },
+          { "matcher": { "id": "byName", "options": "no_agent" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#e02f44" } }] },
+          { "matcher": { "id": "byName", "options": "stream_closed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#e02f44" } }] },
+          { "matcher": { "id": "byName", "options": "agent_error" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#e02f44" } }] },
+          { "matcher": { "id": "byName", "options": "vm_failed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#c4162a" } }] },
+          { "matcher": { "id": "byName", "options": "timeout" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#c4162a" } }] }
+        ]
+      },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 24 },
+      "id": 12,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "sum by (result) (rate(basis_vm_create_result_total{result!=\"placed\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "VM creation failures (by result)",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
       "id": 300,
       "panels": [],
       "title": "Per-host capacity",
@@ -316,7 +353,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 35 },
       "id": 20,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -374,7 +411,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 35 },
       "id": 21,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -426,7 +463,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 35 },
       "id": 22,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -450,89 +487,8 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "description": "Seconds since the controller last received a heartbeat from each host. One line per host. Dashed reference line at 90s — the point at which the controller flips a host to unhealthy and the scheduler stops placing VMs on it (see controller.rs).",
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 0,
-            "showPoints": "never",
-            "spanNulls": true,
-            "thresholdsStyle": { "mode": "line+area" }
-          },
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "transparent", "value": null },
-              { "color": "red", "value": 90 }
-            ]
-          },
-          "unit": "s"
-        }
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
-      "id": 23,
-      "options": {
-        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "basis_host_last_heartbeat_age_seconds",
-          "legendFormat": "{{host}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Heartbeat age by host",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
-      "description": "1 if an agent stream for the host is currently open to the controller, 0 otherwise. Transient drops are expected during agent restarts; persistent 0 means the agent cannot reach the controller.",
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineInterpolation": "stepAfter",
-            "lineWidth": 2,
-            "pointSize": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          },
-          "max": 1,
-          "min": 0,
-          "unit": "none"
-        }
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
-      "id": 24,
-      "options": {
-        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "basis_agent_connected",
-          "legendFormat": "{{host}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Agent stream connected",
-      "type": "timeseries"
-    },
-    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
       "id": 400,
       "panels": [],
       "title": "Stuck states",
@@ -549,7 +505,7 @@
           "unit": "s"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 53 },
       "id": 30,
       "options": {
         "cellHeight": "sm",
@@ -590,7 +546,7 @@
           "unit": "s"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 53 },
       "id": 31,
       "options": {
         "cellHeight": "sm",
@@ -620,8 +576,44 @@
       "type": "table"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Agent self-healing signal: resources the orphan sweep has reclaimed (systemd units, LVs, taps) because a delete path raced and left something behind. A non-zero sustained rate means basis is picking up its own leaks — normal; investigate only if the rate never tapers (indicates the leak is faster than the sweep). Zero is the steady state.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "min": 0,
+          "unit": "ops"
+        }
+      },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 29 },
+      "id": 32,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "sum by (kind) (rate(basis_agent_orphan_sweep_reclaimed_total[5m]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Orphans reclaimed (self-healing rate)",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
       "id": 500,
       "panels": [],
       "title": "Latency",
@@ -638,7 +630,7 @@
           "unit": "s"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
       "id": 40,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -678,7 +670,7 @@
           "unit": "s"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
       "id": 41,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -743,7 +735,7 @@
         "options": [],
         "query": { "query": "label_values(basis_vms, cluster)", "refId": "Prometheus-cluster-Variable-Query" },
         "refresh": 2,
-        "regex": "",
+        "regex": "/.+/",
         "skipUrlSync": false,
         "sort": 1,
         "type": "query"
@@ -755,6 +747,6 @@
   "timezone": "browser",
   "title": "Basis Cluster",
   "uid": "basis-cluster",
-  "version": 4,
+  "version": 13,
   "weekStart": ""
 }

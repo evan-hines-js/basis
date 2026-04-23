@@ -665,6 +665,42 @@ impl Db {
 
         Ok(stale)
     }
+
+    /// Flip every non-terminal VM on the given host to `Failed` with
+    /// the supplied reason. Returns the number of rows updated.
+    ///
+    /// Used when the host's heartbeat has gone stale: the host flag
+    /// alone only stops the scheduler from placing new VMs there, it
+    /// doesn't signal anything to CAPI about the VMs already pinned to
+    /// that host. Flipping them to `Failed` is what makes
+    /// `BasisMachine.status.ready=false` so CAPI can remediate by
+    /// creating replacement machines on healthy hosts.
+    ///
+    /// `Stopped` and already-`Failed` VMs are left alone — they've
+    /// already reached a terminal state and re-writing them would
+    /// bump `updated_at` for no reason and potentially churn the
+    /// CAPI controller's watch output.
+    pub async fn mark_vms_failed_on_host(
+        &self,
+        host_id: &str,
+        reason: &str,
+    ) -> Result<u64, DbError> {
+        let now = basis_common::time::now_rfc3339();
+        let result = sqlx::query(
+            "UPDATE vms \
+             SET state = ?, error_message = ?, updated_at = ? \
+             WHERE host_id = ? AND state NOT IN (?, ?)",
+        )
+        .bind(basis_proto::MachineState::Failed as i64)
+        .bind(reason)
+        .bind(&now)
+        .bind(host_id)
+        .bind(basis_proto::MachineState::Stopped as i64)
+        .bind(basis_proto::MachineState::Failed as i64)
+        .execute(&self.writer)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 // --- Row types ---
@@ -1305,5 +1341,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(vip3, "10.0.10.200");
+    }
+
+    /// The whole point of cascading host-failure into VM state: VMs
+    /// that were Running when the host went away flip to Failed so
+    /// CAPI can see the signal and trigger replacement. Terminal
+    /// states (Stopped, already-Failed) are left alone.
+    #[tokio::test]
+    async fn test_mark_vms_failed_on_host() {
+        let db = test_db().await;
+        db.upsert_host(&make_host("h1", "node-1")).await.unwrap();
+        db.upsert_host(&make_host("h2", "node-2")).await.unwrap();
+        db.insert_cluster(&ClusterRow {
+            id: "c1".to_string(),
+            name: "cluster-c1".to_string(),
+            ip_pool: "default".to_string(),
+            control_plane_endpoint: "10.0.10.10".to_string(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        })
+        .await
+        .unwrap();
+
+        // Two VMs on the dying host, two elsewhere:
+        //   h1: v-running (RUNNING), v-creating (CREATING), v-already-failed (FAILED)
+        //   h2: v-other-host (RUNNING) — must NOT be touched
+        let mut v_running = make_vm("v-running", "h1", "c1");
+        v_running.state = basis_proto::MachineState::Running as i64;
+        db.insert_vm(&v_running).await.unwrap();
+
+        let mut v_creating = make_vm("v-creating", "h1", "c1");
+        v_creating.ip_address = "10.0.10.43".to_string();
+        v_creating.name = "vm-v-creating".to_string();
+        v_creating.state = basis_proto::MachineState::Creating as i64;
+        db.insert_vm(&v_creating).await.unwrap();
+
+        let mut v_already_failed = make_vm("v-already-failed", "h1", "c1");
+        v_already_failed.ip_address = "10.0.10.44".to_string();
+        v_already_failed.name = "vm-v-already-failed".to_string();
+        v_already_failed.state = basis_proto::MachineState::Failed as i64;
+        v_already_failed.error_message = "earlier failure".to_string();
+        db.insert_vm(&v_already_failed).await.unwrap();
+
+        let mut v_other_host = make_vm("v-other-host", "h2", "c1");
+        v_other_host.ip_address = "10.0.10.45".to_string();
+        v_other_host.name = "vm-v-other-host".to_string();
+        v_other_host.state = basis_proto::MachineState::Running as i64;
+        db.insert_vm(&v_other_host).await.unwrap();
+
+        let affected = db
+            .mark_vms_failed_on_host("h1", "heartbeat stale")
+            .await
+            .unwrap();
+        assert_eq!(affected, 2, "only Running + Creating should flip to Failed");
+
+        let v = db.get_vm("v-running").await.unwrap();
+        assert_eq!(v.state, basis_proto::MachineState::Failed as i64);
+        assert_eq!(v.error_message, "heartbeat stale");
+
+        let v = db.get_vm("v-creating").await.unwrap();
+        assert_eq!(v.state, basis_proto::MachineState::Failed as i64);
+
+        // Already-Failed row stays with its original error untouched —
+        // re-stamping would churn updated_at and potentially overwrite
+        // a more useful prior message.
+        let v = db.get_vm("v-already-failed").await.unwrap();
+        assert_eq!(v.state, basis_proto::MachineState::Failed as i64);
+        assert_eq!(v.error_message, "earlier failure");
+
+        // The other host's VM is untouched — the failure cascade is
+        // scoped to one host.
+        let v = db.get_vm("v-other-host").await.unwrap();
+        assert_eq!(v.state, basis_proto::MachineState::Running as i64);
     }
 }

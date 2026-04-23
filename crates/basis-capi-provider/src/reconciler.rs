@@ -80,6 +80,15 @@ pub trait ReconcileError: Display {
     /// True when the failure suggests our cached BasisClient is using
     /// stale credentials and the cache entry should be dropped.
     fn is_credentials_problem(&self) -> bool;
+
+    /// True when the failure is controller-side load shedding
+    /// (`Status::Unavailable` / `DeadlineExceeded`). basis-client
+    /// already retries these internally with an ~30s budget; anything
+    /// that surfaces here survived that budget, so the right response
+    /// is a *short* requeue (5s, not 15s) and an `info!` log instead
+    /// of `error!`. Alerting should ignore the resulting
+    /// `BasisBackpressure` condition — it's expected during overload.
+    fn is_transient(&self) -> bool;
 }
 
 /// Patch the resource's `status` with a `Ready=False` condition and

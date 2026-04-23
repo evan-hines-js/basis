@@ -18,8 +18,8 @@ use std::time::Duration;
 use basis_common::tls::{TlsIdentity, CONTROLLER_IDENTITY};
 use basis_proto::{
     basis_client::BasisClient as InnerClient, CreateClusterRequest, CreateMachineRequest,
-    DeleteClusterRequest, DeleteMachineRequest, GetClusterRequest, GpuConstraints,
-    ListClustersRequest, ListMachinesRequest, Machine,
+    DeleteClusterRequest, DeleteMachineRequest, GetClusterRequest, GetMachineRequest,
+    GpuConstraints, ListClustersRequest, ListMachinesRequest, Machine,
 };
 use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint};
@@ -59,6 +59,23 @@ impl ClientError {
                 Code::Unauthenticated | Code::PermissionDenied
             ),
             ClientError::Malformed(_) => false,
+        }
+    }
+
+    /// True when the failure is load-shedding backpressure the caller
+    /// should retry rather than alert on. The internal `call()` already
+    /// absorbs a retry budget of ~30s on `Unavailable`; this method is
+    /// for callers further up the stack (e.g. the CAPI provider) that
+    /// need to pick different requeue cadence and log levels for
+    /// transient vs real errors. `DeadlineExceeded` counts too: a
+    /// missed server-side ceiling is operationally indistinguishable
+    /// from "retry the whole call" at the controller layer.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ClientError::Rpc(status) => {
+                matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded)
+            }
+            _ => false,
         }
     }
 }
@@ -276,6 +293,22 @@ impl BasisClient {
             provider_id: resp.provider_id,
             ip_address: resp.ip_address,
         })
+    }
+
+    /// Fetch the current state of a single machine by id. Used by the
+    /// CAPI provider's steady-state reconcile to observe VM health:
+    /// `CreateMachine` only reports the outcome of the create call
+    /// itself, so a VM that fails *after* creation (guest kernel panic,
+    /// cloud-hypervisor crash) is only visible via `GetMachine`.
+    pub async fn get_machine(&self, id: String) -> Result<Machine, ClientError> {
+        let request = GetMachineRequest { id };
+        let resp = self
+            .call(|mut c| {
+                let request = request.clone();
+                async move { c.get_machine(request).await }
+            })
+            .await?;
+        Ok(resp)
     }
 
     pub async fn delete_machine(&self, id: String) -> Result<(), ClientError> {

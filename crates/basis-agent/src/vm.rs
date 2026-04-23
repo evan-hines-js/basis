@@ -74,16 +74,20 @@ pub struct BootArtifacts<'a> {
 /// across I/O.
 ///
 /// Two sets, distinct concepts:
-///   - `tracked`: the VM has a live systemd unit. Populated after
+///   - `tracked`: the VM has a spawned systemd unit. Populated after
 ///     `systemd-run` returns, cleared when `delete_vm` starts.
+///     Doesn't imply the *process* is still alive — use
+///     [`Self::has_live_process`] for that; a crashed
+///     `cloud-hypervisor` under `--remain-after-exit` stays in
+///     `tracked` until explicit delete.
 ///   - `pending`: the VM's DB row exists but the systemd unit hasn't
 ///     spawned yet — i.e. we're mid-create. Populated by
 ///     [`crate::handlers::create_vm`] before the DB insert, cleared
 ///     when the whole create flow exits (success or rollback).
 ///
-/// `is_running` returns true for either — so the periodic reconciler
-/// doesn't mis-diagnose an in-flight create as a crashed VM and fire
-/// off a bogus FAILED report to the controller.
+/// The union — [`Self::live_vm_ids`] — is what the orphan sweep uses
+/// to avoid reclaiming resources for VMs this agent is actively
+/// managing, even if the DB row is momentarily missing.
 pub struct VmManager {
     pub vms_dir: PathBuf,
     tracked: Mutex<HashMap<String, TrackedVm>>,
@@ -356,8 +360,75 @@ impl VmManager {
         Ok(running_vm_ids)
     }
 
-    pub async fn is_running(&self, vm_id: &str) -> bool {
-        self.tracked.lock().await.contains_key(vm_id) || self.pending.lock().await.contains(vm_id)
+    /// True iff a create is currently mid-flight for this vm_id —
+    /// `mark_pending` has been called but `clear_pending` has not.
+    /// Callers that do *state reporting* to the controller (e.g. the
+    /// periodic `report_local_vm_states`) must skip VMs in this set;
+    /// the authoritative Running/Failed report comes from
+    /// `spawn_create` when `systemd-run` actually returns, and a
+    /// premature report here would let the controller resolve a
+    /// pending CreateMachine before the systemd unit exists, which
+    /// lets a subsequent DeleteMachine race with the still-pending
+    /// start job and trip `systemd-run: Job canceled`.
+    pub async fn is_pending(&self, vm_id: &str) -> bool {
+        self.pending.lock().await.contains(vm_id)
+    }
+
+    /// Every vm_id this agent is actively managing — a tracked VM
+    /// (systemd unit spawned, may or may not currently be running) or
+    /// a pending create (mid-flight before the unit even exists). The
+    /// orphan sweep merges this with the agent DB to form its `known`
+    /// set, so a transiently-missing DB row can't cause it to rip
+    /// physical resources (LV, tap) out from under a VM we know we're
+    /// running. Without this, a race between a DB-row removal and the
+    /// sweep's list-then-reclaim scan manifests as a silent tap delete
+    /// while cloud-hypervisor is using it, which the guest sees as a
+    /// virtio-net worker crash.
+    pub async fn live_vm_ids(&self) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        for id in self.tracked.lock().await.keys() {
+            ids.insert(id.clone());
+        }
+        for id in self.pending.lock().await.iter() {
+            ids.insert(id.clone());
+        }
+        ids
+    }
+
+    /// True iff the VM's systemd unit currently has a running
+    /// `cloud-hypervisor` process attached. Authoritative — reads
+    /// `SubState` directly from systemd rather than trusting
+    /// `tracked`, which is an in-memory map populated at create and
+    /// only cleared at delete (so a `cloud-hypervisor` crash with
+    /// `--remain-after-exit` leaves the entry stale).
+    ///
+    /// Used by the periodic state reporter to flip crashed VMs to
+    /// `Failed` within one tick — without this, a guest-level crash
+    /// (virtio error, kernel panic, OOM) leaves the VM in `Running`
+    /// forever from basis's perspective and CAPI never replaces it.
+    pub async fn has_live_process(&self, vm_id: &str) -> bool {
+        let unit_name = self
+            .tracked
+            .lock()
+            .await
+            .get(vm_id)
+            .map(|t| t.unit_name.clone())
+            .unwrap_or_else(|| unit_name_for_vm(vm_id));
+        let out = Command::new("systemctl")
+            .args(["show", "--property=SubState", "--value", &unit_name])
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                // `SubState=running` is systemd's "main process is
+                // alive." `exited`, `dead`, `failed` all mean the
+                // cloud-hypervisor process is gone; `--remain-after-
+                // exit` keeps the unit visible in `active` state but
+                // doesn't resurrect the process.
+                String::from_utf8_lossy(&o.stdout).trim() == "running"
+            }
+            _ => false,
+        }
     }
 }
 

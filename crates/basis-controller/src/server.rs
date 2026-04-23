@@ -1230,12 +1230,12 @@ async fn handle_agent_message(
             // Treating that noise as a mismatch would produce spurious
             // DeleteMachine failures. Peek the kind before removing so
             // a non-matching state leaves the waiter intact.
-            let resolves = match (pending_ops.get(&report.vm_id).map(|p| p.kind), state) {
-                (Some(VmOpKind::Create), MachineState::Running) => true,
-                (Some(VmOpKind::Delete), MachineState::Stopped) => true,
-                (Some(_), MachineState::Failed) => true,
-                _ => false,
-            };
+            let resolves = matches!(
+                (pending_ops.get(&report.vm_id).map(|p| p.kind), state),
+                (Some(VmOpKind::Create), MachineState::Running)
+                    | (Some(VmOpKind::Delete), MachineState::Stopped)
+                    | (Some(_), MachineState::Failed)
+            );
             if resolves {
                 if let Some((_, pending)) = pending_ops.remove(&report.vm_id) {
                     let result = if state == MachineState::Failed {
@@ -1319,5 +1319,6 @@ fn vm_to_machine(vm: &VmRow) -> Machine {
         memory_mib: narrow("memory_mib", vm.memory_mib),
         disk_gib: narrow("disk_gib", vm.disk_gib),
         gpus,
+        error_message: vm.error_message.clone(),
     }
 }

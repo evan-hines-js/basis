@@ -1,4 +1,28 @@
 ---
+- name: Ensure data directory exists
+  ansible.builtin.file:
+    path: "{{ basis_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure config directory exists
+  ansible.builtin.file:
+    path: "{{ basis_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure TLS directory exists
+  ansible.builtin.file:
+    path: "{{ basis_tls_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
 - name: Copy basis-agent binary
   ansible.builtin.copy:
     src: "{{ basis_binary_dir }}/basis-agent"

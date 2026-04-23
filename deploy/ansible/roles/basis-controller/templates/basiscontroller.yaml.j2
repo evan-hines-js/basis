@@ -1,7 +1,7 @@
 apiVersion: basis.dev/v1alpha1
 kind: BasisController
 metadata:
-  name: {{ inventory_hostname }}
+  name: "{{ inventory_hostname }}"
 spec:
   listen: "0.0.0.0:{{ basis_controller_port }}"
   metricsListen: "0.0.0.0:{{ basis_controller_metrics_port }}"

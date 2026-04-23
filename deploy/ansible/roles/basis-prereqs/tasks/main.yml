@@ -1,4 +1,99 @@
 ---
+# --- Physical NIC detection + bridge networking -------------------------
+# On a fresh Ubuntu/Debian install the host IP sits directly on the
+# physical NIC. If basis-agent later enslaves that NIC to vmbr0, the
+# kernel strips the IP and the host is unreachable. We fix that here,
+# before anything else: render a netplan config that puts the IP on the
+# bridge with the NIC as a member, then reboot to apply it cleanly.
+#
+# Ex-Proxmox hosts (where vmbr0 already owns the IP) skip the reboot —
+# detection finds the existing bridge slave and the rendered config
+# matches reality, so nothing changes.
+
+- name: Detect physical NIC
+  # If {{ basis_bridge }} already exists, pick its first non-tap slave —
+  # this is the correct answer both before the first apply (bridge
+  # absent, fall through to default-route interface) and after it
+  # (bridge owns the IP, so ansible_default_ipv4.interface would
+  # otherwise resolve to the bridge itself).
+  ansible.builtin.shell: |
+    set -o pipefail
+    slave=$(ip -o link show master {{ basis_bridge }} 2>/dev/null \
+      | awk '{print $2}' \
+      | sed 's/[:@].*//' \
+      | grep -v '^bas' \
+      | head -1 || true)
+    if [ -n "$slave" ]; then
+      echo "$slave"
+    else
+      echo "{{ ansible_default_ipv4.interface | default('') }}"
+    fi
+  register: _basis_nic_detect
+  changed_when: false
+  check_mode: false
+  when: basis_physical_nic | length == 0
+
+- name: Record detected physical NIC
+  ansible.builtin.set_fact:
+    basis_physical_nic: "{{ _basis_nic_detect.stdout | trim }}"
+  when:
+    - basis_physical_nic | length == 0
+    - _basis_nic_detect.stdout is defined
+
+- name: Require basis_physical_nic to resolve
+  # Empty means detection found nothing — surface it now instead of
+  # rendering an invalid netplan or host.yaml.
+  ansible.builtin.assert:
+    that:
+      - basis_physical_nic | length > 0
+    fail_msg: >-
+      basis_physical_nic could not be autodetected. The bridge
+      ({{ basis_bridge }}) has no non-tap slaves and there is no
+      default-route interface. Set basis_physical_nic explicitly in
+      host_vars/{{ inventory_hostname }}.yml or inventory.
+
+- name: Check whether the host IP is already on the bridge
+  # On ex-Proxmox hosts (or any host where netplan already routes via
+  # the bridge), `ansible_default_ipv4.interface` resolves to the
+  # bridge. That's the target state — no netplan work to do.
+  ansible.builtin.set_fact:
+    _basis_ip_already_on_bridge: "{{ ansible_default_ipv4.interface | default('') == basis_bridge }}"
+
+- name: Render netplan bridge config
+  # Captures the host's current IPv4 identity onto the bridge, with the
+  # physical NIC as a member. Only runs when the IP isn't already on the
+  # bridge — we must not clobber a working Proxmox-style setup.
+  ansible.builtin.template:
+    src: 60-basis-bridge.yaml.j2
+    dest: /etc/netplan/60-basis-bridge.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  register: _basis_netplan_render
+  when:
+    - basis_manage_netplan | bool
+    - not _basis_ip_already_on_bridge
+
+- name: Reboot to apply bridge config
+  # Safer than `netplan apply` on a live SSH session: the IP transition
+  # is atomic across the reboot, and ansible's reboot module handles
+  # the disconnect/reconnect wait properly. Only runs on first apply —
+  # idempotent renders don't trigger a reboot on subsequent runs.
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+  register: _basis_rebooted
+  when:
+    - basis_manage_netplan | bool
+    - _basis_netplan_render is defined
+    - _basis_netplan_render.changed
+
+- name: Re-gather facts after reboot
+  # Reboot doesn't auto-refresh facts; gather again so ansible_default_ipv4
+  # reflects the bridge-owned IP rather than the pre-reboot state.
+  ansible.builtin.setup:
+  when: _basis_rebooted is defined and _basis_rebooted is changed
+# ------------------------------------------------------------------------
+
 # On Proxmox hosts, `pve-qemu-kvm` provides qemu-img and an apt-hook
 # refuses to let us install `qemu-utils` because it would remove the
 # Proxmox meta-package. Only install qemu-utils if qemu-img isn't
@@ -138,26 +233,5 @@
     - vfio-pci
   failed_when: false
 
-- name: Ensure data directory exists
-  ansible.builtin.file:
-    path: "{{ basis_data_dir }}"
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
-
-- name: Ensure config directory exists
-  ansible.builtin.file:
-    path: "{{ basis_config_dir }}"
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
-
-- name: Ensure TLS directory exists
-  ansible.builtin.file:
-    path: "{{ basis_tls_dir }}"
-    state: directory
-    owner: root
-    group: root
-    mode: "0700"
+# Directory creation lives in the controller/agent roles directly so the
+# controller host (which skips this prereqs role) still gets its layout.

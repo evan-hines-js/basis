@@ -1,0 +1,29 @@
+# Managed by basis ansible — do not edit by hand.
+# Puts the host IP on {{ basis_bridge }} with {{ basis_physical_nic }} as a
+# bridge member. Required on fresh Ubuntu/Debian installs where the IP
+# otherwise sits directly on the physical NIC; basis-agent enslaves that
+# NIC to the bridge at startup, which would strip its IP and lock the
+# host off the network. Putting the IP on the bridge up front sidesteps
+# the transition entirely.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    {{ basis_physical_nic }}:
+      dhcp4: false
+      dhcp6: false
+  bridges:
+    {{ basis_bridge }}:
+      interfaces: [{{ basis_physical_nic }}]
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - "{{ ansible_default_ipv4.address }}/{{ ansible_default_ipv4.prefix }}"
+      routes:
+        - to: default
+          via: "{{ ansible_default_ipv4.gateway }}"
+      nameservers:
+        addresses: {{ ansible_dns.nameservers | default(['1.1.1.1', '1.0.0.1']) | to_json }}
+      parameters:
+        stp: false
+        forward-delay: 0

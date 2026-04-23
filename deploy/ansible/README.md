@@ -4,6 +4,14 @@ One-shot install of `basis-controller` and `basis-agent` across a fleet of
 bare-metal hosts. The playbook is designed for iterative use: run it,
 let it fail, fix the task, run it again. Everything is idempotent.
 
+## Topology
+
+One dedicated host under `[basis_controller]` runs the control-plane
+process — no VMs on it. Every host under `[basis_agents]` runs
+`basis-agent` and hosts VMs: KVM, LVM thin pool, cloud-hypervisor, qemu
+utilities are only installed there. The controller host only needs the
+binary, TLS material, and a config file.
+
 ## Prerequisites
 
 On the Ansible control node (your laptop):
@@ -13,22 +21,82 @@ pip install ansible-core cryptography
 ansible-galaxy collection install -r requirements.yml
 ```
 
-On every managed host: SSH access as a user with passwordless `sudo` (or
-`ansible_user=root`, as in the example inventory).
+### Per-host preparation (fresh Ubuntu/Debian)
+
+Three things aren't automated — the playbook can't safely do them without
+a human in the loop:
+
+1. **Root SSH** (or non-root + passwordless sudo). Ubuntu Server doesn't
+   enable root SSH by default. Easiest path: during install, seed the
+   root user's `~/.ssh/authorized_keys` via cloud-init autoinstall. Or
+   change `ansible_user` in inventory and give that user `NOPASSWD` in
+   `/etc/sudoers.d/`.
+
+2. **A dedicated partition for the LVM thin pool.** On agents with a
+   single NVMe (the OS and the VM disk pool share the drive), leave free
+   space during install and carve out a partition:
+
+   ```
+   parted /dev/nvme0n1 mkpart primary 60GB 100%   # OS in the first 60G
+   wipefs -a /dev/nvme0n1p3                       # required — basis refuses to pvcreate over an existing FS signature
+   ```
+
+   Then put the partition in `host_vars/<host>.yml`:
+
+   ```yaml
+   basis_lvm_devices:
+     - /dev/nvme0n1p3
+   ```
+
+   Hosts with dedicated SSDs (the PowerEdges) list whole devices instead.
+   The playbook fails fast with a clear message if `basis_lvm_devices` is
+   empty for any agent.
+
+3. **BIOS virtualization on.** The `Verify /dev/kvm exists` task fails
+   fast if SVM/VT-x is off.
+
+### What the playbook does handle
+
+- **Bridge networking.** On first apply, `basis-prereqs` renders
+  `/etc/netplan/60-basis-bridge.yaml` with the host's current IP moved
+  onto `vmbr0` (physical NIC as a bridge member), then **reboots** to
+  apply it cleanly. Subsequent runs are no-ops. This step is what lets
+  `basis-agent` later enslave the NIC to the bridge without stripping
+  the host's IP and killing SSH. On ex-Proxmox hosts where the bridge
+  already owns the IP, detection catches that and skips the reboot.
+
+  Set `basis_manage_netplan: false` in group/host vars if you manage
+  host networking yourself.
+
+- **Everything else:** apt packages, LVM thin pool, cloud-hypervisor,
+  kernel modules, PKI, systemd units, configs.
 
 ## First-time setup
 
 ```
 cd deploy/ansible
 cp inventory.ini.example inventory.ini
-$EDITOR inventory.ini                          # set your hosts + NIC names
+$EDITOR inventory.ini                          # list your host IPs
 $EDITOR group_vars/all.yml                     # adjust IP pool range
+
+# Per-agent LVM devices for the VM-disk thin pool. One file per agent —
+# these are the block devices basis wipes on first apply. Controllers
+# don't need this.
+$EDITOR host_vars/dell1.yml                    # basis_lvm_devices: [/dev/sdb, ...]
 
 # Build release binaries — the playbook expects them at target/release.
 (cd ../.. && cargo build --release -p basis-controller -p basis-agent)
 
 ansible-playbook site.yml -vv
 ```
+
+Heterogeneous hardware is supported out of the box. Each host's NIC is
+autodetected at apply time: picks the bridge's non-tap slave if the
+bridge already exists, otherwise the default-route interface. So a Dell
+with `eno1`, a Beelink with `enp2s0`, and an ex-Proxmox node with `nic0`
+can all share the same one-line-per-host inventory. Override with
+`basis_physical_nic=<name>` only for hosts with multiple NICs or no
+default route.
 
 ## Iteration loop
 

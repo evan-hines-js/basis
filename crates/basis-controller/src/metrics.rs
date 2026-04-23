@@ -431,8 +431,16 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
     // Without this, Grafana panels like "VMs pending" show "no data" for
     // idle clusters — Prometheus gauge series only exist once `.set()`
     // has been called on their labels.
+    //
+    // The `cluster=""` baseline keeps `sum by (state) (basis_vms)` alive
+    // at 0 even when no clusters exist at all; without it, deleting the
+    // last cluster makes every real series vanish and dashboards render
+    // "no data" gaps instead of a flat zero. The Grafana cluster
+    // template variable filters the empty string out of its dropdown
+    // (see dashboards/basis.json).
     let mut vm_counts: HashMap<(&'static str, &str), i64> = HashMap::new();
     for state in ALL_VM_STATES {
+        vm_counts.insert((state, ""), 0);
         for cluster in &clusters {
             vm_counts.insert((state, cluster.id.as_str()), 0);
         }

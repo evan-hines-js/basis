@@ -67,6 +67,7 @@ impl ReconcileError for ClusterError {
             ClusterError::Kube(_) => "KubeApiError",
             ClusterError::Finalizer(_) => "FinalizerError",
             ClusterError::Basis(e) if e.is_credentials_problem() => "BasisCredentialsInvalid",
+            ClusterError::Basis(e) if e.is_transient() => "BasisBackpressure",
             ClusterError::Basis(_) => "BasisRpcError",
             ClusterError::Credentials(_) => "BasisCredentialsInvalid",
         }
@@ -75,6 +76,10 @@ impl ReconcileError for ClusterError {
     fn is_credentials_problem(&self) -> bool {
         matches!(self, ClusterError::Credentials(_))
             || matches!(self, ClusterError::Basis(e) if e.is_credentials_problem())
+    }
+
+    fn is_transient(&self) -> bool {
+        matches!(self, ClusterError::Basis(e) if e.is_transient())
     }
 }
 
@@ -260,6 +265,13 @@ fn error_policy(
     error: &ClusterError,
     _ctx: Arc<ProviderContext>,
 ) -> Action {
+    if error.is_transient() {
+        // Controller-side backpressure: client already burned its
+        // retry budget, don't page operators for this. Short requeue
+        // so recovery is fast once the controller drains.
+        info!(error = %error, "BasisCluster transient backpressure, requeueing");
+        return Action::requeue(Duration::from_secs(5));
+    }
     error!(error = %error, "BasisCluster reconcile error");
     Action::requeue(Duration::from_secs(15))
 }

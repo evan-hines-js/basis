@@ -207,16 +207,19 @@ pub async fn validate_pool() -> Result<PoolCapacity> {
 /// Current capacity of the thin pool. Queries `lvs` with explicit sizes
 /// in bytes (`--units b`) and data/metadata percentages.
 pub async fn pool_capacity() -> Result<PoolCapacity> {
-    let out = run_lvs_pipe(&[
-        "--noheadings",
-        "--separator=|",
-        "--units",
-        "b",
-        "--nosuffix",
-        "-o",
-        "lv_size,data_percent,lv_metadata_size,metadata_percent",
-        &format!("{VG}/{POOL}"),
-    ])
+    let out = run_cmd(
+        "lvs",
+        &[
+            "--noheadings",
+            "--separator=|",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "lv_size,data_percent,lv_metadata_size,metadata_percent",
+            &format!("{VG}/{POOL}"),
+        ],
+    )
     .await?;
 
     let line = out.trim();
@@ -277,28 +280,28 @@ pub async fn ensure_image_lv(
     // Fast-path the already-populated case before taking the permit —
     // otherwise every warm-cache VM create needlessly queues on the
     // global LVM semaphore.
-    if lv_is_readonly(&lv_name).await? {
+    if matches!(lv_attr(&lv_name).await?.as_deref(), Some(a) if attr_is_readonly(a)) {
         return Ok(lv_path);
     }
 
     let _permit = acquire_lvm_permit().await?;
-    // Re-check after acquiring: another caller may have populated the
-    // LV while we were queued, in which case we skip the convert.
-    if lv_is_readonly(&lv_name).await? {
-        return Ok(lv_path);
-    }
 
-    // Either doesn't exist, or exists but not-yet-populated (previous run
-    // crashed between create and RO-flip). Remove and recreate for a
-    // clean slate; the convert below is what actually matters.
-    if lv_exists(&lv_name).await? {
-        warn!(lv = %lv_name, "golden image LV exists but is not RO; recreating");
-        lvremove(&lv_name).await?;
+    // Re-check under the permit and branch on the full state in one
+    // call: another caller may have finished while we queued (Ready),
+    // a previous attempt may have left a writable LV from a crashed
+    // convert (Stale), or the LV may be absent (Missing).
+    match lv_attr(&lv_name).await? {
+        Some(a) if attr_is_readonly(&a) => return Ok(lv_path),
+        Some(_) => {
+            warn!(lv = %lv_name, "golden image LV exists but is not RO; recreating");
+            lvremove(&lv_name).await?;
+        }
+        None => {}
     }
 
     // Create a writable thin volume of the image's virtual size. Thin
     // means no extents are consumed until qemu-img writes to them.
-    run_lvm(
+    run_cmd(
         "lvcreate",
         &[
             "--virtualsize",
@@ -344,7 +347,7 @@ pub async fn ensure_image_lv(
     // Mark RO. This is both a correctness guarantee (snapshots see a
     // stable origin) and the "populated" marker `ensure_image_lv` keys
     // off on re-entry.
-    run_lvm(
+    run_cmd(
         "lvchange",
         &["--permission", "r", &format!("{VG}/{lv_name}")],
     )
@@ -369,7 +372,7 @@ pub async fn create_vm_lv(vm_id: &str, image_hash: &str, disk_gib: u64) -> Resul
     let origin = format!("{IMAGE_LV_PREFIX}{image_hash}");
     let lv_path = vm_lv_path(vm_id);
 
-    if lv_exists(&lv_name).await? {
+    if lv_attr(&lv_name).await?.is_some() {
         warn!(vm_id, "VM LV already exists; removing for clean recreate");
         lvremove(&lv_name).await?;
     }
@@ -384,7 +387,7 @@ pub async fn create_vm_lv(vm_id: &str, image_hash: &str, disk_gib: u64) -> Resul
     //   --permission rw        the origin is RO; the snapshot must be
     //                          writable. Default is rw, but explicit
     //                          beats implicit here.
-    run_lvm(
+    run_cmd(
         "lvcreate",
         &[
             "--snapshot",
@@ -414,9 +417,9 @@ pub async fn create_vm_lv(vm_id: &str, image_hash: &str, disk_gib: u64) -> Resul
 /// Remove a VM's LV. No-op if it doesn't exist (returns Ok).
 pub async fn remove_vm_lv(vm_id: &str) -> Result<()> {
     let lv_name = format!("{VM_LV_PREFIX}{vm_id}");
-    // lv_exists is a read-only `lvs` call and cheap — keep it outside
-    // the permit so the fast no-op path doesn't queue.
-    if !lv_exists(&lv_name).await? {
+    // Existence check is read-only and cheap — keep it outside the
+    // permit so the fast no-op path doesn't queue.
+    if lv_attr(&lv_name).await?.is_none() {
         return Ok(());
     }
     let _permit = acquire_lvm_permit().await?;
@@ -426,7 +429,7 @@ pub async fn remove_vm_lv(vm_id: &str) -> Result<()> {
 /// List all VM LVs currently in the basis VG. Used by reconcile to find
 /// orphan LVs (VMs the controller has forgotten).
 pub async fn list_vm_lvs() -> Result<Vec<String>> {
-    let out = run_lvs_pipe(&["--noheadings", "-o", "lv_name", VG]).await?;
+    let out = run_cmd("lvs", &["--noheadings", "-o", "lv_name", VG]).await?;
     let mut vm_ids = Vec::new();
     for line in out.lines() {
         let name = line.trim();
@@ -439,40 +442,49 @@ pub async fn list_vm_lvs() -> Result<Vec<String>> {
 
 // --- internal helpers ---------------------------------------------------
 
-async fn lv_exists(lv_name: &str) -> Result<bool> {
-    let out = Command::new("lvs")
-        .args(["--noheadings", &format!("{VG}/{lv_name}")])
-        .output()
-        .await?;
-    Ok(out.status.success())
-}
-
-async fn lv_is_readonly(lv_name: &str) -> Result<bool> {
-    let out = Command::new("lvs")
-        .args([
+/// Read-only state query for a single LV in the basis VG. `None` means
+/// the LV is not present; `Some(attr)` returns its 10-char lv_attr
+/// bitfield (see lvs(8) "Lv attr bits").
+///
+/// Uses LVM's `-S lv_name=<name>` reporting selection rather than a
+/// positional `VG/LV` argument. Selection always exits 0 — empty
+/// output when nothing matches, one row when it does — so exit-nonzero
+/// is reserved for real failures (lvm daemon down, VG disappeared
+/// mid-flight, permission error). That lets us propagate real errors
+/// instead of silently treating them as "LV not present" the way a
+/// raw `lvs VG/LV` would.
+async fn lv_attr(lv_name: &str) -> Result<Option<String>> {
+    let out = run_cmd(
+        "lvs",
+        &[
             "--noheadings",
-            "--separator=|",
             "-o",
             "lv_attr",
-            &format!("{VG}/{lv_name}"),
-        ])
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Ok(false);
+            "-S",
+            &format!("lv_name={lv_name}"),
+            VG,
+        ],
+    )
+    .await?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
     }
-    // lv_attr's second character is permission: 'r' = read-only, 'w' = writable.
-    let attr = String::from_utf8_lossy(&out.stdout);
-    Ok(attr
-        .trim()
-        .chars()
-        .nth(1)
-        .map(|c| c == 'r')
-        .unwrap_or(false))
+}
+
+/// `true` when a 10-char lv_attr bitfield marks the LV read-only. Per
+/// lvs(8), the second character is permission: 'r' = read-only,
+/// 'w' = writable.
+fn attr_is_readonly(attr: &str) -> bool {
+    attr.chars().nth(1) == Some('r')
 }
 
 async fn lvremove(lv_name: &str) -> Result<()> {
-    run_lvm("lvremove", &["-f", &format!("{VG}/{lv_name}")]).await
+    run_cmd("lvremove", &["-f", &format!("{VG}/{lv_name}")])
+        .await
+        .map(|_| ())
 }
 
 /// Extend an LV to `size_gib` GiB. Idempotent: if the LV is already at
@@ -483,34 +495,27 @@ async fn lvremove(lv_name: &str) -> Result<()> {
 /// `-L 10G` (uppercase) is gibibytes (2^30). Lowercase `g` is SI
 /// gigabytes (10^9) and is wrong for the API contract the caller wants.
 async fn lvextend(lv_name: &str, size_gib: u64) -> Result<()> {
-    match run_lvm(
+    match run_cmd(
         "lvextend",
         &["-L", &format!("{size_gib}G"), &format!("{VG}/{lv_name}")],
     )
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(LvmError::Command { stderr, .. }) if stderr.contains("No size change") => Ok(()),
         Err(e) => Err(e),
     }
 }
 
-async fn run_lvm(tool: &'static str, args: &[&str]) -> Result<()> {
+/// Spawn a tool, return stdout on success. On non-zero exit, returns
+/// `LvmError::Command` carrying the stderr so callers (and operators
+/// reading logs) can see why it failed. I/O errors (the binary isn't
+/// on PATH, fork fails) propagate as `LvmError::Io`.
+async fn run_cmd(tool: &'static str, args: &[&str]) -> Result<String> {
     let out = Command::new(tool).args(args).output().await?;
     if !out.status.success() {
         return Err(LvmError::Command {
             cmd: format!("{tool} {}", args.join(" ")),
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        });
-    }
-    Ok(())
-}
-
-async fn run_lvs_pipe(args: &[&str]) -> Result<String> {
-    let out = Command::new("lvs").args(args).output().await?;
-    if !out.status.success() {
-        return Err(LvmError::Command {
-            cmd: format!("lvs {}", args.join(" ")),
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         });
     }

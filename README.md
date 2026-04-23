@@ -6,6 +6,8 @@
 
 ---
 
+> **Sandbox project** — Basis is a hypervisor-orchestration sandbox for exploring CAPI-driven GPU Kubernetes on bare metal. It is not production-ready and is not offered as a product. Use it to learn, experiment, and prototype.
+
 # Basis
 
 A minimal hypervisor orchestration layer for Lattice, built on
@@ -19,15 +21,11 @@ Basis turns a pool of bare-metal hosts into a CAPI-compatible VM substrate. It
 is topology-aware at the hypervisor layer (NVLink groups, IOMMU groups, VFIO
 passthrough) and deliberately narrow: a single static binary per host
 (`basis-agent`), one central `basis-controller`, deployed via Ansible,
-configured with TOML, secured with mTLS.
+configured with YAML, secured with mTLS.
 
 Basis is **not** a GPU cloud control plane. It does not do fractional GPUs
 (HAMi handles that inside Kubernetes), multi-tenancy, metering, or a UI. It
 provides just enough VM substrate for Kubernetes + Lattice to run against.
-
-See [`basis.md`](./basis.md) for the full design document and
-[`docs/lattice-integration.md`](./docs/lattice-integration.md) for how Lattice
-consumes it.
 
 ## Architecture
 
@@ -116,9 +114,9 @@ deploy/
   bootstrap.sh           End-to-end build + deploy wrapper
   crds/                  Generated CRD YAMLs
   examples/              Example manifests
-docs/
-  lattice-integration.md How Lattice provider configuration maps to Basis
-basis.md                 Full design document
+  observability/         Grafana dashboards
+  systemd/               Unit files installed by the playbook
+scripts/                 build-capi-provider, smoke/chaos/load test helpers
 Dockerfile               basis-capi-provider image
 ```
 

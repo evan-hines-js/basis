@@ -123,6 +123,12 @@ message Machine {
   uint32 memory_mib = 9;
   uint32 disk_gib = 10;
   repeated MachineGPU gpus = 11;
+  // Populated when state = FAILED: the agent-reported reason the VM
+  // could not be created or stopped running (e.g. "cloud-hypervisor
+  // process exited", "image pull failed"). Empty for non-failed states.
+  // Surfaced by basis-capi-provider onto BasisMachine.status.failureMessage
+  // so operators see the actual fault rather than a generic "VM failed".
+  string error_message = 12;
 }
 
 // GPU detail exposed to CAPI consumers. Strictly a subset of the internal

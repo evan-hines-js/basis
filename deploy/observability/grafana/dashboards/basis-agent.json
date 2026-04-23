@@ -146,6 +146,18 @@
           "expr": "rate(basis_agent_vm_spawn_seconds_count{instance=~\"$instance\"}[5m])",
           "legendFormat": "vm_spawn",
           "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_vfio_bind_seconds_count{instance=~\"$instance\"}[5m])",
+          "legendFormat": "vfio_bind",
+          "refId": "F"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_lv_permit_wait_seconds_count{instance=~\"$instance\"}[5m])",
+          "legendFormat": "lv_permit_wait",
+          "refId": "G"
         }
       ],
       "title": "Completion rate per step",
@@ -198,6 +210,18 @@
           "expr": "rate(basis_agent_vm_spawn_seconds_sum{instance=~\"$instance\"}[5m]) / clamp_min(rate(basis_agent_vm_spawn_seconds_count{instance=~\"$instance\"}[5m]), 1e-9)",
           "legendFormat": "vm_spawn",
           "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_vfio_bind_seconds_sum{instance=~\"$instance\"}[5m]) / clamp_min(rate(basis_agent_vfio_bind_seconds_count{instance=~\"$instance\"}[5m]), 1e-9)",
+          "legendFormat": "vfio_bind",
+          "refId": "F"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_lv_permit_wait_seconds_sum{instance=~\"$instance\"}[5m]) / clamp_min(rate(basis_agent_lv_permit_wait_seconds_count{instance=~\"$instance\"}[5m]), 1e-9)",
+          "legendFormat": "lv_permit_wait",
+          "refId": "G"
         }
       ],
       "title": "Mean time per step",

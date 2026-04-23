@@ -361,7 +361,17 @@ pub async fn periodic_sweep(
 ) -> anyhow::Result<u32> {
     let running_vm_ids = vm_mgr.reconcile_running().await?;
     let known_vms = agent_db.list_vms().await?;
-    let known_ids: HashSet<String> = known_vms.iter().map(|v| v.vm_id.clone()).collect();
+    // `known_ids` unions the DB with every VM the agent is actively
+    // managing in memory. The DB row is *usually* in sync with the
+    // in-memory state, but there are narrow windows where they
+    // diverge (between `insert_vm` and the systemd-run returning, or
+    // during a controller-driven reconcile that race with a fresh
+    // create). If the sweep used the DB alone, it could reclaim a
+    // tap / LV mid-create and crash the guest's virtio-net worker.
+    // Taking the union makes the sweep conservative: a resource is
+    // only reclaimable when *no* authoritative source claims it.
+    let mut known_ids: HashSet<String> = known_vms.iter().map(|v| v.vm_id.clone()).collect();
+    known_ids.extend(vm_mgr.live_vm_ids().await);
     Ok(sweep_orphans(&running_vm_ids, &known_ids, agent_db, vm_mgr, net_mgr).await)
 }
 

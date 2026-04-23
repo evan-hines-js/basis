@@ -37,6 +37,7 @@ use serde_json::json;
 use tracing::{error, info, warn};
 
 use basis_client::{ClientError, CreatedMachine, MachineRequest};
+use basis_proto::{Machine as BasisVmState, MachineState};
 
 use crate::bootstrap;
 use crate::client_cache::CacheError;
@@ -75,6 +76,17 @@ pub enum MachineError {
 
     #[error("BasisCluster '{0}' has no basisClusterId yet — retrying")]
     ClusterNotReady(String),
+
+    /// Basis reported the VM is in `FAILED` state. Terminal from basis's
+    /// point of view — basis does not restart VMs; recovery is replacement
+    /// orchestrated by CAPI. Surfacing this as an error routes through
+    /// `on_failure` → `record_failure_status`, which patches
+    /// `failureMessage` and `Ready=False`. CAPI's Machine controller then
+    /// propagates to `Machine.status.failureMessage`, at which point a
+    /// MachineHealthCheck / MachineDeployment on the consumer side
+    /// replaces the machine.
+    #[error("VM reported failed state: {0}")]
+    VmFailed(String),
 }
 
 impl ReconcileError for MachineError {
@@ -84,16 +96,22 @@ impl ReconcileError for MachineError {
             MachineError::Finalizer(_) => "FinalizerError",
             MachineError::Bootstrap(_) => "BootstrapNotReady",
             MachineError::Basis(e) if e.is_credentials_problem() => "BasisCredentialsInvalid",
+            MachineError::Basis(e) if e.is_transient() => "BasisBackpressure",
             MachineError::Basis(_) => "BasisRpcError",
             MachineError::Credentials(_) => "BasisCredentialsInvalid",
             MachineError::Missing(_) => "Misconfigured",
             MachineError::ClusterNotReady(_) => "ClusterNotReady",
+            MachineError::VmFailed(_) => "VMFailed",
         }
     }
 
     fn is_credentials_problem(&self) -> bool {
         matches!(self, MachineError::Credentials(_))
             || matches!(self, MachineError::Basis(e) if e.is_credentials_problem())
+    }
+
+    fn is_transient(&self) -> bool {
+        matches!(self, MachineError::Basis(e) if e.is_transient())
     }
 }
 
@@ -160,15 +178,25 @@ async fn apply(
     } = resolve_cluster_ref(&ctx.client, namespace, &cluster_name).await?;
     let basis = ctx.clients.get(&credentials_ref, namespace).await?;
 
+    // Steady-state observation path: once we have the basis-side VM id,
+    // CreateMachine adds nothing (provider_id is derivable, spec is
+    // CAPI-immutable, and the server only returns success once the agent
+    // has reported RUNNING). Sample live state via GetMachine so a VM
+    // that dies *after* create (guest kernel panic, cloud-hypervisor
+    // crash, OOM) surfaces as a failure on the BasisMachine. CAPI's
+    // Machine controller then propagates to `Machine.status`, at which
+    // point a MachineHealthCheck / MachineDeployment on the consumer
+    // side replaces the machine — standard CAPI flow, no Basis-specific
+    // hook required.
+    if let Some(vm_id) = machine.status.as_ref().and_then(|s| s.basis_vm_id.clone()) {
+        let vm = basis.get_machine(vm_id).await?;
+        return observe_vm(&api, &name, &vm, &machine, generation).await;
+    }
+
     let bootstrap_secret = find_bootstrap_secret(&ctx.client, namespace, &name).await?;
     let bootstrap_data =
         bootstrap::load_bootstrap_data(ctx.client.clone(), namespace, &bootstrap_secret).await?;
 
-    // Server-side CreateMachine is idempotent by `(cluster_id, name)`.
-    // Issuing it on every reconcile lets us self-heal partial writes:
-    // if a prior attempt created the VM but crashed before patching
-    // status/spec, the next call returns the existing row and we finish
-    // the patches below.
     info!(machine = %name, cluster_id = %basis_cluster_id, "calling Basis.CreateMachine");
     let created = basis
         .create_machine(MachineRequest {
@@ -214,7 +242,62 @@ async fn apply(
         return Err(e);
     }
 
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok(Action::requeue(Duration::from_secs(60)))
+}
+
+/// Steady-state state dispatch for a VM whose id we already hold. One
+/// RPC (`GetMachine`) per reconcile tick; the cadence (see `apply`'s
+/// requeue) is the bound on failure-detection latency.
+async fn observe_vm(
+    api: &Api<BasisMachine>,
+    name: &str,
+    vm: &BasisVmState,
+    machine: &BasisMachine,
+    generation: Option<i64>,
+) -> Result<Action, MachineError> {
+    // prost-generated enum conversion: unknown discriminants would only
+    // appear on a cross-version skew between controller and provider,
+    // which we don't support in the same deploy. Map anything we can't
+    // decode to a short-requeue transitional state rather than crash.
+    let state = MachineState::try_from(vm.state).unwrap_or(MachineState::Pending);
+    match state {
+        MachineState::Running => {
+            // Refresh the success patch on every tick. The kube apiserver
+            // merge is a no-op if nothing changed, and this is what
+            // self-heals a BasisMachine whose condition set was left
+            // stale by a prior transient failure (e.g. a past
+            // `Ready=False` from a BasisBackpressure that has since
+            // recovered to RUNNING).
+            let created = CreatedMachine {
+                id: vm.id.clone(),
+                provider_id: vm.provider_id.clone(),
+                ip_address: vm.ip_address.clone(),
+            };
+            write_success_status(api, name, &created, machine, generation).await?;
+            Ok(Action::requeue(Duration::from_secs(60)))
+        }
+        MachineState::Failed => {
+            let msg = if vm.error_message.is_empty() {
+                "VM reported failed state (no detail from agent)".to_string()
+            } else {
+                vm.error_message.clone()
+            };
+            Err(MachineError::VmFailed(msg))
+        }
+        other => {
+            // Pending/Creating post-create, or Stopping/Stopped on a VM
+            // we did not ask to delete, are both anomalous in steady
+            // state. Don't rewrite success (the VM isn't usable) and
+            // don't fail permanently (the state may resolve). Short
+            // requeue so we observe the next transition quickly.
+            warn!(
+                machine = %name,
+                state = ?other,
+                "unexpected VM state in steady-state observe; requeueing"
+            );
+            Ok(Action::requeue(Duration::from_secs(15)))
+        }
+    }
 }
 
 /// Patch status (with the `basisVmId` marker) first, then spec. Status
@@ -404,8 +487,15 @@ fn error_policy(
     error: &MachineError,
     _ctx: Arc<ProviderContext>,
 ) -> Action {
-    // ClusterNotReady is expected transient state — short requeue, no noise.
-    if matches!(error, MachineError::ClusterNotReady(_)) {
+    // Expected transient states — short requeue, info-level log so
+    // they don't show up as errors in operator dashboards:
+    //   * ClusterNotReady — waiting for the sibling BasisCluster
+    //     reconcile to stamp an id; self-resolves.
+    //   * BasisError.is_transient() — controller-side load shedding
+    //     (Unavailable / DeadlineExceeded past the client's retry
+    //     budget); self-resolves as the controller drains.
+    if matches!(error, MachineError::ClusterNotReady(_)) || error.is_transient() {
+        info!(error = %error, "BasisMachine transient, requeueing");
         return Action::requeue(Duration::from_secs(5));
     }
     error!(error = %error, "BasisMachine reconcile error");

@@ -1,9 +1,13 @@
+{# `basis_controller` holds a single host; fall back to its inventory name
+   (typically the raw IP) when `ansible_host` isn't set. #}
+{% set controller = groups['basis_controller'][0] %}
+{% set controller_addr = hostvars[controller].ansible_host | default(controller) %}
 apiVersion: basis.dev/v1alpha1
 kind: Host
 metadata:
-  name: {{ inventory_hostname }}
+  name: "{{ inventory_hostname }}"
 spec:
-  controllerEndpoint: "https://{{ hostvars[groups['basis_controller'][0]].ansible_host }}:{{ basis_controller_port }}"
+  controllerEndpoint: "https://{{ controller_addr }}:{{ basis_controller_port }}"
   dataDir: {{ basis_data_dir }}
   network:
     bridge: {{ basis_bridge }}

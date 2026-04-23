@@ -17,8 +17,11 @@
   roles:
     - basis-pki
 
-- name: Prepare bare-metal prerequisites
-  hosts: basis
+# The controller is a control-plane process — no VMs, no KVM, no LVM
+# thin pool. Only the VM-host prereqs (qemu, cloud-hypervisor, /dev/kvm,
+# LVM thin pool, kernel modules) need to run on agents.
+- name: Prepare VM-host prerequisites
+  hosts: basis_agents
   become: true
   tags: [prereqs]
   roles:
