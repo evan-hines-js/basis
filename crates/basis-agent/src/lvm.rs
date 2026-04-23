@@ -23,14 +23,62 @@
 //!      propagates to the physical SSD.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
+
+use crate::metrics;
 
 /// Fixed volume group name. The ansible role creates exactly this.
 pub const VG: &str = "basis";
 /// Fixed thin pool name within the VG.
 pub const POOL: &str = "pool";
+
+/// Ceiling on concurrent lvm2 mutation commands (lvcreate/lvremove/
+/// lvextend/lvchange) in flight from this agent.
+///
+/// Set to 1 deliberately. lvm2 takes a per-VG metadata lock for every
+/// mutation internally, so any concurrency we allow here doesn't
+/// actually execute in parallel — it just queues inside lvm2 and
+/// burns CPU on contending processes. Measured at cap=4: each
+/// `lvcreate` took ~8.5s because it was fighting three siblings for
+/// the same VG lock, for zero throughput benefit. At cap=1 each call
+/// should hit lvm2's uncontended per-op time (sub-second on a healthy
+/// pool) and end-to-end latency is bounded by `queue_depth × per_op`
+/// rather than `queue_depth × contended_per_op`. If a future storage
+/// backend exposes real parallelism (e.g. a per-LV metadata model)
+/// raising this makes sense; for lvm2 thin it's counter-productive.
+const MAX_CONCURRENT_LVM_MUTATIONS: usize = 1;
+
+/// Maximum wall-clock wait for the LVM mutation permit before an
+/// acquirer gives up and returns `LvmError::Busy`. Bounds tail latency:
+/// once arrival rate exceeds service rate the queue grows without
+/// limit, and an unbounded `acquire().await` would let a single caller
+/// sit in that queue for minutes while the queue continues to grow
+/// behind it. 60s is generous enough that a transient stall (a
+/// `systemctl stop` that took an unusual amount of time, a background
+/// metadata flush) clears without a spurious failure, but tight enough
+/// that sustained backpressure produces fast-fail responses the caller
+/// can act on rather than minute-long hangs.
+const LVM_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+static LVM_MUTATION_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_LVM_MUTATIONS);
+
+async fn acquire_lvm_permit() -> Result<tokio::sync::SemaphorePermit<'static>> {
+    let started = Instant::now();
+    let result = tokio::time::timeout(LVM_PERMIT_TIMEOUT, LVM_MUTATION_SEMAPHORE.acquire()).await;
+    if let Some(m) = metrics::global() {
+        m.lv_permit_wait_seconds
+            .observe(started.elapsed().as_secs_f64());
+    }
+    match result {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => unreachable!("LVM_MUTATION_SEMAPHORE is a static and is never closed"),
+        Err(_) => Err(LvmError::Busy(LVM_PERMIT_TIMEOUT)),
+    }
+}
 
 /// LV name prefix for golden per-image volumes.
 const IMAGE_LV_PREFIX: &str = "image-";
@@ -66,6 +114,12 @@ pub enum LvmError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error(
+        "lvm backend busy: could not acquire permit within {0:?} — arrival rate exceeds \
+         service rate, shed load or retry"
+    )]
+    Busy(std::time::Duration),
 }
 
 pub type Result<T> = std::result::Result<T, LvmError>;
@@ -220,6 +274,16 @@ pub async fn ensure_image_lv(
     let lv_name = format!("{IMAGE_LV_PREFIX}{image_hash}");
     let lv_path = image_lv_path(image_hash);
 
+    // Fast-path the already-populated case before taking the permit —
+    // otherwise every warm-cache VM create needlessly queues on the
+    // global LVM semaphore.
+    if lv_is_readonly(&lv_name).await? {
+        return Ok(lv_path);
+    }
+
+    let _permit = acquire_lvm_permit().await?;
+    // Re-check after acquiring: another caller may have populated the
+    // LV while we were queued, in which case we skip the convert.
     if lv_is_readonly(&lv_name).await? {
         return Ok(lv_path);
     }
@@ -298,11 +362,9 @@ pub async fn ensure_image_lv(
 /// create), remove it first. Creating-then-extending-then-activating is
 /// fast enough (<500ms on tested hardware) that the idempotency cost is
 /// negligible.
-pub async fn create_vm_lv(
-    vm_id: &str,
-    image_hash: &str,
-    disk_gib: u64,
-) -> Result<PathBuf> {
+pub async fn create_vm_lv(vm_id: &str, image_hash: &str, disk_gib: u64) -> Result<PathBuf> {
+    let _permit = acquire_lvm_permit().await?;
+
     let lv_name = format!("{VM_LV_PREFIX}{vm_id}");
     let origin = format!("{IMAGE_LV_PREFIX}{image_hash}");
     let lv_path = vm_lv_path(vm_id);
@@ -339,15 +401,11 @@ pub async fn create_vm_lv(
 
     // Grow the virtual size to the requested disk. A 10G image + 40G
     // request becomes a 40G LV; cloud-init's growpart + resize2fs claims
-    // the extra space inside the guest on first boot.
-    // `-L 40G` (uppercase) is gibibytes (2^30). Lowercase `g` is SI
-    // gigabytes (10^9) — 40g is 37.25 GiB, not 40 GiB. The user asked
-    // for disk_gib GiB; give them GiB.
-    run_lvm(
-        "lvextend",
-        &["-L", &format!("{disk_gib}G"), &format!("{VG}/{lv_name}")],
-    )
-    .await?;
+    // the extra space inside the guest on first boot. If the request
+    // matches the image size (10G image + 10G request), lvextend
+    // reports "No size change" — tolerated as a no-op by `lvextend`
+    // below, because the snapshot is already the right size.
+    lvextend(&lv_name, disk_gib).await?;
 
     info!(vm_id, lv = %lv_name, origin = %origin, disk_gib, "VM LV ready");
     Ok(lv_path)
@@ -356,9 +414,12 @@ pub async fn create_vm_lv(
 /// Remove a VM's LV. No-op if it doesn't exist (returns Ok).
 pub async fn remove_vm_lv(vm_id: &str) -> Result<()> {
     let lv_name = format!("{VM_LV_PREFIX}{vm_id}");
+    // lv_exists is a read-only `lvs` call and cheap — keep it outside
+    // the permit so the fast no-op path doesn't queue.
     if !lv_exists(&lv_name).await? {
         return Ok(());
     }
+    let _permit = acquire_lvm_permit().await?;
     lvremove(&lv_name).await
 }
 
@@ -412,6 +473,26 @@ async fn lv_is_readonly(lv_name: &str) -> Result<bool> {
 
 async fn lvremove(lv_name: &str) -> Result<()> {
     run_lvm("lvremove", &["-f", &format!("{VG}/{lv_name}")]).await
+}
+
+/// Extend an LV to `size_gib` GiB. Idempotent: if the LV is already at
+/// the requested size (snapshot of an image LV that's already the right
+/// size), LVM exits non-zero with "No size change" — treated as success
+/// since the post-condition ("LV is `size_gib` GiB") holds.
+///
+/// `-L 10G` (uppercase) is gibibytes (2^30). Lowercase `g` is SI
+/// gigabytes (10^9) and is wrong for the API contract the caller wants.
+async fn lvextend(lv_name: &str, size_gib: u64) -> Result<()> {
+    match run_lvm(
+        "lvextend",
+        &["-L", &format!("{size_gib}G"), &format!("{VG}/{lv_name}")],
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(LvmError::Command { stderr, .. }) if stderr.contains("No size change") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 async fn run_lvm(tool: &'static str, args: &[&str]) -> Result<()> {

@@ -4,9 +4,9 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  # Basis controller — the one process on each cluster. Default target is
-  # the Docker host loopback so a locally-running controller on :9443 is
-  # scraped automatically. Edit for a remote controller.
+  # Basis controller - the one process on each cluster. Default target
+  # is the Docker host loopback so a locally-running controller on 9443
+  # is scraped automatically. Edit for a remote controller.
   - job_name: basis-controller
     metrics_path: /metrics
     static_configs:
@@ -15,11 +15,13 @@ scrape_configs:
         labels:
           service: basis-controller
 
-  # Basis agents — one target per host. Fill in the list below (or replace
-  # with a file_sd_config once an inventory file exists).
+  # Basis agents - one target per host on port 9444 (configurable via
+  # spec.metricsListen in the Host YAML). Fill in the list below or
+  # replace with a file_sd_config once an inventory file exists.
   - job_name: basis-agents
     metrics_path: /metrics
     static_configs:
-      - targets: []
+      - targets:
+          - 10.0.0.206:9444
         labels:
           service: basis-agent

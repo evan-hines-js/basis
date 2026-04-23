@@ -39,36 +39,31 @@ curl -X POST http://localhost:9090/-/reload
 
 Add agent hosts under the `basis-agents` job the same way.
 
-## Metrics the dashboard expects
+## Metrics the controller emits
 
-The dashboard queries metrics the controller hasn't emitted yet. The
-exporter implementation will provide:
+Every metric the dashboard renders is backed by one of these. Anything
+not listed here isn't emitted — if a panel shows "No data" the metric
+name probably drifted, not the scrape.
 
-**Controller gauges:**
+**Gauges:**
 - `basis_hosts{healthy}`, `basis_clusters`
 - `basis_vms{state, cluster}`
-- `basis_host_cpu_total{host}`, `basis_host_cpu_available{host}`
-- `basis_host_memory_mib_total{host}`, `basis_host_memory_mib_available{host}`
+- `basis_host_cpu_total{host}`, `basis_host_cpu_assigned{host}` (unclamped — can exceed total under overcommit)
+- `basis_host_memory_mib_total{host}`, `basis_host_memory_mib_assigned{host}`
+- `basis_host_disk_gib_total{host}`, `basis_host_disk_gib_assigned{host}`
 - `basis_host_gpus_total{host}`, `basis_host_gpus_assigned{host}`
 - `basis_host_last_heartbeat_age_seconds{host}`
-- `basis_agent_connected{host}`, `basis_agent_commands_in_flight{host}`
-- `basis_vm_age_in_state_seconds{vm_id, state, host, cluster}` — stuck-VM detector
+- `basis_agent_connected{host}` — 1 if the agent stream is open
+- `basis_vm_age_in_state_seconds{vm_id, name, state, host, cluster}` — stuck-VM detector
+- `basis_cpu_overcommit_ratio` — scheduler configuration, for dashboard math
 
-**Controller counters:**
-- `basis_vm_create_result_total{result}`
-- `basis_vm_state_transitions_total{from, to}`
-- `basis_grpc_requests_total{method, status}`
-- `basis_scheduler_decisions_total{outcome}`
-- `basis_agent_commands_sent_total{type, host}`
-- `basis_agent_stream_reconnects_total{host}`
+**Counters:**
+- `basis_vm_create_result_total{result}` — terminal CreateMachine outcome (placed, no_capacity, no_agent, stream_closed, vm_failed, agent_error, timeout)
+- `basis_scheduler_decisions_total{outcome}` — scheduler placement outcomes
 
-**Controller histograms:**
-- `basis_vm_time_to_running_seconds`
-- `basis_grpc_request_duration_seconds{method}`
-- `basis_agent_command_rtt_seconds{type}`
-
-Until the exporter exists, the dashboard panels render "No data" — this
-is expected and defines the implementation contract.
+**Histograms:**
+- `basis_vm_create_duration_seconds{result}` — end-to-end CreateMachine latency, same `result` labels as the counter
+- `basis_vm_time_to_running_seconds` — CREATING → RUNNING provisioning time, observed even after a CreateMachine timeout
 
 ## Layout
 

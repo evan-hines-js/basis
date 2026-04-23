@@ -348,12 +348,14 @@ name = "basis-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum 0.7.9",
  "basis-common",
  "basis-proto",
  "clap",
  "futures",
  "humantime",
  "oci-client",
+ "prometheus",
  "rustls",
  "serde",
  "serde_json",
@@ -410,6 +412,7 @@ name = "basis-common"
 version = "0.1.0"
 dependencies = [
  "humantime",
+ "rcgen",
  "serde",
  "serde_json",
  "serde_yaml_ng",

@@ -96,6 +96,16 @@ pub struct CachedImage {
     pub initrd: PathBuf,
 }
 
+/// Guest-side network configuration baked into the cloud-init ISO.
+/// Grouped here so the ISO builder has one parameter instead of four
+/// positional `&str`s that are easy to transpose at the call site.
+pub struct GuestNetwork<'a> {
+    pub ip_address: &'a str,
+    pub gateway: &'a str,
+    pub prefix_len: u32,
+    pub dns_servers: &'a [String],
+}
+
 /// Name of the ISO-9660 producer resolved at startup. `mkisofs` and
 /// `genisoimage` accept the same flags for the subset of options we use
 /// (`-output`, `-volid`, `-joliet`, `-rock`), so only the binary name
@@ -340,10 +350,7 @@ impl ImageManager {
         instance_id: &str,
         hostname: &str,
         userdata: &[u8],
-        ip_address: &str,
-        gateway: &str,
-        prefix_len: u32,
-        dns_servers: &[String],
+        net: &GuestNetwork<'_>,
     ) -> Result<PathBuf, ImageError> {
         let cidata_dir = vm_dir.join("cidata");
         std::fs::create_dir_all(&cidata_dir)?;
@@ -354,7 +361,8 @@ impl ImageManager {
             format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n"),
         )?;
 
-        let dns_entries: String = dns_servers
+        let dns_entries: String = net
+            .dns_servers
             .iter()
             .map(|s| format!("          - {s}"))
             .collect::<Vec<_>>()
@@ -366,12 +374,15 @@ impl ImageManager {
   ethernets:
     ens3:
       addresses:
-        - {ip_address}/{prefix_len}
-      gateway4: {gateway}
+        - {ip}/{prefix}
+      gateway4: {gw}
       nameservers:
         addresses:
 {dns_entries}
-"#
+"#,
+            ip = net.ip_address,
+            prefix = net.prefix_len,
+            gw = net.gateway,
         );
         std::fs::write(cidata_dir.join("network-config"), &network_config)?;
 
@@ -392,10 +403,7 @@ impl ImageManager {
             .output()
             .await
             .map_err(|e| {
-                ImageError::CloudInitFailed(format!(
-                    "spawning {}: {e}",
-                    self.iso_tool.command()
-                ))
+                ImageError::CloudInitFailed(format!("spawning {}: {e}", self.iso_tool.command()))
             })?;
 
         if !output.status.success() {

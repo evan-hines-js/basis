@@ -21,7 +21,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 mod certs;
 use certs::TestPki;
 
-const CONTROLLER_SAN: &str = "basis-controller";
+use basis_common::tls::{CAPI_PROVIDER_IDENTITY, CONTROLLER_IDENTITY};
 
 async fn install_crypto_provider_once() {
     static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
@@ -67,7 +67,7 @@ impl RunningController {
         .await
         .unwrap();
 
-        let pki = Arc::new(TestPki::new(CONTROLLER_SAN));
+        let pki = Arc::new(TestPki::new(CONTROLLER_IDENTITY));
         let server_tls = pki.server_tls_config();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -107,13 +107,13 @@ impl RunningController {
         ClientTlsConfig::new()
             .identity(Identity::from_pem(cert_pem, key_pem))
             .ca_certificate(Certificate::from_pem(self.pki.ca_pem()))
-            .domain_name(CONTROLLER_SAN)
+            .domain_name(CONTROLLER_IDENTITY)
     }
 
     async fn capi_client(&self) -> basis_client::BasisClient<tonic::transport::Channel> {
         let channel = Endpoint::from_shared(self.endpoint.clone())
             .unwrap()
-            .tls_config(self.client_tls(basis_controller::server::CAPI_PROVIDER_CN))
+            .tls_config(self.client_tls(CAPI_PROVIDER_IDENTITY))
             .unwrap()
             .connect()
             .await
@@ -177,7 +177,6 @@ async fn register_agent(
             total_memory_mib: 65536,
             total_disk_gib: 1000,
             gpus: Vec::new(),
-            iommu_groups: Vec::new(),
         })),
     })
     .await
@@ -236,6 +235,7 @@ async fn drive_create_to_running(
                 vm_id: vm_id.clone(),
                 state: MachineState::Running as i32,
                 error_message: String::new(),
+                transient: false,
             })),
         })
         .await
@@ -472,6 +472,7 @@ async fn test_create_machine_agent_reports_failure() {
                 vm_id: vm_id.clone(),
                 state: MachineState::Failed as i32,
                 error_message: "disk image pull failed".to_string(),
+                transient: false,
             })),
         })
         .await
@@ -513,9 +514,7 @@ async fn test_capi_cn_cannot_open_agent_stream() {
     // agent stream with that CN must be rejected before any register
     // message is inspected.
     let (running, _db) = RunningController::start().await;
-    let mut client = running
-        .agent_client(basis_controller::server::CAPI_PROVIDER_CN)
-        .await;
+    let mut client = running.agent_client(CAPI_PROVIDER_IDENTITY).await;
     let (_tx, rx) = mpsc::channel::<AgentMessage>(1);
     let err = client
         .stream_messages(ReceiverStream::new(rx))
@@ -537,7 +536,6 @@ async fn test_agent_cn_must_match_registered_hostname() {
             total_memory_mib: 65536,
             total_disk_gib: 1000,
             gpus: Vec::new(),
-            iommu_groups: Vec::new(),
         })),
     })
     .await

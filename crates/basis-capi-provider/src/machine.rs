@@ -17,6 +17,12 @@
 //! Delete flow:
 //!   1. If `status.basisVmId` is set, call `Basis.DeleteMachine`.
 //!   2. Remove finalizer.
+//!
+//! Failure surfacing: every apply/cleanup error is reflected back onto
+//! the `BasisMachine` as a `Ready=False` condition + `failureMessage`
+//! before the error propagates. Credential-shaped failures additionally
+//! invalidate the cached `BasisClient` so a fixed Secret is picked up
+//! on the next reconcile without restarting the pod.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,22 +39,19 @@ use tracing::{error, info, warn};
 use basis_client::{ClientError, CreatedMachine, MachineRequest};
 
 use crate::bootstrap;
-use crate::client_cache::{BasisClientCache, CacheError};
+use crate::client_cache::CacheError;
 use crate::conditions;
 use crate::crds::{
     BasisCluster, BasisMachine, CredentialsRef, Machine as CapiMachine, MachineAddress,
 };
-use crate::reconcile_util::{merge_spec, merge_status, namespace_of};
+use crate::reconciler::{
+    merge_spec, merge_status, namespace_of, record_failure_status, ProviderContext, ReconcileError,
+};
 
 const FINALIZER: &str = "basismachine.infrastructure.cluster.x-k8s.io/finalizer";
 /// Label CAPI places on every Machine/BasisMachine naming the cluster
 /// they belong to.
 const CLUSTER_LABEL: &str = "cluster.x-k8s.io/cluster-name";
-
-pub struct MachineContext {
-    pub client: Client,
-    pub clients: Arc<BasisClientCache>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum MachineError {
@@ -74,9 +77,32 @@ pub enum MachineError {
     ClusterNotReady(String),
 }
 
-pub async fn run(client: Client, clients: Arc<BasisClientCache>) -> anyhow::Result<()> {
+impl ReconcileError for MachineError {
+    fn condition_reason(&self) -> &'static str {
+        match self {
+            MachineError::Kube(_) => "KubeApiError",
+            MachineError::Finalizer(_) => "FinalizerError",
+            MachineError::Bootstrap(_) => "BootstrapNotReady",
+            MachineError::Basis(e) if e.is_credentials_problem() => "BasisCredentialsInvalid",
+            MachineError::Basis(_) => "BasisRpcError",
+            MachineError::Credentials(_) => "BasisCredentialsInvalid",
+            MachineError::Missing(_) => "Misconfigured",
+            MachineError::ClusterNotReady(_) => "ClusterNotReady",
+        }
+    }
+
+    fn is_credentials_problem(&self) -> bool {
+        matches!(self, MachineError::Credentials(_))
+            || matches!(self, MachineError::Basis(e) if e.is_credentials_problem())
+    }
+}
+
+pub async fn run(
+    client: Client,
+    clients: Arc<crate::client_cache::BasisClientCache>,
+) -> anyhow::Result<()> {
     let api: Api<BasisMachine> = Api::all(client.clone());
-    let ctx = Arc::new(MachineContext { client, clients });
+    let ctx = Arc::new(ProviderContext { client, clients });
 
     Controller::new(api, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
@@ -94,16 +120,20 @@ pub async fn run(client: Client, clients: Arc<BasisClientCache>) -> anyhow::Resu
 
 async fn reconcile(
     machine: Arc<BasisMachine>,
-    ctx: Arc<MachineContext>,
+    ctx: Arc<ProviderContext>,
 ) -> Result<Action, MachineError> {
     let namespace = namespace_of(machine.as_ref());
     let api: Api<BasisMachine> = Api::namespaced(ctx.client.clone(), &namespace);
 
-    finalizer(&api, FINALIZER, machine, |event| async {
-        match event {
-            Event::Apply(m) => apply(m, ctx.clone(), &namespace).await,
-            Event::Cleanup(m) => cleanup(m, ctx.clone()).await,
+    finalizer(&api, FINALIZER, machine, |event| async move {
+        let (resource, action) = match &event {
+            Event::Apply(m) => (m.clone(), apply(m.clone(), ctx.clone(), &namespace).await),
+            Event::Cleanup(m) => (m.clone(), cleanup(m.clone(), ctx.clone()).await),
+        };
+        if let Err(err) = &action {
+            on_failure(&resource, ctx.clone(), &namespace, err).await;
         }
+        action
     })
     .await
     .map_err(|e| MachineError::Finalizer(e.to_string()))
@@ -111,7 +141,7 @@ async fn reconcile(
 
 async fn apply(
     machine: Arc<BasisMachine>,
-    ctx: Arc<MachineContext>,
+    ctx: Arc<ProviderContext>,
     namespace: &str,
 ) -> Result<Action, MachineError> {
     let name = machine.name_any();
@@ -166,7 +196,7 @@ async fn apply(
     // itself fails (e.g. controller unreachable), the next reconcile will
     // find the ghost and either finish patching it or delete it via the
     // CAPI deletion path.
-    if let Err(e) = write_machine_patches(&api, &name, &created, &machine, generation).await {
+    if let Err(e) = write_success_status(&api, &name, &created, &machine, generation).await {
         warn!(
             machine = %name,
             vm_id = %created.id,
@@ -192,7 +222,10 @@ async fn apply(
 /// the two patches is self-healing on the next reconcile — the basis-side
 /// VM is re-created idempotently and spec is finished. The opposite order
 /// would leave spec populated without the id k8s uses to clean up.
-async fn write_machine_patches(
+///
+/// Also clears any prior `Ready=False` / `failureMessage` so a recovered
+/// machine doesn't keep advertising its last failure.
+async fn write_success_status(
     api: &Api<BasisMachine>,
     name: &str,
     created: &CreatedMachine,
@@ -222,6 +255,7 @@ async fn write_machine_patches(
                     kind: "InternalIP".to_string(),
                     address: created.ip_address.clone(),
                 }],
+                "failureMessage": serde_json::Value::Null,
                 "conditions": conditions,
             }
         }),
@@ -240,7 +274,7 @@ async fn write_machine_patches(
 
 async fn cleanup(
     machine: Arc<BasisMachine>,
-    ctx: Arc<MachineContext>,
+    ctx: Arc<ProviderContext>,
 ) -> Result<Action, MachineError> {
     let Some(id) = machine.status.as_ref().and_then(|s| s.basis_vm_id.clone()) else {
         return Ok(Action::await_change());
@@ -260,6 +294,51 @@ async fn cleanup(
     info!(vm_id = %id, "deleting VM in Basis controller");
     basis.delete_machine(id).await?;
     Ok(Action::await_change())
+}
+
+/// Reflect a failed apply/cleanup back onto the BasisMachine as a
+/// `Ready=False` condition + `failureMessage`, and invalidate the
+/// cached `BasisClient` if the failure looks credential-shaped.
+///
+/// Best-effort: errors here are logged but never propagated, because
+/// the original error is what we want callers to see.
+async fn on_failure(
+    machine: &BasisMachine,
+    ctx: Arc<ProviderContext>,
+    namespace: &str,
+    err: &MachineError,
+) {
+    if err.is_credentials_problem() {
+        // Re-resolve the cluster ref; if even that fails, there's nothing
+        // sensible to invalidate.
+        if let Some(cluster_name) = machine.labels().get(CLUSTER_LABEL).cloned() {
+            if let Ok(ClusterRef {
+                credentials_ref, ..
+            }) = resolve_cluster_ref(&ctx.client, namespace, &cluster_name).await
+            {
+                ctx.clients.invalidate(&credentials_ref, namespace).await;
+                info!(
+                    machine = %machine.name_any(),
+                    "invalidated cached BasisClient after credentials failure"
+                );
+            }
+        }
+    }
+
+    let api: Api<BasisMachine> = Api::namespaced(ctx.client.clone(), namespace);
+    let existing_conditions = machine
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    record_failure_status(
+        &api,
+        &machine.name_any(),
+        machine.metadata.generation,
+        existing_conditions,
+        err,
+    )
+    .await;
 }
 
 /// What the machine reconciler needs off the owning `BasisCluster`:
@@ -323,7 +402,7 @@ async fn find_bootstrap_secret(
 fn error_policy(
     _machine: Arc<BasisMachine>,
     error: &MachineError,
-    _ctx: Arc<MachineContext>,
+    _ctx: Arc<ProviderContext>,
 ) -> Action {
     // ClusterNotReady is expected transient state — short requeue, no noise.
     if matches!(error, MachineError::ClusterNotReady(_)) {

@@ -21,7 +21,8 @@ use basis_common::gpu::GpuInfo;
 use basis_common::json::parse_owned_json;
 use basis_proto::MachineState;
 use prometheus::{
-    Encoder, Gauge, GaugeVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -41,11 +42,20 @@ pub struct Metrics {
     pub vms: IntGaugeVec,
 
     pub host_cpu_total: IntGaugeVec,
-    pub host_cpu_available: IntGaugeVec,
+    /// Sum of VM vCPU allocations on the host. **Not** clamped to
+    /// physical — with the scheduler's overcommit ratio this legitimately
+    /// exceeds `host_cpu_total`, and dashboards need to see that to
+    /// visualize overcommit.
+    pub host_cpu_assigned: IntGaugeVec,
     pub host_memory_mib_total: IntGaugeVec,
-    pub host_memory_mib_available: IntGaugeVec,
+    /// Sum of VM memory allocations on the host. Memory is never
+    /// overcommitted by the scheduler so this stays ≤ total, but it's
+    /// exposed symmetrically with CPU so dashboards don't have to
+    /// special-case one resource.
+    pub host_memory_mib_assigned: IntGaugeVec,
     pub host_disk_gib_total: IntGaugeVec,
-    pub host_disk_gib_available: IntGaugeVec,
+    /// Sum of VM disk allocations on the host. Never overcommitted.
+    pub host_disk_gib_assigned: IntGaugeVec,
     pub host_gpus_total: IntGaugeVec,
     pub host_gpus_assigned: IntGaugeVec,
     pub host_last_heartbeat_age_seconds: GaugeVec,
@@ -62,6 +72,22 @@ pub struct Metrics {
     // --- Counters (event-driven) ---
     pub scheduler_decisions_total: IntCounterVec,
     pub vm_create_result_total: IntCounterVec,
+
+    // --- Histograms (event-driven) ---
+    /// End-to-end CreateMachine latency observed at the gRPC boundary:
+    /// from the moment the controller receives the request to the moment
+    /// it returns a response. Labelled by `result` — same values as
+    /// `vm_create_result_total` — so operators can compare p95 of
+    /// successful placements vs failure paths. Answers "how long did the
+    /// caller wait for their VM."
+    pub vm_create_duration_seconds: HistogramVec,
+
+    /// Elapsed wall-clock from VM row insertion (state=CREATING) to the
+    /// agent reporting RUNNING. Observed in the agent-stream handler so
+    /// it still captures VMs that finish after the CreateMachine RPC has
+    /// already returned a timeout to the caller — useful for telling
+    /// "the controller gave up" apart from "the agent took a long time."
+    pub vm_time_to_running_seconds: Histogram,
 }
 
 impl Metrics {
@@ -87,16 +113,20 @@ impl Metrics {
         registry.register(Box::new(vms.clone()))?;
 
         let host_cpu_total = IntGaugeVec::new(
-            Opts::new("basis_host_cpu_total", "Total vCPUs on each host"),
+            Opts::new("basis_host_cpu_total", "Total physical vCPUs on each host"),
             &["host"],
         )?;
         registry.register(Box::new(host_cpu_total.clone()))?;
 
-        let host_cpu_available = IntGaugeVec::new(
-            Opts::new("basis_host_cpu_available", "Unallocated vCPUs on each host"),
+        let host_cpu_assigned = IntGaugeVec::new(
+            Opts::new(
+                "basis_host_cpu_assigned",
+                "Sum of VM vCPU allocations on each host (unclamped; \
+                 can exceed basis_host_cpu_total under overcommit)",
+            ),
             &["host"],
         )?;
-        registry.register(Box::new(host_cpu_available.clone()))?;
+        registry.register(Box::new(host_cpu_assigned.clone()))?;
 
         let host_memory_mib_total = IntGaugeVec::new(
             Opts::new(
@@ -107,14 +137,14 @@ impl Metrics {
         )?;
         registry.register(Box::new(host_memory_mib_total.clone()))?;
 
-        let host_memory_mib_available = IntGaugeVec::new(
+        let host_memory_mib_assigned = IntGaugeVec::new(
             Opts::new(
-                "basis_host_memory_mib_available",
-                "Unallocated RAM (MiB) on each host",
+                "basis_host_memory_mib_assigned",
+                "Sum of VM RAM allocations (MiB) on each host",
             ),
             &["host"],
         )?;
-        registry.register(Box::new(host_memory_mib_available.clone()))?;
+        registry.register(Box::new(host_memory_mib_assigned.clone()))?;
 
         let host_disk_gib_total = IntGaugeVec::new(
             Opts::new("basis_host_disk_gib_total", "Total disk (GiB) on each host"),
@@ -122,14 +152,14 @@ impl Metrics {
         )?;
         registry.register(Box::new(host_disk_gib_total.clone()))?;
 
-        let host_disk_gib_available = IntGaugeVec::new(
+        let host_disk_gib_assigned = IntGaugeVec::new(
             Opts::new(
-                "basis_host_disk_gib_available",
-                "Unallocated disk (GiB) on each host",
+                "basis_host_disk_gib_assigned",
+                "Sum of VM disk allocations (GiB) on each host",
             ),
             &["host"],
         )?;
-        registry.register(Box::new(host_disk_gib_available.clone()))?;
+        registry.register(Box::new(host_disk_gib_assigned.clone()))?;
 
         let host_gpus_total = IntGaugeVec::new(
             Opts::new(
@@ -201,17 +231,44 @@ impl Metrics {
         )?;
         registry.register(Box::new(vm_create_result_total.clone()))?;
 
+        // Bucket range spans the VM creation envelope: sub-second
+        // fast-fails (no_capacity, no_agent) through the multi-minute
+        // path that includes qemu boot + kubeadm bootstrap, up to the
+        // CREATE_MACHINE_TIMEOUT ceiling at 600s.
+        let vm_duration_buckets = vec![
+            0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0, 1200.0,
+        ];
+
+        let vm_create_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "basis_vm_create_duration_seconds",
+                "End-to-end CreateMachine latency in seconds, by terminal result",
+            )
+            .buckets(vm_duration_buckets.clone()),
+            &["result"],
+        )?;
+        registry.register(Box::new(vm_create_duration_seconds.clone()))?;
+
+        let vm_time_to_running_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "basis_vm_time_to_running_seconds",
+                "Seconds from VM insertion (CREATING) to the agent reporting RUNNING",
+            )
+            .buckets(vm_duration_buckets),
+        )?;
+        registry.register(Box::new(vm_time_to_running_seconds.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
             clusters,
             hosts,
             vms,
             host_cpu_total,
-            host_cpu_available,
+            host_cpu_assigned,
             host_memory_mib_total,
-            host_memory_mib_available,
+            host_memory_mib_assigned,
             host_disk_gib_total,
-            host_disk_gib_available,
+            host_disk_gib_assigned,
             host_gpus_total,
             host_gpus_assigned,
             host_last_heartbeat_age_seconds,
@@ -220,6 +277,8 @@ impl Metrics {
             agent_connected,
             scheduler_decisions_total,
             vm_create_result_total,
+            vm_create_duration_seconds,
+            vm_time_to_running_seconds,
         }))
     }
 
@@ -279,11 +338,11 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
     metrics.hosts.with_label_values(&["false"]).set(unhealthy);
 
     metrics.host_cpu_total.reset();
-    metrics.host_cpu_available.reset();
+    metrics.host_cpu_assigned.reset();
     metrics.host_memory_mib_total.reset();
-    metrics.host_memory_mib_available.reset();
+    metrics.host_memory_mib_assigned.reset();
     metrics.host_disk_gib_total.reset();
-    metrics.host_disk_gib_available.reset();
+    metrics.host_disk_gib_assigned.reset();
     metrics.host_gpus_total.reset();
     metrics.host_gpus_assigned.reset();
     metrics.host_last_heartbeat_age_seconds.reset();
@@ -324,25 +383,25 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
             .with_label_values(&[h])
             .set(host.total_cpu);
         metrics
-            .host_cpu_available
+            .host_cpu_assigned
             .with_label_values(&[h])
-            .set((host.total_cpu - usage.cpu).max(0));
+            .set(usage.cpu);
         metrics
             .host_memory_mib_total
             .with_label_values(&[h])
             .set(host.total_memory_mib);
         metrics
-            .host_memory_mib_available
+            .host_memory_mib_assigned
             .with_label_values(&[h])
-            .set((host.total_memory_mib - usage.mem).max(0));
+            .set(usage.mem);
         metrics
             .host_disk_gib_total
             .with_label_values(&[h])
             .set(host.total_disk_gib);
         metrics
-            .host_disk_gib_available
+            .host_disk_gib_assigned
             .with_label_values(&[h])
-            .set((host.total_disk_gib - usage.disk).max(0));
+            .set(usage.disk);
 
         let inventory: Vec<GpuInfo> = parse_owned_json(&host.gpu_inventory, "hosts.gpu_inventory");
         metrics
@@ -537,6 +596,44 @@ mod tests {
         );
         assert_eq!(metrics.vms.with_label_values(&["RUNNING", "c1"]).get(), 1);
         assert_eq!(metrics.vms.with_label_values(&["CREATING", "c1"]).get(), 1);
+    }
+
+    /// The scheduler allows CPU overcommit (ratio > 1.0 by default), so
+    /// the sum of VM CPU allocations on a host can legitimately exceed
+    /// the host's physical CPU count. The `assigned` gauge must expose
+    /// this unclamped so dashboards can visualize overcommit — prior
+    /// versions exposed only `total - available`, which saturates at
+    /// `total` and hid overcommit entirely.
+    #[tokio::test]
+    async fn refresh_exposes_cpu_overcommit_unclamped() {
+        let db = Db::open(":memory:".as_ref()).await.unwrap();
+        // 16-core host with 3 × 16-core VMs scheduled — 48 assigned on a
+        // 16-core host = 3× overcommit. A 4.0 overcommit ratio permits it.
+        db.upsert_host(&make_host("h1", "node-a", 16, true))
+            .await
+            .unwrap();
+        db.insert_cluster(&make_cluster("c1")).await.unwrap();
+        for n in 0..3 {
+            let mut vm = make_vm(&format!("v{n}"), "h1", "c1", 2);
+            vm.cpu = 16;
+            db.insert_vm(&vm).await.unwrap();
+        }
+
+        let metrics = Metrics::new(4.0).unwrap();
+        refresh(&metrics, &db).await.unwrap();
+
+        assert_eq!(
+            metrics.host_cpu_total.with_label_values(&["node-a"]).get(),
+            16
+        );
+        assert_eq!(
+            metrics
+                .host_cpu_assigned
+                .with_label_values(&["node-a"])
+                .get(),
+            48,
+            "host_cpu_assigned must report the raw sum, not clamp to total"
+        );
     }
 
     #[tokio::test]

@@ -325,7 +325,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "basis_host_cpu_total - basis_host_cpu_available",
+          "expr": "basis_host_cpu_assigned",
           "legendFormat": "{{host}} assigned",
           "refId": "A"
         },
@@ -383,7 +383,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "basis_host_memory_mib_total - basis_host_memory_mib_available",
+          "expr": "basis_host_memory_mib_assigned",
           "legendFormat": "{{host}} assigned",
           "refId": "A"
         },
@@ -435,7 +435,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "basis_host_disk_gib_total - basis_host_disk_gib_available",
+          "expr": "basis_host_disk_gib_assigned",
           "legendFormat": "{{host}} assigned",
           "refId": "A"
         },
@@ -618,6 +618,94 @@
         }
       ],
       "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "id": 500,
+      "panels": [],
+      "title": "Latency",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "End-to-end CreateMachine latency as experienced by the caller — from the moment the controller receives the request to the moment it returns. Aggregated p95 broken out by `result` so you can see where time is going: `placed` is real provisioning, `timeout` is the controller giving up on a slow agent, `no_capacity` / `no_agent` / `stream_closed` are fast-fail paths. The overall p50/p95 across all results is also plotted as the unlabeled baseline.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "spanNulls": true },
+          "min": 0,
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "id": 40,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(basis_vm_create_duration_seconds_bucket[5m])))",
+          "legendFormat": "overall p50",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_vm_create_duration_seconds_bucket[5m])))",
+          "legendFormat": "overall p95",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le, result) (rate(basis_vm_create_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{result}}",
+          "refId": "C"
+        }
+      ],
+      "title": "CreateMachine latency (by result)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Actual VM provisioning time as reported by the agent: seconds from VM insertion (CREATING) to the agent reporting RUNNING. This is observed in the agent-message handler, so it still captures VMs that the caller already gave up on (CreateMachine timeout) but that the agent eventually completed — useful for distinguishing 'controller timed out' from 'agent took too long'. For the p95 to rise faster than the create-latency p95 is a sign boot+kubeadm is slowing down independently of request load.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "spanNulls": true },
+          "min": 0,
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "id": 41,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(basis_vm_time_to_running_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_vm_time_to_running_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(basis_vm_time_to_running_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "title": "VM time-to-RUNNING (provisioning, from CREATING)",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
@@ -667,6 +755,6 @@
   "timezone": "browser",
   "title": "Basis Cluster",
   "uid": "basis-cluster",
-  "version": 2,
+  "version": 4,
   "weekStart": ""
 }

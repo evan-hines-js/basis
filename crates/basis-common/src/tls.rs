@@ -5,6 +5,15 @@ use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::Request;
 
+/// Fixed peer identity required for connections from the CAPI provider.
+/// Matched against the SAN-DNS (preferred) or CN of the client cert by
+/// the controller's `require_capi_caller`.
+pub const CAPI_PROVIDER_IDENTITY: &str = "basis-capi-provider";
+
+/// SAN the controller's server certificate must carry — both agent and
+/// CAPI-provider clients pin it via `client_config(CONTROLLER_IDENTITY)`.
+pub const CONTROLLER_IDENTITY: &str = "basis-controller";
+
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
     #[error("reading TLS file {path}: {source}")]
@@ -92,14 +101,29 @@ fn read(path: &Path) -> Result<Vec<u8>, TlsError> {
     })
 }
 
-/// Extract the Common Name (CN) from a DER-encoded X.509 certificate.
+/// Extract a peer identity string from a DER-encoded X.509 certificate.
 ///
-/// The controller uses the CN to decide what role a connection has — agent
-/// CNs are hostnames, the CAPI provider CN is a fixed value. Returning
-/// `None` means the certificate parsed but had no CN attribute.
-pub fn extract_cn(cert_der: &[u8]) -> Result<Option<String>, TlsError> {
+/// Per RFC 6125 §6.4.4 we prefer a SubjectAltName DNSName over the
+/// Common Name. Servers that don't carry a SAN fall back to CN so
+/// existing certificates issued before this code was written keep
+/// working. The controller uses the returned string to gate roles:
+/// agent identities are hostnames, the CAPI provider identity is a
+/// fixed value.
+///
+/// Returns `Ok(None)` only if the certificate parsed cleanly but
+/// presented neither a SAN DNSName nor a CN — a misconfiguration the
+/// caller treats as authentication failure.
+pub fn extract_peer_identity(cert_der: &[u8]) -> Result<Option<String>, TlsError> {
     let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
         .map_err(|e| TlsError::ParseCert(e.to_string()))?;
+
+    if let Ok(Some(san_ext)) = cert.subject_alternative_name() {
+        for name in &san_ext.value.general_names {
+            if let x509_parser::extensions::GeneralName::DNSName(s) = name {
+                return Ok(Some((*s).to_string()));
+            }
+        }
+    }
 
     for attr in cert.subject().iter_common_name() {
         if let Ok(s) = attr.as_str() {
@@ -109,29 +133,71 @@ pub fn extract_cn(cert_der: &[u8]) -> Result<Option<String>, TlsError> {
     Ok(None)
 }
 
-/// Pull the CN from the peer certificate attached to a tonic request.
+/// Pull the peer identity from the peer certificate attached to a tonic
+/// request. See [`extract_peer_identity`] for the SAN-first selection
+/// rule.
 ///
-/// Returns:
-/// - `Ok(Some(cn))`: connection is mTLS and presented a parseable cert.
+/// - `Ok(Some(id))`: connection is mTLS and presented a parseable cert.
 /// - `Ok(None)`: connection has no TLS info at all (insecure test mode).
 ///   Callers decide whether to allow this.
 /// - `Err(_)`: TLS info was present but the cert was missing or malformed.
-pub fn request_peer_cn<T>(req: &Request<T>) -> Result<Option<String>, TlsError> {
+pub fn request_peer_identity<T>(req: &Request<T>) -> Result<Option<String>, TlsError> {
     let Some(tls_info) = req.extensions().get::<TlsConnectInfo<TcpConnectInfo>>() else {
         return Ok(None);
     };
     let certs = tls_info.peer_certs().ok_or(TlsError::NoPeerCert)?;
     let first = certs.first().ok_or(TlsError::NoPeerCert)?;
-    extract_cn(first.as_ref())
+    extract_peer_identity(first.as_ref())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 
     #[test]
-    fn test_extract_cn_rejects_garbage() {
-        let result = extract_cn(b"not-a-cert");
+    fn extract_peer_identity_rejects_garbage() {
+        let result = extract_peer_identity(b"not-a-cert");
         assert!(matches!(result, Err(TlsError::ParseCert(_))));
+    }
+
+    fn issue_cert(common_name: Option<&str>, sans: Vec<SanType>) -> Vec<u8> {
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        if let Some(cn) = common_name {
+            dn.push(DnType::CommonName, cn);
+        }
+        params.distinguished_name = dn;
+        params.subject_alt_names = sans;
+        let key = KeyPair::generate().expect("generate key");
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn extract_peer_identity_prefers_san_dns_over_cn() {
+        let der = issue_cert(
+            Some("legacy-cn"),
+            vec![SanType::DnsName("preferred.example".try_into().unwrap())],
+        );
+        assert_eq!(
+            extract_peer_identity(&der).unwrap().as_deref(),
+            Some("preferred.example")
+        );
+    }
+
+    #[test]
+    fn extract_peer_identity_falls_back_to_cn_when_no_san() {
+        let der = issue_cert(Some("agent-host"), vec![]);
+        assert_eq!(
+            extract_peer_identity(&der).unwrap().as_deref(),
+            Some("agent-host")
+        );
+    }
+
+    #[test]
+    fn extract_peer_identity_returns_none_when_no_san_and_no_cn() {
+        let der = issue_cert(None, vec![]);
+        assert_eq!(extract_peer_identity(&der).unwrap(), None);
     }
 }

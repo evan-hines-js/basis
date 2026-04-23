@@ -82,6 +82,11 @@ pub struct BasisClusterStatus {
     #[serde(default)]
     pub ready: bool,
 
+    /// Human-readable description of the most recent failure observed by
+    /// the reconciler. Cleared on the next successful apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+
     #[serde(default)]
     pub conditions: Vec<Condition>,
 }

@@ -49,12 +49,15 @@ impl SecretKey {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
+    // `kube::Error` is ~150 bytes; box it so the whole enum (and every
+    // `Result<_, CacheError>` along with it) fits in a register-sized
+    // discriminant + pointer instead of 150+ bytes per Result.
     #[error("kube error reading credentials Secret {namespace}/{name}: {source}")]
     Kube {
         namespace: String,
         name: String,
         #[source]
-        source: kube::Error,
+        source: Box<kube::Error>,
     },
 
     #[error("credentials Secret {namespace}/{name} missing required key '{key}'")]
@@ -121,7 +124,7 @@ impl BasisClientCache {
             .map_err(|source| CacheError::Kube {
                 namespace: key.namespace.clone(),
                 name: key.name.clone(),
-                source,
+                source: Box::new(source),
             })?;
 
         let data = secret.data.unwrap_or_default();

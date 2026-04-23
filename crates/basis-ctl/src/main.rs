@@ -14,7 +14,7 @@
 //!   basis-ctl get    machines --cluster <id>
 //!   basis-ctl delete -f fixtures/machine-debug.yaml
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use basis_client::BasisClient;
@@ -102,7 +102,7 @@ fn connect(cli: &Cli) -> Result<BasisClient> {
     Ok(BasisClient::new(endpoint, tls.load_identity()?))
 }
 
-async fn apply(client: &BasisClient, file: &PathBuf) -> Result<()> {
+async fn apply(client: &BasisClient, file: &Path) -> Result<()> {
     for resource in load_file(file)? {
         match resource {
             Resource::Cluster(c) => {
@@ -134,7 +134,7 @@ async fn apply(client: &BasisClient, file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn delete(client: &BasisClient, file: &PathBuf) -> Result<()> {
+async fn delete(client: &BasisClient, file: &Path) -> Result<()> {
     // Delete machines first, then clusters — cluster delete cascades
     // VMs, but if a fixture has both, explicit deletion of each makes
     // the per-resource output readable.
@@ -196,8 +196,8 @@ async fn get_machines(client: &BasisClient, cluster: Option<String>) -> Result<(
         return Ok(());
     }
     println!(
-        "{:36}  {:32}  {:10}  {:15}  {}",
-        "ID", "NAME", "STATE", "IP", "HOST"
+        "{:36}  {:32}  {:10}  {:15}  HOST",
+        "ID", "NAME", "STATE", "IP",
     );
     for m in machines {
         println!(

@@ -38,6 +38,17 @@ pub struct HostSpec {
     /// (e.g., `ghcr.io`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registries: Vec<RegistryCredentials>,
+
+    /// Plain-HTTP `host:port` for the Prometheus `/metrics` endpoint.
+    /// Defaults to `0.0.0.0:9444` — one above the controller's 9443 so
+    /// a single-host dev setup doesn't collide. Operators point their
+    /// Prometheus `basis-agents` scrape job at this address.
+    #[serde(default = "default_metrics_listen")]
+    pub metrics_listen: String,
+}
+
+fn default_metrics_listen() -> String {
+    "0.0.0.0:9444".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

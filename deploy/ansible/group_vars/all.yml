@@ -85,10 +85,10 @@ basis_ip_pool:
   name: default
   cidr: 10.0.0.0/24
   gateway: 10.0.0.1
-  vm_range_start: 10.0.0.220
-  vm_range_end: 10.0.0.250
-  vip_range_start: 10.0.0.210
-  vip_range_end: 10.0.0.219
+  vm_range_start: 10.0.0.150
+  vm_range_end: 10.0.0.205
+  vip_range_start: 10.0.0.100
+  vip_range_end: 10.0.0.149
 
 # Credentials for private OCI registries basis-agent pulls VM images
 # from. Override in host/group vars or vault when deploying against

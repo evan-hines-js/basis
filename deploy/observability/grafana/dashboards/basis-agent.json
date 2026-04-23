@@ -1,0 +1,239 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Per-agent VM create pipeline breakdown. Each histogram is observed on the agent at one step of handlers::create_vm_inner — when the controller dashboard shows an end-to-end latency jump, this dashboard tells you which step moved. Filter by host via the `instance` variable.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": [],
+      "title": "Per-step create latency",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "p95 of every step in handlers::create_vm_inner on the agent, on one panel. When the controller's CreateMachine p95 jumps, exactly one of these six lines will jump with it — that's the step doing the waiting. Lines near zero are healthy; a line climbing into tens of seconds is the suspect.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "spanNulls": true },
+          "min": 0,
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 1 },
+      "id": 1,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_agent_image_ensure_cached_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "image_ensure_cached",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_agent_lv_snapshot_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "lv_snapshot",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_agent_cloud_init_iso_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "cloud_init_iso",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_agent_tap_create_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "tap_create",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_agent_vfio_bind_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "vfio_bind",
+          "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_agent_vm_spawn_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "vm_spawn",
+          "refId": "F"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(basis_agent_lv_permit_wait_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "lv_permit_wait",
+          "refId": "G"
+        }
+      ],
+      "title": "p95 per step (by name)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 11 },
+      "id": 200,
+      "panels": [],
+      "title": "Throughput",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Per-step completion rate. Derived from the histogram's own `_count` series so the integral matches the count panels on the controller dashboard. Divergence between steps means creates are failing partway through — e.g. image_ensure_cached rate high but vm_spawn rate low = creates dying in the middle of the pipeline.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "spanNulls": true },
+          "min": 0,
+          "unit": "ops"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "id": 10,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_image_ensure_cached_seconds_count{instance=~\"$instance\"}[5m])",
+          "legendFormat": "image_ensure_cached",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_lv_snapshot_seconds_count{instance=~\"$instance\"}[5m])",
+          "legendFormat": "lv_snapshot",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_cloud_init_iso_seconds_count{instance=~\"$instance\"}[5m])",
+          "legendFormat": "cloud_init_iso",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_tap_create_seconds_count{instance=~\"$instance\"}[5m])",
+          "legendFormat": "tap_create",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_vm_spawn_seconds_count{instance=~\"$instance\"}[5m])",
+          "legendFormat": "vm_spawn",
+          "refId": "E"
+        }
+      ],
+      "title": "Completion rate per step",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Mean time per step (sum / count). Complements the p95 panel above — if mean rises alongside p95, every create is slower; if p95 rises but mean barely moves, only the tail is affected (more often a contention pattern than a systemic slowdown).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "spanNulls": true },
+          "min": 0,
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_image_ensure_cached_seconds_sum{instance=~\"$instance\"}[5m]) / clamp_min(rate(basis_agent_image_ensure_cached_seconds_count{instance=~\"$instance\"}[5m]), 1e-9)",
+          "legendFormat": "image_ensure_cached",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_lv_snapshot_seconds_sum{instance=~\"$instance\"}[5m]) / clamp_min(rate(basis_agent_lv_snapshot_seconds_count{instance=~\"$instance\"}[5m]), 1e-9)",
+          "legendFormat": "lv_snapshot",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_cloud_init_iso_seconds_sum{instance=~\"$instance\"}[5m]) / clamp_min(rate(basis_agent_cloud_init_iso_seconds_count{instance=~\"$instance\"}[5m]), 1e-9)",
+          "legendFormat": "cloud_init_iso",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_tap_create_seconds_sum{instance=~\"$instance\"}[5m]) / clamp_min(rate(basis_agent_tap_create_seconds_count{instance=~\"$instance\"}[5m]), 1e-9)",
+          "legendFormat": "tap_create",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_vm_spawn_seconds_sum{instance=~\"$instance\"}[5m]) / clamp_min(rate(basis_agent_vm_spawn_seconds_count{instance=~\"$instance\"}[5m]), 1e-9)",
+          "legendFormat": "vm_spawn",
+          "refId": "E"
+        }
+      ],
+      "title": "Mean time per step",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["basis", "agent"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "Prometheus" },
+        "definition": "label_values(basis_agent_vm_spawn_seconds_count, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Host (instance)",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": { "query": "label_values(basis_agent_vm_spawn_seconds_count, instance)", "refId": "Prometheus-instance-Variable-Query" },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Basis Agent",
+  "uid": "basis-agent",
+  "version": 2,
+  "weekStart": ""
+}

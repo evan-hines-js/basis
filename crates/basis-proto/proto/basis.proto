@@ -155,11 +155,6 @@ message GPUDevice {
   uint32 nvlink_group = 4;
 }
 
-message IOMMUGroup {
-  uint32 id = 1;
-  repeated string pci_addresses = 2;
-}
-
 // --- Agent stream messages ---
 
 message AgentMessage {
@@ -209,8 +204,9 @@ message RegisterHostRequest {
   uint32 total_cpu = 2;
   uint64 total_memory_mib = 3;
   uint64 total_disk_gib = 4;
+  // Per-GPU iommu_group is carried inside each GPUDevice; no separate
+  // aggregate field needed.
   repeated GPUDevice gpus = 5;
-  repeated IOMMUGroup iommu_groups = 6;
 }
 
 // Agent liveness signal. The controller is authoritative for capacity:
@@ -225,6 +221,13 @@ message ReportVMStateRequest {
   string vm_id = 1;
   MachineState state = 2;
   string error_message = 3;
+  // True when the failure is a load-shedding signal (e.g., the LVM
+  // mutation semaphore timed out because the agent couldn't keep up
+  // with arrival rate) rather than a real fault. The controller maps
+  // this to a transient RPC status (`Unavailable`) so callers retry
+  // instead of alerting, and labels the result as `busy` in metrics.
+  // Ignored for state=RUNNING.
+  bool transient = 4;
 }
 
 // --- Controller -> Agent commands ---

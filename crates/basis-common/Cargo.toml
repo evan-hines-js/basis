@@ -16,3 +16,4 @@ x509-parser.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 tempfile = "3"
+rcgen.workspace = true

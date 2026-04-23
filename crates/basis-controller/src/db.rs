@@ -20,6 +20,20 @@ pub enum DbError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// All IPs in the requested pool sub-range are already allocated.
+    /// Distinct from `Conflict` so callers can map exhaustion to
+    /// `ResourceExhausted` and a transient lost-race to `Internal`/retry
+    /// instead of conflating the two.
+    #[error("ip pool exhausted: {0}")]
+    Exhausted(String),
+
+    /// `insert_vm` rejected the row because the host is unknown or
+    /// unhealthy at the moment the insert ran. Atomic with the insert
+    /// itself, so callers can release any IP they pre-allocated and
+    /// surface a clean retry-able error.
+    #[error("host '{0}' is unknown or unhealthy")]
+    HostUnavailable(String),
+
     #[error(
         "ip pool '{pool}' has malformed {field} = '{value}' in the controller DB: {reason} \
          — controller.toml validation should have caught this, so the DB has likely been \
@@ -58,27 +72,65 @@ impl IpOwner<'_> {
 
 #[derive(Debug, Clone)]
 pub struct Db {
-    pool: SqlitePool,
+    /// Read-only pool. Multiple connections so independent read RPCs +
+    /// the metrics poller + scheduler snapshots can run in parallel —
+    /// SQLite in WAL mode allows unlimited concurrent readers alongside
+    /// the single writer.
+    reader: SqlitePool,
+    /// Single-connection write pool. Every INSERT/UPDATE/DELETE funnels
+    /// through this one connection so concurrent writes queue in
+    /// tokio's mpsc-like connection acquisition (fair, cache-friendly)
+    /// rather than inside SQLite's `busy_timeout` retry loop, which is
+    /// an *unfair* sleep/retry and starves under heavy load. The
+    /// classic symptom was SQLITE_BUSY ("database is locked") under
+    /// 40+ concurrent writers even though no transaction was held
+    /// across an await. See
+    /// https://emschwartz.me/psa-your-sqlite-connection-pool-might-be-ruining-your-write-performance/
+    writer: SqlitePool,
 }
 
 impl Db {
     pub async fn open(path: &Path) -> Result<Self, DbError> {
-        let options = if path.to_string_lossy() == ":memory:" {
-            SqliteConnectOptions::from_str("sqlite::memory:")?
+        let (write_options, read_options) = if path.to_string_lossy() == ":memory:" {
+            // Per-`Db` unique URI + `cache=shared` so the reader and
+            // writer pools within this instance see the same in-memory
+            // database, but two different `Db::open(":memory:")` calls
+            // (successive tests in the same process) get isolated DBs.
+            // Plain `file::memory:?cache=shared` is process-global and
+            // would leak state between tests.
+            let uri = format!(
+                "sqlite:file:basis-mem-{}?mode=memory&cache=shared",
+                uuid::Uuid::new_v4()
+            );
+            let shared = SqliteConnectOptions::from_str(&uri)?;
+            (shared.clone(), shared)
         } else {
-            SqliteConnectOptions::new()
+            let base = SqliteConnectOptions::new()
                 .filename(path)
                 .create_if_missing(true)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                .busy_timeout(std::time::Duration::from_secs(5))
+                // Even with only one writer connection, statements can
+                // still transiently block on a WAL checkpoint or a
+                // just-committed txn's fsync. 30s swallows that without
+                // hanging a misbehaving caller forever.
+                .busy_timeout(std::time::Duration::from_secs(30));
+            let read = base.clone().read_only(true);
+            (base, read)
         };
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect_with(options)
+        // Writer pool FIRST so migrations run before any reader
+        // connects to the (possibly empty) DB.
+        let writer = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(write_options)
             .await?;
 
-        let db = Self { pool };
+        let reader = SqlitePoolOptions::new()
+            .max_connections(32)
+            .connect_with(read_options)
+            .await?;
+
+        let db = Self { reader, writer };
         db.migrate().await?;
         Ok(db)
     }
@@ -96,7 +148,7 @@ impl Db {
                 healthy INTEGER NOT NULL DEFAULT 1
             )",
         )
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
 
         sqlx::query(
@@ -108,7 +160,7 @@ impl Db {
                 created_at TEXT NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
 
         sqlx::query(
@@ -129,7 +181,7 @@ impl Db {
                 updated_at TEXT NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
 
         // Enforces that `(cluster_id, name)` is unique across VMs. CAPI
@@ -141,7 +193,7 @@ impl Db {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_vms_cluster_name
              ON vms (cluster_id, name)",
         )
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
 
         sqlx::query(
@@ -155,7 +207,7 @@ impl Db {
                 vip_range_end TEXT NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
 
         sqlx::query(
@@ -166,7 +218,28 @@ impl Db {
                 owner_kind TEXT NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&self.writer)
+        .await?;
+
+        // Indices on ip_allocations. Both allocate (WHERE pool_name = ?)
+        // and release (WHERE owner_id = ? AND owner_kind = ?) were full
+        // table scans without these — under concurrent CreateMachine
+        // load the scans ran inside SQLite's writer lock and piled up
+        // past `busy_timeout`, surfacing to callers as "database is
+        // locked" (SQLITE_BUSY) even though no transaction was held
+        // open across an await.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_ip_allocations_pool \
+             ON ip_allocations(pool_name)",
+        )
+        .execute(&self.writer)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_ip_allocations_owner \
+             ON ip_allocations(owner_id, owner_kind)",
+        )
+        .execute(&self.writer)
         .await?;
 
         Ok(())
@@ -206,7 +279,7 @@ impl Db {
         .bind(&pool.vm_range.end)
         .bind(&pool.vip_range.start)
         .bind(&pool.vip_range.end)
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
         Ok(())
     }
@@ -214,7 +287,7 @@ impl Db {
     pub async fn get_ip_pool(&self, name: &str) -> Result<IpPoolRow, DbError> {
         sqlx::query_as::<_, IpPoolRow>("SELECT * FROM ip_pools WHERE name = ?")
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reader)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("ip pool '{name}'")))
     }
@@ -252,49 +325,56 @@ impl Db {
         range: &ParsedRange,
         owner: IpOwner<'_>,
     ) -> Result<String, DbError> {
-        let allocated: Vec<String> =
-            sqlx::query_scalar("SELECT ip_address FROM ip_allocations WHERE pool_name = ?")
-                .bind(pool_name)
-                .fetch_all(&self.pool)
-                .await?;
-        let allocated_set: std::collections::HashSet<String> = allocated.into_iter().collect();
-
-        for ip_u32 in range.start..=range.end {
-            let candidate = std::net::Ipv4Addr::from(ip_u32).to_string();
-            if !allocated_set.contains(&candidate) {
-                self.insert_allocation(pool_name, &candidate, owner).await?;
-                return Ok(candidate);
-            }
-        }
-
-        Err(DbError::Conflict(format!(
-            "no available IPs in pool '{pool_name}' sub-range"
-        )))
-    }
-
-    async fn insert_allocation(
-        &self,
-        pool_name: &str,
-        ip: &str,
-        owner: IpOwner<'_>,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO ip_allocations (ip_address, pool_name, owner_id, owner_kind)
-             VALUES (?, ?, ?, ?)",
+        // Single-statement allocation: a recursive CTE enumerates the
+        // range in ascending order, the NOT IN subquery filters out
+        // currently-allocated IPs (index-backed on pool_name), the INSERT
+        // grabs the first free address, and RETURNING hands it back.
+        //
+        // Correctness rests on SQLite's per-statement implicit write
+        // transaction: concurrent allocators serialise on the global
+        // writer lock, so the NOT-IN snapshot is always consistent with
+        // a freshly-committed view. The earlier `BEGIN IMMEDIATE +
+        // SELECT + INSERT + COMMIT` wrapper provided the same guarantee
+        // but kept the writer lock held across two round-trips plus a
+        // full-table scan — under concurrent CreateMachine load that
+        // queue depth exceeded `busy_timeout` and surfaced as
+        // SQLITE_BUSY.
+        let allocated: Option<String> = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE
+              candidate(n) AS (
+                  SELECT ? UNION ALL SELECT n + 1 FROM candidate WHERE n < ?
+              ),
+              picked(ip) AS (
+                  SELECT printf('%d.%d.%d.%d',
+                                (n >> 24) & 255, (n >> 16) & 255,
+                                (n >>  8) & 255,  n        & 255)
+                  FROM candidate
+                  WHERE printf('%d.%d.%d.%d',
+                               (n >> 24) & 255, (n >> 16) & 255,
+                               (n >>  8) & 255,  n        & 255)
+                        NOT IN (SELECT ip_address FROM ip_allocations
+                                WHERE pool_name = ?)
+                  ORDER BY n
+                  LIMIT 1
+              )
+            INSERT INTO ip_allocations (ip_address, pool_name, owner_id, owner_kind)
+            SELECT ip, ?, ?, ? FROM picked
+            RETURNING ip_address
+            "#,
         )
-        .bind(ip)
-        .bind(pool_name)
+        .bind(range.start as i64)
+        .bind(range.end as i64)
+        .bind(pool_name) // NOT IN subquery
+        .bind(pool_name) // INSERT value
         .bind(owner.id())
         .bind(owner.kind())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-                DbError::Conflict(format!("IP '{ip}' already allocated"))
-            }
-            other => DbError::Sqlx(other),
-        })?;
-        Ok(())
+        .fetch_optional(&self.writer)
+        .await?;
+
+        allocated.ok_or_else(|| {
+            DbError::Exhausted(format!("no available IPs in pool '{pool_name}' sub-range"))
+        })
     }
 
     /// Release every IP held by this owner.
@@ -302,7 +382,7 @@ impl Db {
         sqlx::query("DELETE FROM ip_allocations WHERE owner_id = ? AND owner_kind = ?")
             .bind(owner.id())
             .bind(owner.kind())
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
@@ -319,7 +399,7 @@ impl Db {
         .bind(&cluster.ip_pool)
         .bind(&cluster.control_plane_endpoint)
         .bind(&cluster.created_at)
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await
         .map_err(|e| match e {
             sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
@@ -333,7 +413,7 @@ impl Db {
     pub async fn get_cluster(&self, id: &str) -> Result<ClusterRow, DbError> {
         sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters WHERE id = ?")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reader)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("cluster '{id}'")))
     }
@@ -342,7 +422,7 @@ impl Db {
         Ok(
             sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters WHERE name = ?")
                 .bind(name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.reader)
                 .await?,
         )
     }
@@ -350,14 +430,14 @@ impl Db {
     pub async fn delete_cluster(&self, id: &str) -> Result<(), DbError> {
         sqlx::query("DELETE FROM clusters WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
 
     pub async fn list_clusters(&self) -> Result<Vec<ClusterRow>, DbError> {
         Ok(sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await?)
     }
 
@@ -385,7 +465,7 @@ impl Db {
         .bind(&host.gpu_inventory)
         .bind(&host.last_heartbeat)
         .bind(host.healthy)
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
         Ok(())
     }
@@ -393,7 +473,7 @@ impl Db {
     pub async fn get_host(&self, id: &str) -> Result<HostRow, DbError> {
         sqlx::query_as::<_, HostRow>("SELECT * FROM hosts WHERE id = ?")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reader)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("host '{id}'")))
     }
@@ -402,7 +482,7 @@ impl Db {
         Ok(
             sqlx::query_as::<_, HostRow>("SELECT * FROM hosts WHERE hostname = ?")
                 .bind(hostname)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.reader)
                 .await?,
         )
     }
@@ -410,14 +490,14 @@ impl Db {
     pub async fn list_healthy_hosts(&self) -> Result<Vec<HostRow>, DbError> {
         Ok(
             sqlx::query_as::<_, HostRow>("SELECT * FROM hosts WHERE healthy = 1")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.reader)
                 .await?,
         )
     }
 
     pub async fn list_hosts(&self) -> Result<Vec<HostRow>, DbError> {
         Ok(sqlx::query_as::<_, HostRow>("SELECT * FROM hosts")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await?)
     }
 
@@ -427,7 +507,7 @@ impl Db {
         let result = sqlx::query("UPDATE hosts SET last_heartbeat = ?, healthy = 1 WHERE id = ?")
             .bind(now)
             .bind(host_id)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
 
         if result.rows_affected() == 0 {
@@ -439,18 +519,29 @@ impl Db {
     pub async fn mark_host_unhealthy(&self, host_id: &str) -> Result<(), DbError> {
         sqlx::query("UPDATE hosts SET healthy = 0 WHERE id = ?")
             .bind(host_id)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
 
     // --- VMs ---
 
+    /// Insert a VM row, but only if the target host is still healthy.
+    /// `INSERT … SELECT … WHERE EXISTS` performs the health check and the
+    /// insert as a single SQL statement, so a host flipping unhealthy
+    /// between the scheduler picking it and the row landing in the table
+    /// can never produce a CREATING row pinned to a host whose agent
+    /// will never receive the command.
+    ///
+    /// Returns `HostUnavailable` if the host doesn't exist or is
+    /// unhealthy, `Conflict` on duplicate `(cluster_id, name)`, and the
+    /// unwrapped sqlx error for everything else.
     pub async fn insert_vm(&self, vm: &VmRow) -> Result<(), DbError> {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO vms (id, name, cluster_id, host_id, ip_address, state, cpu, memory_mib, disk_gib,
                 gpu_assignments, image, error_message, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+             WHERE EXISTS (SELECT 1 FROM hosts WHERE id = ? AND healthy = 1)",
         )
         .bind(&vm.id)
         .bind(&vm.name)
@@ -466,7 +557,8 @@ impl Db {
         .bind(&vm.error_message)
         .bind(&vm.created_at)
         .bind(&vm.updated_at)
-        .execute(&self.pool)
+        .bind(&vm.host_id)
+        .execute(&self.writer)
         .await
         .map_err(|e| match e {
             sqlx::Error::Database(db_err) if db_err.is_unique_violation() => DbError::Conflict(
@@ -474,13 +566,17 @@ impl Db {
             ),
             other => DbError::Sqlx(other),
         })?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::HostUnavailable(vm.host_id.clone()));
+        }
         Ok(())
     }
 
     pub async fn get_vm(&self, id: &str) -> Result<VmRow, DbError> {
         sqlx::query_as::<_, VmRow>("SELECT * FROM vms WHERE id = ?")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reader)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("vm '{id}'")))
     }
@@ -494,7 +590,7 @@ impl Db {
             sqlx::query_as::<_, VmRow>("SELECT * FROM vms WHERE cluster_id = ? AND name = ?")
                 .bind(cluster_id)
                 .bind(name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.reader)
                 .await?,
         )
     }
@@ -504,11 +600,11 @@ impl Db {
             Some(c) => Ok(
                 sqlx::query_as::<_, VmRow>("SELECT * FROM vms WHERE cluster_id = ?")
                     .bind(c)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&self.reader)
                     .await?,
             ),
             None => Ok(sqlx::query_as::<_, VmRow>("SELECT * FROM vms")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.reader)
                 .await?),
         }
     }
@@ -517,7 +613,7 @@ impl Db {
         Ok(
             sqlx::query_as::<_, VmRow>("SELECT * FROM vms WHERE host_id = ?")
                 .bind(host_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.reader)
                 .await?,
         )
     }
@@ -535,7 +631,7 @@ impl Db {
                 .bind(error_message)
                 .bind(now)
                 .bind(vm_id)
-                .execute(&self.pool)
+                .execute(&self.writer)
                 .await?;
 
         if result.rows_affected() == 0 {
@@ -547,7 +643,7 @@ impl Db {
     pub async fn delete_vm(&self, id: &str) -> Result<(), DbError> {
         sqlx::query("DELETE FROM vms WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
@@ -557,13 +653,13 @@ impl Db {
         let stale: Vec<String> =
             sqlx::query_scalar("SELECT id FROM hosts WHERE healthy = 1 AND last_heartbeat < ?")
                 .bind(cutoff)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.reader)
                 .await?;
 
         if !stale.is_empty() {
             sqlx::query("UPDATE hosts SET healthy = 0 WHERE healthy = 1 AND last_heartbeat < ?")
                 .bind(cutoff)
-                .execute(&self.pool)
+                .execute(&self.writer)
                 .await?;
         }
 
@@ -624,6 +720,19 @@ pub struct IpPoolRow {
 }
 
 impl IpPoolRow {
+    /// Parse the CIDR prefix length stored on this pool. Returns
+    /// `DbError::MalformedIpPool` rather than a silent fallback so a
+    /// corrupted `cidr` value surfaces as an explicit error instead of
+    /// quietly defaulting to /24 and giving the VM the wrong netmask.
+    pub fn prefix_len(&self) -> Result<u8, DbError> {
+        crate::config::parse_cidr_prefix(&self.cidr).map_err(|e| DbError::MalformedIpPool {
+            pool: self.name.clone(),
+            field: "cidr",
+            value: self.cidr.clone(),
+            reason: e.to_string(),
+        })
+    }
+
     /// Parse the VM sub-range. Returns `DbError::MalformedIpPool` if the
     /// stored strings are not valid IPv4 addresses — `controller.toml`
     /// validation catches this at startup, so the error should only
@@ -1096,7 +1205,51 @@ mod tests {
         }
 
         let result = db.allocate_ip("small", IpOwner::Vm("vm6")).await;
-        assert!(matches!(result, Err(DbError::Conflict(_))));
+        assert!(
+            matches!(result, Err(DbError::Exhausted(_))),
+            "expected Exhausted, got {result:?}"
+        );
+    }
+
+    /// 32 concurrent allocators against a 6-IP pool should produce 6
+    /// distinct successes and 26 `Exhausted` errors — no `Conflict`s
+    /// from the read-then-insert race, no duplicate addresses, no
+    /// silent loss of capacity.
+    #[tokio::test]
+    async fn test_allocate_ip_concurrent_no_double_allocation() {
+        let db = test_db().await;
+        db.upsert_ip_pool(&make_pool("default")).await.unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                let owner = format!("vm-{i}");
+                db.allocate_ip("default", IpOwner::Vm(&owner)).await
+            }));
+        }
+
+        let mut ok = Vec::new();
+        let mut exhausted = 0;
+        let mut conflict = 0;
+        let mut other = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(ip) => ok.push(ip),
+                Err(DbError::Exhausted(_)) => exhausted += 1,
+                Err(DbError::Conflict(_)) => conflict += 1,
+                Err(_) => other += 1,
+            }
+        }
+        assert_eq!(ok.len(), 6, "successful allocations");
+        assert_eq!(exhausted, 26, "remaining 26 must report Exhausted");
+        assert_eq!(conflict, 0, "no spurious Conflict from race-loss");
+        assert_eq!(other, 0, "no other errors");
+
+        let mut sorted = ok.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ok.len(), "no duplicate IPs assigned");
     }
 
     #[tokio::test]

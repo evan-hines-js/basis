@@ -22,6 +22,25 @@ pub fn ready_true(reason: &'static str, generation: Option<i64>) -> Condition {
     }
 }
 
+/// Build a `Ready=False` condition with a machine-readable reason and a
+/// human-readable message. Used by both reconcilers to surface failures
+/// to CAPI core, MachineHealthCheck, and `kubectl describe` so a stuck
+/// resource shows *why* it's stuck instead of just sitting in pending.
+pub fn ready_false(
+    reason: &'static str,
+    message: impl Into<String>,
+    generation: Option<i64>,
+) -> Condition {
+    Condition {
+        kind: "Ready".to_string(),
+        status: "False".to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.into()),
+        last_transition_time: now_rfc3339(),
+        observed_generation: generation,
+    }
+}
+
 /// Merge `new` into `existing` by `type`. Preserves `lastTransitionTime`
 /// when the condition's `status` is unchanged (per K8s convention).
 /// Other controllers' conditions on other `type`s pass through untouched.

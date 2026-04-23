@@ -12,6 +12,11 @@
 //! Delete flow:
 //!   1. Call `Basis.DeleteCluster(cluster_id)` (cascades VM deletes + releases VIP)
 //!   2. Remove finalizer
+//!
+//! Failure surfacing: every apply/cleanup error is reflected back onto
+//! the BasisCluster as a `Ready=False` condition + `failureMessage`.
+//! Credential-shaped failures additionally invalidate the cached
+//! `BasisClient` so a fixed Secret is picked up on the next reconcile.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,17 +30,21 @@ use kube::{Client, ResourceExt};
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use crate::client_cache::{BasisClientCache, CacheError};
+use crate::client_cache::CacheError;
 use crate::conditions;
 use crate::crds::BasisCluster;
-use crate::reconcile_util::{merge_spec, merge_status, namespace_of};
+use crate::reconciler::{
+    merge_spec, merge_status, namespace_of, record_failure_status, ProviderContext, ReconcileError,
+};
 
 const FINALIZER: &str = "basiscluster.infrastructure.cluster.x-k8s.io/finalizer";
 
-pub struct ClusterContext {
-    pub client: Client,
-    pub clients: Arc<BasisClientCache>,
-}
+/// kubeadm's apiserver always listens on 6443. We don't expose this
+/// as a spec knob because the kube-vip static pod manifest the control
+/// plane ships is hard-wired to the same number — making it
+/// configurable would require threading the port through bootstrap
+/// data templating and buys nothing for a kubeadm cluster.
+const KUBE_API_PORT: u16 = 6443;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterError {
@@ -52,9 +61,29 @@ pub enum ClusterError {
     Credentials(#[from] CacheError),
 }
 
-pub async fn run(client: Client, clients: Arc<BasisClientCache>) -> anyhow::Result<()> {
+impl ReconcileError for ClusterError {
+    fn condition_reason(&self) -> &'static str {
+        match self {
+            ClusterError::Kube(_) => "KubeApiError",
+            ClusterError::Finalizer(_) => "FinalizerError",
+            ClusterError::Basis(e) if e.is_credentials_problem() => "BasisCredentialsInvalid",
+            ClusterError::Basis(_) => "BasisRpcError",
+            ClusterError::Credentials(_) => "BasisCredentialsInvalid",
+        }
+    }
+
+    fn is_credentials_problem(&self) -> bool {
+        matches!(self, ClusterError::Credentials(_))
+            || matches!(self, ClusterError::Basis(e) if e.is_credentials_problem())
+    }
+}
+
+pub async fn run(
+    client: Client,
+    clients: Arc<crate::client_cache::BasisClientCache>,
+) -> anyhow::Result<()> {
     let api: Api<BasisCluster> = Api::all(client.clone());
-    let ctx = Arc::new(ClusterContext { client, clients });
+    let ctx = Arc::new(ProviderContext { client, clients });
 
     Controller::new(api, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
@@ -74,16 +103,20 @@ pub async fn run(client: Client, clients: Arc<BasisClientCache>) -> anyhow::Resu
 
 async fn reconcile(
     cluster: Arc<BasisCluster>,
-    ctx: Arc<ClusterContext>,
+    ctx: Arc<ProviderContext>,
 ) -> Result<Action, ClusterError> {
     let namespace = namespace_of(cluster.as_ref());
     let api: Api<BasisCluster> = Api::namespaced(ctx.client.clone(), &namespace);
 
-    finalizer(&api, FINALIZER, cluster, |event| async {
-        match event {
-            Event::Apply(c) => apply(c, ctx.clone()).await,
-            Event::Cleanup(c) => cleanup(c, ctx.clone()).await,
+    finalizer(&api, FINALIZER, cluster, |event| async move {
+        let (resource, action) = match &event {
+            Event::Apply(c) => (c.clone(), apply(c.clone(), ctx.clone()).await),
+            Event::Cleanup(c) => (c.clone(), cleanup(c.clone(), ctx.clone()).await),
+        };
+        if let Err(err) = &action {
+            on_failure(&resource, ctx.clone(), &namespace, err).await;
         }
+        action
     })
     .await
     .map_err(|e| ClusterError::Finalizer(e.to_string()))
@@ -91,7 +124,7 @@ async fn reconcile(
 
 async fn apply(
     cluster: Arc<BasisCluster>,
-    ctx: Arc<ClusterContext>,
+    ctx: Arc<ProviderContext>,
 ) -> Result<Action, ClusterError> {
     let name = cluster.name_any();
     let namespace = namespace_of(cluster.as_ref());
@@ -155,6 +188,7 @@ async fn apply(
                 "basisClusterId": created.cluster_id,
                 "ready": true,
                 "initialization": { "provisioned": true },
+                "failureMessage": serde_json::Value::Null,
                 "conditions": conditions,
             }
         }),
@@ -164,16 +198,9 @@ async fn apply(
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
-/// kubeadm's apiserver always listens on 6443. We don't expose this
-/// as a spec knob because the kube-vip static pod manifest the control
-/// plane ships is hard-wired to the same number — making it
-/// configurable would require threading the port through bootstrap
-/// data templating and buys nothing for a kubeadm cluster.
-const KUBE_API_PORT: u16 = 6443;
-
 async fn cleanup(
     cluster: Arc<BasisCluster>,
-    ctx: Arc<ClusterContext>,
+    ctx: Arc<ProviderContext>,
 ) -> Result<Action, ClusterError> {
     if let Some(id) = cluster
         .status
@@ -191,10 +218,47 @@ async fn cleanup(
     Ok(Action::await_change())
 }
 
+/// Reflect a failed apply/cleanup back onto the BasisCluster as a
+/// `Ready=False` condition + `failureMessage`, and invalidate the
+/// cached `BasisClient` if the failure is credential-shaped.
+///
+/// Best-effort: errors here are logged but never propagated.
+async fn on_failure(
+    cluster: &BasisCluster,
+    ctx: Arc<ProviderContext>,
+    namespace: &str,
+    err: &ClusterError,
+) {
+    if err.is_credentials_problem() {
+        ctx.clients
+            .invalidate(&cluster.spec.credentials_ref, namespace)
+            .await;
+        info!(
+            cluster = %cluster.name_any(),
+            "invalidated cached BasisClient after credentials failure"
+        );
+    }
+
+    let api: Api<BasisCluster> = Api::namespaced(ctx.client.clone(), namespace);
+    let existing_conditions = cluster
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    record_failure_status(
+        &api,
+        &cluster.name_any(),
+        cluster.metadata.generation,
+        existing_conditions,
+        err,
+    )
+    .await;
+}
+
 fn error_policy(
     _cluster: Arc<BasisCluster>,
     error: &ClusterError,
-    _ctx: Arc<ClusterContext>,
+    _ctx: Arc<ProviderContext>,
 ) -> Action {
     error!(error = %error, "BasisCluster reconcile error");
     Action::requeue(Duration::from_secs(15))

@@ -15,7 +15,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use basis_common::tls::TlsIdentity;
+use basis_common::tls::{TlsIdentity, CONTROLLER_IDENTITY};
 use basis_proto::{
     basis_client::BasisClient as InnerClient, CreateClusterRequest, CreateMachineRequest,
     DeleteClusterRequest, DeleteMachineRequest, GetClusterRequest, GpuConstraints,
@@ -24,8 +24,6 @@ use basis_proto::{
 use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Response};
-
-const CONTROLLER_SAN: &str = "basis-controller";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -43,6 +41,26 @@ pub enum ClientError {
 
     #[error("controller returned malformed response: {0}")]
     Malformed(&'static str),
+}
+
+impl ClientError {
+    /// True when the failure suggests our cached credentials or endpoint
+    /// no longer match what the controller will accept — bad PEM, wrong
+    /// URL, TLS handshake failure, or an `Unauthenticated`/`PermissionDenied`
+    /// RPC. Callers (the CAPI provider's BasisClientCache) drop the
+    /// cached entry on `true` so the next reconcile re-reads the Secret.
+    /// `Unavailable`/`Unknown`/`DeadlineExceeded` are *not* in this set —
+    /// `call()` already drops the underlying channel for those.
+    pub fn is_credentials_problem(&self) -> bool {
+        match self {
+            ClientError::Tls(_) | ClientError::Endpoint(_) | ClientError::Connect(_) => true,
+            ClientError::Rpc(status) => matches!(
+                status.code(),
+                Code::Unauthenticated | Code::PermissionDenied
+            ),
+            ClientError::Malformed(_) => false,
+        }
+    }
 }
 
 /// A cluster as the caller cares about it — two fields, no proto
@@ -93,40 +111,75 @@ impl BasisClient {
 
     async fn connected_client(&self) -> Result<InnerClient<Channel>, ClientError> {
         let mut guard = self.channel.lock().await;
-        if guard.is_none() {
-            let tls = self.identity.client_config(CONTROLLER_SAN);
-            let channel = Endpoint::from_shared(self.endpoint.clone())
-                .map_err(|e| ClientError::Endpoint(e.to_string()))?
-                .connect_timeout(Duration::from_secs(10))
-                .tls_config(tls)?
-                .connect()
-                .await?;
-            *guard = Some(channel);
-        }
-        Ok(InnerClient::new(guard.as_ref().unwrap().clone()))
+        let channel = match &*guard {
+            Some(ch) => ch.clone(),
+            None => {
+                let tls = self.identity.client_config(CONTROLLER_IDENTITY);
+                let channel = Endpoint::from_shared(self.endpoint.clone())
+                    .map_err(|e| ClientError::Endpoint(e.to_string()))?
+                    .connect_timeout(Duration::from_secs(10))
+                    .tls_config(tls)?
+                    .connect()
+                    .await?;
+                *guard = Some(channel.clone());
+                channel
+            }
+        };
+        Ok(InnerClient::new(channel))
     }
 
     /// Issue one RPC against the controller. Handles channel reuse,
-    /// unwraps the response, and drops the cached channel on errors
-    /// that suggest the underlying transport is dead.
+    /// unwraps the response, drops the cached channel on transport-level
+    /// errors, and retries `Unavailable` with exponential backoff.
+    ///
+    /// `Unavailable` is the controller's way of signalling "retry me" —
+    /// either the controller is momentarily unreachable (channel dead)
+    /// or the agent is shedding load (e.g. LVM backpressure in
+    /// `handlers::create_vm`). Both are transient by contract, both
+    /// idempotent at the server for our RPCs (create by name is
+    /// idempotent; delete is a no-op for a missing resource), so a
+    /// bounded retry loop turns transient backpressure into a
+    /// success-with-latency instead of a failure at the caller.
+    ///
+    /// Budget: ~30s total (500ms + 1s + 2s + 4s + 8s + 15s cap), 5
+    /// attempts. A sustained outage past that still surfaces as an
+    /// error so operators see it; momentary blips are absorbed.
     async fn call<F, Fut, T>(&self, f: F) -> Result<T, ClientError>
     where
-        F: FnOnce(InnerClient<Channel>) -> Fut,
+        F: Fn(InnerClient<Channel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, tonic::Status>>,
     {
-        let client = self.connected_client().await?;
-        match f(client).await {
-            Ok(resp) => Ok(resp.into_inner()),
-            Err(status) => {
-                if matches!(
-                    status.code(),
-                    Code::Unavailable | Code::Unknown | Code::DeadlineExceeded
-                ) {
-                    *self.channel.lock().await = None;
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut delay = Duration::from_millis(500);
+        let mut last_err: Option<tonic::Status> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let client = self.connected_client().await?;
+            match f(client).await {
+                Ok(resp) => return Ok(resp.into_inner()),
+                Err(status) => {
+                    if matches!(
+                        status.code(),
+                        Code::Unavailable | Code::Unknown | Code::DeadlineExceeded
+                    ) {
+                        *self.channel.lock().await = None;
+                    }
+                    if status.code() == Code::Unavailable && attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(15));
+                        last_err = Some(status);
+                        continue;
+                    }
+                    return Err(status.into());
                 }
-                Err(status.into())
             }
         }
+        // Unreachable in practice: the loop either returns Ok, returns
+        // a non-Unavailable Err, or retries up to MAX_ATTEMPTS and
+        // returns the final Unavailable. This arm preserves the last
+        // error if the control flow ever changes.
+        Err(last_err
+            .unwrap_or_else(|| tonic::Status::unavailable("retry budget exhausted"))
+            .into())
     }
 
     pub async fn create_cluster(
@@ -134,10 +187,11 @@ impl BasisClient {
         name: String,
         ip_pool: String,
     ) -> Result<Cluster, ClientError> {
+        let request = CreateClusterRequest { name, ip_pool };
         let resp = self
-            .call(|mut c| async move {
-                c.create_cluster(CreateClusterRequest { name, ip_pool })
-                    .await
+            .call(|mut c| {
+                let request = request.clone();
+                async move { c.create_cluster(request).await }
             })
             .await?;
         Ok(Cluster {
@@ -147,16 +201,22 @@ impl BasisClient {
     }
 
     pub async fn delete_cluster(&self, cluster_id: String) -> Result<(), ClientError> {
-        self.call(
-            |mut c| async move { c.delete_cluster(DeleteClusterRequest { cluster_id }).await },
-        )
+        let request = DeleteClusterRequest { cluster_id };
+        self.call(|mut c| {
+            let request = request.clone();
+            async move { c.delete_cluster(request).await }
+        })
         .await?;
         Ok(())
     }
 
     pub async fn get_cluster(&self, cluster_id: String) -> Result<Cluster, ClientError> {
+        let request = GetClusterRequest { cluster_id };
         let resp = self
-            .call(|mut c| async move { c.get_cluster(GetClusterRequest { cluster_id }).await })
+            .call(|mut c| {
+                let request = request.clone();
+                async move { c.get_cluster(request).await }
+            })
             .await?;
         Ok(Cluster {
             cluster_id: resp.cluster_id,
@@ -189,7 +249,10 @@ impl BasisClient {
                 .map(|min_group_size| GpuConstraints { min_group_size }),
         };
         let resp = self
-            .call(|mut c| async move { c.create_machine(request).await })
+            .call(|mut c| {
+                let request = request.clone();
+                async move { c.create_machine(request).await }
+            })
             .await?;
         // Server-side CreateMachine guarantees these fields on success.
         // Guard the boundary so an empty value never reaches the caller
@@ -216,16 +279,24 @@ impl BasisClient {
     }
 
     pub async fn delete_machine(&self, id: String) -> Result<(), ClientError> {
-        self.call(|mut c| async move { c.delete_machine(DeleteMachineRequest { id }).await })
-            .await?;
+        let request = DeleteMachineRequest { id };
+        self.call(|mut c| {
+            let request = request.clone();
+            async move { c.delete_machine(request).await }
+        })
+        .await?;
         Ok(())
     }
 
     /// List machines, optionally filtered by cluster. Pass an empty
     /// string for `cluster_id` to list across all clusters.
     pub async fn list_machines(&self, cluster_id: String) -> Result<Vec<Machine>, ClientError> {
+        let request = ListMachinesRequest { cluster_id };
         let resp = self
-            .call(|mut c| async move { c.list_machines(ListMachinesRequest { cluster_id }).await })
+            .call(|mut c| {
+                let request = request.clone();
+                async move { c.list_machines(request).await }
+            })
             .await?;
         Ok(resp.machines)
     }

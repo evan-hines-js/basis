@@ -171,28 +171,24 @@ impl NetworkManager {
     /// Create a tap device for a VM and attach it to the bridge.
     /// Fails if the tap already exists — use `ensure_tap` for idempotent creation.
     pub async fn create_tap(&self, vm_id: &str) -> Result<String, NetworkError> {
-        let tap_name = tap_name_for_vm(vm_id);
+        let tap = tap_name(vm_id);
 
-        run_cmd("ip", &["tuntap", "add", &tap_name, "mode", "tap"]).await?;
-        run_cmd(
-            "ip",
-            &["link", "set", &tap_name, "master", &self.bridge_name],
-        )
-        .await?;
-        run_cmd("ip", &["link", "set", &tap_name, "up"]).await?;
+        run_cmd("ip", &["tuntap", "add", &tap, "mode", "tap"]).await?;
+        run_cmd("ip", &["link", "set", &tap, "master", &self.bridge_name]).await?;
+        run_cmd("ip", &["link", "set", &tap, "up"]).await?;
 
-        info!(tap = %tap_name, vm_id = %vm_id, "tap device created");
-        Ok(tap_name)
+        info!(tap = %tap, vm_id = %vm_id, "tap device created");
+        Ok(tap)
     }
 
     /// Idempotent tap creation: if the tap already exists (e.g., agent restart
     /// without node reboot), verify it's attached to the bridge and up. If it
     /// doesn't exist, create it.
     pub async fn ensure_tap(&self, vm_id: &str) -> Result<String, NetworkError> {
-        let tap_name = tap_name_for_vm(vm_id);
+        let tap = tap_name(vm_id);
 
         let exists = tokio::process::Command::new("ip")
-            .args(["link", "show", &tap_name])
+            .args(["link", "show", &tap])
             .output()
             .await?;
 
@@ -204,23 +200,20 @@ impl NetworkManager {
             // dangling tap would produce a VM that reports Running while
             // having no network, which is the one failure mode the
             // controller can't detect. Propagate instead.
-            run_cmd(
-                "ip",
-                &["link", "set", &tap_name, "master", &self.bridge_name],
-            )
-            .await
-            .map_err(|e| NetworkError::TapInconsistent {
-                tap: tap_name.clone(),
-                reason: format!("re-attach to bridge {}: {e}", self.bridge_name),
-            })?;
-            run_cmd("ip", &["link", "set", &tap_name, "up"])
+            run_cmd("ip", &["link", "set", &tap, "master", &self.bridge_name])
                 .await
                 .map_err(|e| NetworkError::TapInconsistent {
-                    tap: tap_name.clone(),
+                    tap: tap.clone(),
+                    reason: format!("re-attach to bridge {}: {e}", self.bridge_name),
+                })?;
+            run_cmd("ip", &["link", "set", &tap, "up"])
+                .await
+                .map_err(|e| NetworkError::TapInconsistent {
+                    tap: tap.clone(),
                     reason: format!("link up: {e}"),
                 })?;
-            info!(tap = %tap_name, vm_id = %vm_id, "tap device already exists, ensured up");
-            return Ok(tap_name);
+            info!(tap = %tap, vm_id = %vm_id, "tap device already exists, ensured up");
+            return Ok(tap);
         }
 
         self.create_tap(vm_id).await
@@ -228,11 +221,10 @@ impl NetworkManager {
 
     /// Delete a tap device.
     pub async fn delete_tap(&self, vm_id: &str) -> Result<(), NetworkError> {
-        let tap_name = tap_name_for_vm(vm_id);
+        let tap = tap_name(vm_id);
 
-        let result = run_cmd("ip", &["link", "delete", &tap_name]).await;
-        if let Err(e) = &result {
-            warn!(tap = %tap_name, error = %e, "failed to delete tap (may already be gone)");
+        if let Err(e) = run_cmd("ip", &["link", "delete", &tap]).await {
+            warn!(tap = %tap, error = %e, "failed to delete tap (may already be gone)");
         }
         Ok(())
     }
@@ -272,35 +264,31 @@ impl NetworkManager {
         Ok(taps)
     }
 
-    /// Delete every tap in `names` via `ip link delete`. Best-effort:
-    /// logs failures but returns Ok — a missing tap is fine (the state
-    /// we want is "gone") and a race with another delete is harmless.
-    pub async fn delete_taps_by_name(&self, names: &[String]) {
-        for tap in names {
-            if let Err(e) = run_cmd("ip", &["link", "delete", tap]).await {
-                warn!(tap, error = %e, "failed to delete orphan tap");
-            } else {
-                info!(tap, "deleted orphan tap");
-            }
+    /// Delete a single tap by its interface name. Used by the orphan
+    /// sweep, which has a tap name (from `bridge link show`) but no
+    /// corresponding vm_id because `tap_name` is a one-way hash.
+    /// A missing tap is not an error — the state we want is "gone".
+    pub async fn delete_tap_by_name(&self, name: &str) -> Result<(), NetworkError> {
+        if let Err(e) = run_cmd("ip", &["link", "delete", name]).await {
+            warn!(tap = %name, error = %e, "failed to delete tap (may already be gone)");
         }
+        Ok(())
     }
-}
-
-/// Public so reconcile can compute the expected set for orphan detection.
-pub fn tap_name(vm_id: &str) -> String {
-    tap_name_for_vm(vm_id)
 }
 
 const TAP_PREFIX: &str = "bas";
 
-/// Generate a tap device name from a VM ID.
-/// Tap names are limited to 15 chars on Linux, so we use a short prefix + hash.
-fn tap_name_for_vm(vm_id: &str) -> String {
+/// Deterministic tap device name for a VM ID.
+///
+/// Linux caps interface names at 15 chars (IFNAMSIZ); a 3-char prefix
+/// plus a 10-hex hash fits with one byte to spare. Public so reconcile
+/// can compute the expected set for orphan detection.
+pub fn tap_name(vm_id: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     vm_id.hash(&mut hasher);
     let hash = hasher.finish();
-    format!("bas{:010x}", hash & 0xff_ffff_ffff)
+    format!("{TAP_PREFIX}{:010x}", hash & 0xff_ffff_ffff)
 }
 
 async fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), NetworkError> {
@@ -324,22 +312,22 @@ mod tests {
     #[test]
     fn test_tap_name_fits_linux_limit() {
         // Linux tap device names are limited to 15 characters (IFNAMSIZ)
-        let name = tap_name_for_vm("3f8a1b2c-7d9e-4f1a-b5c3-2e8f6a9d0b1e");
+        let name = tap_name("3f8a1b2c-7d9e-4f1a-b5c3-2e8f6a9d0b1e");
         assert!(name.len() <= 15, "tap name '{}' exceeds 15 chars", name);
         assert!(name.starts_with("bas"));
     }
 
     #[test]
     fn test_tap_name_deterministic() {
-        let a = tap_name_for_vm("vm-123");
-        let b = tap_name_for_vm("vm-123");
+        let a = tap_name("vm-123");
+        let b = tap_name("vm-123");
         assert_eq!(a, b);
     }
 
     #[test]
     fn test_tap_name_unique_for_different_vms() {
-        let a = tap_name_for_vm("vm-1");
-        let b = tap_name_for_vm("vm-2");
+        let a = tap_name("vm-1");
+        let b = tap_name("vm-2");
         assert_ne!(a, b);
     }
 }

@@ -10,6 +10,7 @@ use basis_agent::handlers;
 use basis_agent::host_info::HostResources;
 use basis_agent::image::ImageManager;
 use basis_agent::lvm;
+use basis_agent::metrics::{self, Metrics};
 use basis_agent::network::NetworkManager;
 use basis_agent::reconcile;
 use basis_agent::vm::VmManager;
@@ -18,19 +19,74 @@ use basis_proto::*;
 use clap::Parser;
 use futures::StreamExt;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Endpoint;
 use tonic::Streaming;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// Cadence of the agent's heartbeat to the controller. Paired with the
+/// controller's `HEARTBEAT_STALE_THRESHOLD` (90 s = three intervals) so
+/// a single missed beat doesn't flip the host unhealthy.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Cadence of the agent-side periodic local reconcile, which detects
+/// VMs the local DB believes are running but that systemd has lost
+/// (crash, OOM, manual stop) and reports them as FAILED.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wait between failed connect attempts. Short enough that recovery
+/// from a controller restart is sub-10s; long enough that we don't
+/// hammer a permanently-down endpoint.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+/// Per-attempt connect deadline to the controller. Generous because
+/// the agent has nothing else to do; longer waits mostly hurt the
+/// "controller permanently down" case which isn't latency-sensitive.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The SAN the controller's server certificate must carry.
-const CONTROLLER_SAN: &str = "basis-controller";
+
+/// Cadence for logging thin-pool capacity. Coarser than the heartbeat
+/// because operators don't need second-by-second fill graphs, and
+/// because every query forks `lvs` which can stall behind a busy VG
+/// lock during mass VM teardown. Decoupled from `HEARTBEAT_INTERVAL`
+/// so a stuck `lvs` can never delay a heartbeat.
+const POOL_CAPACITY_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Upper bound on a single `lvs` call. If LVM is wedged long enough
+/// that we can't probe capacity, we log a warning and move on rather
+/// than accumulating stuck tasks.
+const POOL_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Idle cadence for the periodic orphan sweep. Reclaims systemd units,
+/// LVs, and taps whose owning VM id is no longer in the agent DB or
+/// running unit set. Handles the residue of `delete_vm` calls whose
+/// `lvremove` raced with a not-yet-released block-device handle and got
+/// skipped best-effort.
+///
+/// Used only when the previous pass found nothing to reclaim. On a
+/// non-zero pass the loop tail-chases at `ORPHAN_SWEEP_BUSY_INTERVAL`
+/// so a churn-heavy fleet drains its backlog in seconds instead of
+/// letting stale LVs accrete for multiples of this interval. For a
+/// long-running agent that's where the value is: self-healing is load-
+/// proportional rather than fixed.
+const ORPHAN_SWEEP_IDLE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Wake interval after a non-zero sweep pass. Short enough to drain a
+/// large backlog quickly (hundreds of orphans in minutes, not hours);
+/// not so short that failed-lvremove retries hammer the thin pool.
+const ORPHAN_SWEEP_BUSY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Defense-in-depth grace window for periodic `ReconcileHostCommand`
+/// pushes: a VM younger than this is *not* deleted on a single push
+/// that omits it, so an in-flight CreateMachine the controller hasn't
+/// fully recorded yet can't be wiped out by a misbehaving controller.
+/// Sized to comfortably exceed the controller's `CREATE_MACHINE_TIMEOUT`
+/// of 600 s would be too long; 120 s covers a normal cold-start
+/// (~20 s) plus headroom. The post-register reconcile *does not* apply
+/// this grace — that one trusts the controller's authoritative list
+/// because the agent has been offline.
+const PERIODIC_RECONCILE_GRACE: Duration = Duration::from_secs(120);
 
 #[derive(Parser)]
 #[command(name = "basis-agent", about = "Basis hypervisor agent")]
@@ -46,8 +102,9 @@ struct AgentRuntime {
     spec: HostSpec,
     agent_db: AgentDb,
     image_mgr: Arc<ImageManager>,
-    vm_mgr: Arc<Mutex<VmManager>>,
+    vm_mgr: Arc<VmManager>,
     net_mgr: Arc<NetworkManager>,
+    metrics: Arc<Metrics>,
     host_resources: HostResources,
     gpus: Vec<GpuInfo>,
     /// Flipped by the SIGHUP handler when the current stream should be
@@ -79,6 +136,23 @@ async fn main() -> anyhow::Result<()> {
 
     let runtime = Arc::new(tokio::sync::RwLock::new(initialize_runtime(host).await?));
     spawn_reload_loop(cli.config.clone(), runtime.clone());
+
+    // Expose Prometheus `/metrics` on a plain-HTTP port alongside the
+    // agent's gRPC stream to the controller. Separate port, no TLS —
+    // Prometheus scrapes it locally or via the observability stack's
+    // `basis-agents` job. Lives for the process lifetime; the shutdown
+    // token is a stub since the agent exits by process termination.
+    {
+        let metrics_listen = runtime.read().await.spec.metrics_listen.clone();
+        let metrics = runtime.read().await.metrics.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                metrics::run_server(metrics, &metrics_listen, CancellationToken::new()).await
+            {
+                error!(error = %e, "agent metrics server exited");
+            }
+        });
+    }
 
     loop {
         let (endpoint, reconnect) = {
@@ -167,7 +241,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
             .collect(),
         iso_tool,
     )?);
-    let vm_mgr = Arc::new(Mutex::new(VmManager::new(spec.vms_dir())));
+    let vm_mgr = Arc::new(VmManager::new(spec.vms_dir()));
     let net_mgr = Arc::new(net_mgr);
 
     let report =
@@ -198,6 +272,9 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         "discovered host resources"
     );
 
+    let metrics = Metrics::new().context("constructing agent metrics registry")?;
+    metrics.install_global();
+
     Ok(AgentRuntime {
         hostname,
         spec,
@@ -205,6 +282,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         image_mgr,
         vm_mgr,
         net_mgr,
+        metrics,
         host_resources,
         gpus,
         reconnect_signal: CancellationToken::new(),
@@ -282,7 +360,7 @@ async fn run_session(
         (rt.spec.controller_endpoint.clone(), rt.spec.tls.clone())
     };
 
-    let tls_config = tls.client_config(CONTROLLER_SAN)?;
+    let tls_config = tls.client_config(basis_common::tls::CONTROLLER_IDENTITY)?;
     let channel = Endpoint::from_shared(endpoint_url)?
         .connect_timeout(CONNECT_TIMEOUT)
         .keep_alive_timeout(Duration::from_secs(20))
@@ -314,7 +392,9 @@ async fn run_session(
     }
 
     spawn_heartbeat_loop(msg_tx.clone(), host_id.clone());
+    spawn_pool_capacity_loop();
     spawn_periodic_reconciler(msg_tx.clone(), runtime.clone());
+    spawn_orphan_sweep_loop(runtime.clone());
 
     process_inbound(&mut inbound, runtime, msg_tx, reconnect).await
 }
@@ -342,7 +422,6 @@ async fn send_register(
                 total_memory_mib: rt.host_resources.total_memory_mib,
                 total_disk_gib: rt.host_resources.total_disk_gib,
                 gpus: gpu_devices,
-                iommu_groups: Vec::new(),
             })),
         })
         .await?;
@@ -375,6 +454,7 @@ async fn handshake(
         &rt.vm_mgr,
         &rt.net_mgr,
         &rt.agent_db,
+        Duration::ZERO,
     )
     .await?;
     Ok(ack.host_id)
@@ -385,20 +465,6 @@ fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>, host_id: String) {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
-            // Log pool capacity locally every heartbeat. Metadata free is
-            // the silent killer of thin pools — when it fills up the pool
-            // goes read-only and every running VM's disk errors out. No
-            // prometheus yet, so the journal is the warning channel.
-            match lvm::pool_capacity().await {
-                Ok(c) => info!(
-                    pool_data_free_gib = c.data_free_bytes / (1 << 30),
-                    pool_data_total_gib = c.data_total_bytes / (1 << 30),
-                    pool_metadata_free_mib = c.metadata_free_bytes / (1 << 20),
-                    pool_metadata_total_mib = c.metadata_total_bytes / (1 << 20),
-                    "thin pool capacity"
-                ),
-                Err(e) => warn!(error = %e, "reading thin pool capacity"),
-            }
             let msg = AgentMessage {
                 payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
                     host_id: host_id.clone(),
@@ -411,10 +477,80 @@ fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>, host_id: String) {
     });
 }
 
-/// Periodic local reconciliation loop. Detects VMs the local DB believes
-/// are running but that systemd has lost (crash, OOM, manual stop) and
-/// reports them as FAILED. No neighbor awareness — the agent diagnoses
-/// drift on its own and lets the controller decide what to do about it.
+/// Periodically log thin-pool capacity. Metadata free is the silent
+/// killer of thin pools — when it fills up the pool goes read-only and
+/// every running VM's disk errors out. No prometheus yet, so the
+/// journal is the warning channel.
+///
+/// Runs independently of the heartbeat so an `lvs` that gets stuck
+/// behind a busy VG lock (e.g. during mass VM teardown) can't delay
+/// liveness reporting.
+fn spawn_pool_capacity_loop() {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(POOL_CAPACITY_INTERVAL);
+        loop {
+            interval.tick().await;
+            match tokio::time::timeout(POOL_CAPACITY_TIMEOUT, lvm::pool_capacity()).await {
+                Ok(Ok(c)) => info!(
+                    pool_data_free_gib = c.data_free_bytes / (1 << 30),
+                    pool_data_total_gib = c.data_total_bytes / (1 << 30),
+                    pool_metadata_free_mib = c.metadata_free_bytes / (1 << 20),
+                    pool_metadata_total_mib = c.metadata_total_bytes / (1 << 20),
+                    "thin pool capacity"
+                ),
+                Ok(Err(e)) => warn!(error = %e, "reading thin pool capacity"),
+                Err(_) => warn!(
+                    timeout_secs = POOL_CAPACITY_TIMEOUT.as_secs(),
+                    "thin pool capacity query timed out — LVM likely busy"
+                ),
+            }
+        }
+    });
+}
+
+/// Periodic orphan sweep. Reclaims host-level resources (systemd units,
+/// LVs, taps) that no authoritative source claims — typically the
+/// residue of `delete_vm` calls where `lvremove` raced with a held
+/// block-device handle and was skipped best-effort.
+///
+/// Adaptive cadence, not a fixed tick: on an idle fleet this runs every
+/// `ORPHAN_SWEEP_IDLE_INTERVAL`; on a churning fleet with a backlog the
+/// loop immediately re-enters after a non-zero pass, draining the
+/// backlog load-proportionally. This is what lets a long-lived agent
+/// self-heal after hours of crash/restart noise without needing an
+/// operator to prune the thin pool by hand.
+fn spawn_orphan_sweep_loop(runtime: Arc<tokio::sync::RwLock<AgentRuntime>>) {
+    tokio::spawn(async move {
+        // Skip an immediate first sweep: startup already ran a full
+        // reconcile including the orphan sweep, so there's nothing to
+        // reclaim yet.
+        tokio::time::sleep(ORPHAN_SWEEP_IDLE_INTERVAL).await;
+        loop {
+            let sleep = {
+                let rt = runtime.read().await;
+                match reconcile::periodic_sweep(&rt.agent_db, &rt.vm_mgr, rt.net_mgr.as_ref()).await
+                {
+                    Ok(0) => ORPHAN_SWEEP_IDLE_INTERVAL,
+                    Ok(n) => {
+                        info!(reclaimed = n, "orphan sweep reclaimed resources");
+                        ORPHAN_SWEEP_BUSY_INTERVAL
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "orphan sweep failed");
+                        ORPHAN_SWEEP_IDLE_INTERVAL
+                    }
+                }
+            };
+            tokio::time::sleep(sleep).await;
+        }
+    });
+}
+
+/// Periodic state-report loop. Tells the controller the current state
+/// (Running or Failed) of every locally-known VM on `RECONCILE_INTERVAL`,
+/// catching VMs whose systemd scope has disappeared (crash, OOM, manual
+/// stop). Same function as the post-handshake catch-up so there's one
+/// definition of "what state report should look like."
 fn spawn_periodic_reconciler(
     sender: mpsc::Sender<AgentMessage>,
     runtime: Arc<tokio::sync::RwLock<AgentRuntime>>,
@@ -427,9 +563,10 @@ fn spawn_periodic_reconciler(
         loop {
             interval.tick().await;
             let rt = runtime.read().await;
-            if let Err(e) = handlers::reconcile_running_vms(&rt.agent_db, &rt.vm_mgr, &sender).await
+            if let Err(e) =
+                handlers::report_local_vm_states(&rt.agent_db, &rt.vm_mgr, &sender).await
             {
-                warn!(error = %e, "periodic reconcile failed");
+                warn!(error = %e, "periodic state report failed");
             }
         }
     });
@@ -490,24 +627,56 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
             &rt.vm_mgr,
             rt.net_mgr.as_ref(),
             &rt.agent_db,
+            rt.metrics.as_ref(),
         )
         .await;
 
-        let (state, err) = match result {
-            Ok(()) => (MachineState::Running, String::new()),
+        let (state, err, transient) = match result {
+            Ok(()) => (MachineState::Running, String::new(), false),
             Err(e) => {
-                error!(vm_id = %cmd.vm_id, error = %e, "VM creation failed");
-                (MachineState::Failed, e.to_string())
+                // Walk the error chain to detect `LvmError::Busy` — this
+                // is a load-shedding signal, not a real fault. The
+                // controller's caller should retry the create on this
+                // response instead of bubbling a failure to the user.
+                let transient = e.chain().any(|c| {
+                    matches!(
+                        c.downcast_ref::<lvm::LvmError>(),
+                        Some(lvm::LvmError::Busy(_))
+                    )
+                });
+                if transient {
+                    warn!(vm_id = %cmd.vm_id, error = %e, "VM creation shed for backpressure");
+                } else {
+                    error!(vm_id = %cmd.vm_id, error = %e, "VM creation failed");
+                }
+                (MachineState::Failed, e.to_string(), transient)
             }
         };
-        handlers::send_vm_state(&sender, cmd.vm_id, state, err).await;
+        handlers::send_vm_state(&sender, cmd.vm_id, state, err, transient).await;
     });
 }
 
+/// Controller-initiated delete. Reports the outcome back via the
+/// standard `ReportVMStateRequest` path so the controller's
+/// `DeleteCluster` / `DeleteMachine` RPC can block on real cleanup
+/// completion — that's what bounds queue depth under load
+/// (workers wait on the delete RPC rather than pipelining the next
+/// create behind an unresolved delete).
 fn spawn_delete(cmd: DeleteVmCommand, rt: TaskContext, sender: mpsc::Sender<AgentMessage>) {
     tokio::spawn(async move {
-        handlers::delete_vm(&cmd.vm_id, &rt.vm_mgr, rt.net_mgr.as_ref(), &rt.agent_db).await;
-        handlers::send_vm_state(&sender, cmd.vm_id, MachineState::Stopped, String::new()).await;
+        // Every surfaced delete error is retry-worthy: the only step
+        // that returns an error is `lvremove`, and either the kernel
+        // has the device still pending release (transient, next retry
+        // succeeds) or lvm2 itself is busy (semaphore timeout). The
+        // orphan sweep is the backstop if retries eventually give up.
+        let (state, err, transient) =
+            match handlers::delete_vm(&cmd.vm_id, &rt.vm_mgr, rt.net_mgr.as_ref(), &rt.agent_db)
+                .await
+            {
+                Ok(()) => (MachineState::Stopped, String::new(), false),
+                Err(e) => (MachineState::Failed, e.to_string(), true),
+            };
+        handlers::send_vm_state(&sender, cmd.vm_id, state, err, transient).await;
     });
 }
 
@@ -523,6 +692,7 @@ fn spawn_reconcile(cmd: ReconcileHostCommand, rt: TaskContext) {
             &rt.vm_mgr,
             rt.net_mgr.as_ref(),
             &rt.agent_db,
+            PERIODIC_RECONCILE_GRACE,
         )
         .await
         {
@@ -535,8 +705,9 @@ fn spawn_reconcile(cmd: ReconcileHostCommand, rt: TaskContext) {
 struct TaskContext {
     agent_db: AgentDb,
     image_mgr: Arc<ImageManager>,
-    vm_mgr: Arc<Mutex<VmManager>>,
+    vm_mgr: Arc<VmManager>,
     net_mgr: Arc<NetworkManager>,
+    metrics: Arc<Metrics>,
 }
 
 impl AgentRuntime {
@@ -546,6 +717,7 @@ impl AgentRuntime {
             image_mgr: self.image_mgr.clone(),
             vm_mgr: self.vm_mgr.clone(),
             net_mgr: self.net_mgr.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }

@@ -119,6 +119,24 @@ impl BasisControllerSpec {
     }
 }
 
+/// Parse a CIDR string like `"10.0.10.0/24"` and return the prefix
+/// length. Used by both config validation (loud anyhow error) and the
+/// runtime allocator path (typed `DbError::MalformedIpPool`).
+pub fn parse_cidr_prefix(cidr: &str) -> anyhow::Result<u8> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("cidr '{cidr}' must be in the form 'A.B.C.D/N'"))?;
+    addr.parse::<std::net::Ipv4Addr>()
+        .map_err(|e| anyhow::anyhow!("cidr '{cidr}' has bad address: {e}"))?;
+    let n: u8 = prefix
+        .parse()
+        .map_err(|e| anyhow::anyhow!("cidr '{cidr}' prefix '{prefix}' is not a u8: {e}"))?;
+    if n > 32 {
+        anyhow::bail!("cidr '{cidr}' prefix /{n} exceeds 32");
+    }
+    Ok(n)
+}
+
 impl IpPool {
     /// Parse every IP field and confirm the ranges are non-empty and
     /// disjoint. Called from [`BasisControllerSpec::validate`] so a
@@ -129,6 +147,7 @@ impl IpPool {
             s.parse::<Ipv4Addr>()
                 .map_err(|e| anyhow::anyhow!("{label} '{s}' is not a valid IPv4 address: {e}"))
         };
+        parse_cidr_prefix(&self.cidr)?;
         parse_ip("gateway", &self.gateway)?;
         let vm_start = parse_ip("vmRange.start", &self.vm_range.start)?;
         let vm_end = parse_ip("vmRange.end", &self.vm_range.end)?;
@@ -136,14 +155,10 @@ impl IpPool {
         let vip_end = parse_ip("vipRange.end", &self.vip_range.end)?;
 
         if u32::from(vm_start) > u32::from(vm_end) {
-            anyhow::bail!(
-                "vmRange.start ({vm_start}) must be <= vmRange.end ({vm_end})"
-            );
+            anyhow::bail!("vmRange.start ({vm_start}) must be <= vmRange.end ({vm_end})");
         }
         if u32::from(vip_start) > u32::from(vip_end) {
-            anyhow::bail!(
-                "vipRange.start ({vip_start}) must be <= vipRange.end ({vip_end})"
-            );
+            anyhow::bail!("vipRange.start ({vip_start}) must be <= vipRange.end ({vip_end})");
         }
 
         // Ranges must be disjoint — the allocator keys off range

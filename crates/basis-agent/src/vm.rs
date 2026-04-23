@@ -25,11 +25,12 @@
 //! fall back to `systemctl stop`. The directory cleanup is best-effort
 //! because the VM dir is regenerated on next create anyway.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use basis_proto::CreateVmCommand;
@@ -48,13 +49,45 @@ pub enum VmError {
 
 /// Tracks a running VM managed by a systemd transient unit.
 struct TrackedVm {
-    pub unit_name: String,
-    pub vm_dir: PathBuf,
+    unit_name: String,
+    vm_dir: PathBuf,
 }
 
+/// Host-resolved artifacts handed to `create_vm`. Grouped so the spawn
+/// signature stays readable and so a caller can't accidentally transpose
+/// `kernel` and `initrd`.
+pub struct BootArtifacts<'a> {
+    pub kernel: &'a Path,
+    pub initrd: &'a Path,
+    /// Raw LVM thin snapshot that becomes the guest rootfs.
+    pub rootfs: &'a Path,
+    /// Generated cloud-init cidata ISO attached as a second disk.
+    pub cloud_init: &'a Path,
+}
+
+/// Owner of "VMs running on this host" state.
+///
+/// Interior mutability over `tracked` / `pending` so callers share a
+/// single `Arc<VmManager>` instead of `Arc<Mutex<VmManager>>`. This
+/// lets concurrent `create_vm` calls run their `systemd-run` spawns in
+/// parallel — locks are held only during brief map mutations, not
+/// across I/O.
+///
+/// Two sets, distinct concepts:
+///   - `tracked`: the VM has a live systemd unit. Populated after
+///     `systemd-run` returns, cleared when `delete_vm` starts.
+///   - `pending`: the VM's DB row exists but the systemd unit hasn't
+///     spawned yet — i.e. we're mid-create. Populated by
+///     [`crate::handlers::create_vm`] before the DB insert, cleared
+///     when the whole create flow exits (success or rollback).
+///
+/// `is_running` returns true for either — so the periodic reconciler
+/// doesn't mis-diagnose an in-flight create as a crashed VM and fire
+/// off a bogus FAILED report to the controller.
 pub struct VmManager {
     pub vms_dir: PathBuf,
-    tracked: HashMap<String, TrackedVm>,
+    tracked: Mutex<HashMap<String, TrackedVm>>,
+    pending: Mutex<HashSet<String>>,
 }
 
 impl VmManager {
@@ -62,8 +95,21 @@ impl VmManager {
         std::fs::create_dir_all(&vms_dir).ok();
         Self {
             vms_dir,
-            tracked: HashMap::new(),
+            tracked: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Mark a VM as mid-create. Must be called before any state that
+    /// the reconciler can observe (the DB row insert, host resources).
+    pub async fn mark_pending(&self, vm_id: &str) {
+        self.pending.lock().await.insert(vm_id.to_string());
+    }
+
+    /// Unmark. Called from the create wrapper on both success and
+    /// rollback; idempotent so double-clear is safe.
+    pub async fn clear_pending(&self, vm_id: &str) {
+        self.pending.lock().await.remove(vm_id);
     }
 
     /// Spawn a cloud-hypervisor process for a VM as a systemd transient unit.
@@ -74,12 +120,9 @@ impl VmManager {
     /// - Journal logging per VM (`journalctl -u basis-vm-<id>`)
     /// - `systemctl` visibility for debugging
     pub async fn create_vm(
-        &mut self,
+        &self,
         cmd: &CreateVmCommand,
-        kernel_path: &Path,
-        initrd_path: &Path,
-        disk_path: &Path,
-        cloud_init_path: &Path,
+        boot: &BootArtifacts<'_>,
         tap_name: &str,
         vfio_devices: &[String],
     ) -> Result<(), VmError> {
@@ -137,8 +180,8 @@ impl VmManager {
             format!("--api-socket={}", socket_path.to_string_lossy()),
             format!("--cpus=boot={}", cmd.cpu),
             format!("--memory=size={}M", cmd.memory_mib),
-            format!("--kernel={}", kernel_path.to_string_lossy()),
-            format!("--initramfs={}", initrd_path.to_string_lossy()),
+            format!("--kernel={}", boot.kernel.to_string_lossy()),
+            format!("--initramfs={}", boot.initrd.to_string_lossy()),
             // transparent_hugepage=never: etcd's own docs call this out —
             // THP defragmentation stalls the mutator for seconds at a
             // time, which pushes WAL fsync latency past raft election
@@ -152,10 +195,10 @@ impl VmManager {
             "--disk".to_string(),
             format!(
                 "path={},image_type=raw,direct=on,num_queues={},queue_size=256",
-                disk_path.to_string_lossy(),
+                boot.rootfs.to_string_lossy(),
                 cmd.cpu
             ),
-            format!("path={}", cloud_init_path.to_string_lossy()),
+            format!("path={}", boot.cloud_init.to_string_lossy()),
         ];
 
         if !vfio_devices.is_empty() {
@@ -202,14 +245,16 @@ impl VmManager {
         }
 
         self.tracked
+            .lock()
+            .await
             .insert(cmd.vm_id.clone(), TrackedVm { unit_name, vm_dir });
 
         Ok(())
     }
 
     /// Shut down and clean up a VM.
-    pub async fn delete_vm(&mut self, vm_id: &str) -> Result<(), VmError> {
-        let tracked = self.tracked.remove(vm_id);
+    pub async fn delete_vm(&self, vm_id: &str) -> Result<(), VmError> {
+        let tracked = self.tracked.lock().await.remove(vm_id);
         let unit_name = tracked
             .as_ref()
             .map(|t| t.unit_name.clone())
@@ -232,6 +277,22 @@ impl VmManager {
             .output()
             .await;
 
+        // Drain pending udev events before returning. `systemctl stop`
+        // returns once qemu has exited, but the kernel's block-device
+        // release for `/dev/basis/vm-<id>` is asynchronous — for a
+        // brief window (<100ms in practice, longer under I/O load) the
+        // LV is still marked in-use by udev even with no fds open. The
+        // caller's next step is `lvm::remove_vm_lv`, which in that
+        // window gets EBUSY; since the error is logged-and-skipped at
+        // the handler level, a lost race leaks the LV permanently. A
+        // bounded `udevadm settle` closes the race at its source so
+        // the reconciler only has to mop up genuine crash-time
+        // orphans, not happy-path releases.
+        let _ = Command::new("udevadm")
+            .args(["settle", "--timeout=5"])
+            .output()
+            .await;
+
         // Clean up VM directory (overlay, cloud-init, socket)
         if vm_dir.exists() {
             std::fs::remove_dir_all(&vm_dir).ok();
@@ -249,7 +310,7 @@ impl VmManager {
     /// 2. Match them against what the controller expects (via the stream)
     /// 3. Track the ones the controller knows about
     /// 4. Kill any orphans the controller doesn't know about
-    pub async fn reconcile_running(&mut self) -> Result<Vec<String>, VmError> {
+    pub async fn reconcile_running(&self) -> Result<Vec<String>, VmError> {
         let output = Command::new("systemctl")
             .args([
                 "list-units",
@@ -264,6 +325,7 @@ impl VmManager {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut running_vm_ids = Vec::new();
+        let mut to_track = Vec::new();
 
         for line in stdout.lines() {
             let unit = line.split_whitespace().next().unwrap_or("");
@@ -272,16 +334,19 @@ impl VmManager {
                 .and_then(|s| s.strip_suffix(".service"))
             {
                 running_vm_ids.push(vm_id.to_string());
-
-                let vm_dir = self.vms_dir.join(vm_id);
-                self.tracked.insert(
+                to_track.push((
                     vm_id.to_string(),
                     TrackedVm {
                         unit_name: unit.to_string(),
-                        vm_dir,
+                        vm_dir: self.vms_dir.join(vm_id),
                     },
-                );
+                ));
             }
+        }
+
+        let mut tracked = self.tracked.lock().await;
+        for (id, tv) in to_track {
+            tracked.insert(id, tv);
         }
 
         info!(
@@ -291,12 +356,8 @@ impl VmManager {
         Ok(running_vm_ids)
     }
 
-    pub fn is_running(&self, vm_id: &str) -> bool {
-        self.tracked.contains_key(vm_id)
-    }
-
-    pub fn tracked_vm_ids(&self) -> Vec<String> {
-        self.tracked.keys().cloned().collect()
+    pub async fn is_running(&self, vm_id: &str) -> bool {
+        self.tracked.lock().await.contains_key(vm_id) || self.pending.lock().await.contains(vm_id)
     }
 }
 
