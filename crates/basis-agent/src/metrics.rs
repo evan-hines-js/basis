@@ -50,6 +50,7 @@ pub struct Metrics {
 
     pub image_ensure_cached_seconds: Histogram,
     pub lv_snapshot_seconds: Histogram,
+    pub data_disk_create_seconds: Histogram,
     pub cloud_init_iso_seconds: Histogram,
     pub tap_create_seconds: Histogram,
     pub vfio_bind_seconds: Histogram,
@@ -105,6 +106,17 @@ impl Metrics {
             .buckets(buckets.clone()),
         )?;
         registry.register(Box::new(lv_snapshot_seconds.clone()))?;
+
+        let data_disk_create_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "basis_agent_data_disk_create_seconds",
+                "Elapsed seconds to create every extra data-disk LV for one \
+                 VM. Scales with the number of data disks requested; zero \
+                 observations on VMs that request none",
+            )
+            .buckets(buckets.clone()),
+        )?;
+        registry.register(Box::new(data_disk_create_seconds.clone()))?;
 
         let cloud_init_iso_seconds = Histogram::with_opts(
             HistogramOpts::new(
@@ -176,6 +188,7 @@ impl Metrics {
             registry,
             image_ensure_cached_seconds,
             lv_snapshot_seconds,
+            data_disk_create_seconds,
             cloud_init_iso_seconds,
             tap_create_seconds,
             vfio_bind_seconds,

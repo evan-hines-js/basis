@@ -83,6 +83,20 @@ message CreateMachineRequest {
   bytes bootstrap_data = 7;
   uint32 gpus = 8;
   GPUConstraints gpu_constraints = 9;
+  // Additional raw block devices to attach to the guest alongside the
+  // rootfs. Each becomes a plain virtio-blk device (`/dev/vdb`, `/dev/vdc`,
+  // …). Basis does not format, partition, or mount them — they're handed
+  // to the guest unformatted so an in-cluster storage operator (Rook/Ceph)
+  // can claim and manage them directly.
+  repeated ExtraDisk extra_disks = 10;
+}
+
+// A raw data disk requested alongside a VM's rootfs. Deliberately
+// minimal: just a size. Basis creates an LVM thin volume of this size
+// and attaches it as a virtio-blk device; anything richer (filesystem,
+// partitioning, mount point, device class) is the guest's problem.
+message ExtraDisk {
+  uint32 size_gib = 1;
 }
 
 message CreateMachineResponse {
@@ -129,6 +143,12 @@ message Machine {
   // Surfaced by basis-capi-provider onto BasisMachine.status.failureMessage
   // so operators see the actual fault rather than a generic "VM failed".
   string error_message = 12;
+  // Extra raw data disks provisioned alongside the rootfs, in the
+  // order the guest enumerates them after `/dev/vda` (rootfs) and
+  // `/dev/vdb` (cloud-init ISO). Echoed from the caller's
+  // `CreateMachineRequest.extra_disks` so CAPI reconcilers can compare
+  // against the desired spec without a second lookup.
+  repeated ExtraDisk extra_disks = 13;
 }
 
 // GPU detail exposed to CAPI consumers. Strictly a subset of the internal
@@ -255,6 +275,12 @@ message CreateVMCommand {
   // PCI addresses of GPUs selected by the scheduler. The agent binds
   // these to vfio-pci and passes them to cloud-hypervisor.
   repeated string gpu_pci_addresses = 14;
+  // Forwarded from `CreateMachineRequest.extra_disks`. Order is
+  // stable and load-bearing: the N'th entry becomes `vmdata-<vm_id>-<N>`
+  // in LVM and enumerates as the (N+1)'th virtio-blk device in the
+  // guest (after rootfs and cloud-init ISO). Agents must preserve it
+  // so a restart reattaches the same disk at the same index.
+  repeated ExtraDisk extra_disks = 15;
 }
 
 message DeleteVMCommand {

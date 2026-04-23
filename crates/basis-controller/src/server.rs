@@ -635,6 +635,9 @@ impl basis_server::Basis for BasisApiService {
 
         let gpu_json = serde_json::to_string(&gpu_devices)
             .expect("serializing Vec<GpuDevice> to JSON is infallible");
+        let extra_disk_gibs: Vec<u32> = req.extra_disks.iter().map(|d| d.size_gib).collect();
+        let extra_disk_json = serde_json::to_string(&extra_disk_gibs)
+            .expect("serializing Vec<u32> to JSON is infallible");
         let vm = VmRow {
             id: vm_id.clone(),
             name: req.name.clone(),
@@ -646,6 +649,7 @@ impl basis_server::Basis for BasisApiService {
             memory_mib: req.memory_mib as i64,
             disk_gib: req.disk_gib as i64,
             gpu_assignments: gpu_json,
+            extra_disk_gibs: extra_disk_json,
             image: req.image.clone(),
             error_message: String::new(),
             created_at: now.clone(),
@@ -717,6 +721,7 @@ impl basis_server::Basis for BasisApiService {
                 gpu_constraints: req.gpu_constraints,
                 dns_servers: self.dns_servers.as_ref().clone(),
                 gpu_pci_addresses: gpu_devices.iter().map(|g| g.pci_address.clone()).collect(),
+                extra_disks: req.extra_disks,
             })),
         };
 
@@ -1294,6 +1299,12 @@ fn vm_to_machine(vm: &VmRow) -> Machine {
         })
         .collect();
 
+    let extra_disks: Vec<ExtraDisk> =
+        parse_owned_json::<Vec<u32>>(&vm.extra_disk_gibs, "vms.extra_disk_gibs")
+            .into_iter()
+            .map(|size_gib| ExtraDisk { size_gib })
+            .collect();
+
     // `vms.cpu/memory_mib/disk_gib` originate from u32-typed proto
     // fields and are CHECK-bounded by sqlite (see migration). A panic
     // here would mean the DB was hand-edited to an out-of-range value;
@@ -1320,5 +1331,6 @@ fn vm_to_machine(vm: &VmRow) -> Machine {
         disk_gib: narrow("disk_gib", vm.disk_gib),
         gpus,
         error_message: vm.error_message.clone(),
+        extra_disks,
     }
 }

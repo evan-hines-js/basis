@@ -118,6 +118,12 @@ pub struct BasisMachineSpec {
     pub gpus: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_constraints: Option<GpuConstraints>,
+    /// Raw data disks (GiB each) to attach alongside the rootfs. Basis
+    /// hands them to the guest unformatted so a Kubernetes storage
+    /// operator (Rook/Ceph) can claim and manage them. Order is stable;
+    /// the N'th entry becomes `/dev/vd{c,d,...}` in the guest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_disk_gibs: Vec<u32>,
     /// Set by the provider after CreateMachine succeeds. The JSON field
     /// is `providerID` (not `providerId`) to match the CAPI contract —
     /// CAPI's Machine reconciler reads this exact path off the

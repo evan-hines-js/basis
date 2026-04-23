@@ -15,6 +15,10 @@ pub enum SchedulerError {
 pub struct ScheduleRequest {
     pub cpu: u32,
     pub memory_mib: u32,
+    /// Full host-side disk footprint — rootfs plus every extra data
+    /// disk. The scheduler compares this directly against the host's
+    /// free thin-pool capacity; callers that only supply rootfs
+    /// would silently over-place any VM that asked for extras.
     pub disk_gib: u32,
     pub gpus: u32,
     pub min_group_size: u32,
@@ -22,10 +26,11 @@ pub struct ScheduleRequest {
 
 impl From<&CreateMachineRequest> for ScheduleRequest {
     fn from(req: &CreateMachineRequest) -> Self {
+        let extras_total: u32 = req.extra_disks.iter().map(|d| d.size_gib).sum();
         Self {
             cpu: req.cpu,
             memory_mib: req.memory_mib,
-            disk_gib: req.disk_gib,
+            disk_gib: req.disk_gib.saturating_add(extras_total),
             gpus: req.gpus,
             min_group_size: req
                 .gpu_constraints
@@ -54,7 +59,7 @@ impl HostCapacity {
     fn compute(host: &HostRow, vms: &[VmRow], cpu_overcommit_ratio: f32) -> Self {
         let used_cpu: i64 = vms.iter().map(|v| v.cpu).sum();
         let used_mem: i64 = vms.iter().map(|v| v.memory_mib).sum();
-        let used_disk: i64 = vms.iter().map(|v| v.disk_gib).sum();
+        let used_disk: i64 = vms.iter().map(|v| v.total_disk_gib()).sum();
 
         // Promote to f64 for the multiply so we don't lose precision on
         // large host cpu counts when the ratio has a fractional part.
@@ -263,8 +268,20 @@ mod tests {
 
     /// Build a VM that consumes `(cpu, mem, disk)` with the given PCI
     /// addresses already bound to it. Only the fields the scheduler reads
-    /// are populated.
+    /// are populated. `disk` is the rootfs size; use [`vm_on_with_extras`]
+    /// if the test needs to add extra data disks.
     fn vm_on(host_id: &str, cpu: i64, mem: i64, disk: i64, gpus: &[GpuInfo]) -> VmRow {
+        vm_on_with_extras(host_id, cpu, mem, disk, &[], gpus)
+    }
+
+    fn vm_on_with_extras(
+        host_id: &str,
+        cpu: i64,
+        mem: i64,
+        disk: i64,
+        extra_disk_gibs: &[u32],
+        gpus: &[GpuInfo],
+    ) -> VmRow {
         VmRow {
             id: format!("vm-{host_id}"),
             name: "test".to_string(),
@@ -276,6 +293,7 @@ mod tests {
             memory_mib: mem,
             disk_gib: disk,
             gpu_assignments: serde_json::to_string(gpus).unwrap(),
+            extra_disk_gibs: serde_json::to_string(extra_disk_gibs).unwrap(),
             image: String::new(),
             error_message: String::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
@@ -377,6 +395,56 @@ mod tests {
         let vms = HashMap::new();
         let (host_id, _) = schedule(&hosts, &vms, &basic_req(0, 0), STRICT).unwrap();
         assert_eq!(host_id, "h2");
+    }
+
+    /// A VM already occupying a host charges *total* disk — rootfs
+    /// plus every extra data disk — against the host's free capacity.
+    /// Without this, a ceph-heavy VM with 1 TiB of extras looks like
+    /// its 100 GiB rootfs to the scheduler and the next placement
+    /// silently oversubscribes the thin pool into ENOSPC.
+    #[test]
+    fn test_schedule_charges_extra_disks_against_host() {
+        // 500 GiB host, one VM already on it consuming 100 GiB rootfs
+        // + 300 GiB across two extras. Remaining: 100 GiB. A 150 GiB
+        // rootfs request must be rejected.
+        let hosts = vec![make_host("h1", 64, 262144, 500, &[])];
+        let mut vms_by_host = HashMap::new();
+        vms_by_host.insert(
+            "h1".to_string(),
+            vec![vm_on_with_extras("h1", 4, 8192, 100, &[100, 200], &[])],
+        );
+        let req = ScheduleRequest {
+            cpu: 4,
+            memory_mib: 8192,
+            disk_gib: 150,
+            gpus: 0,
+            min_group_size: 0,
+        };
+        assert!(schedule(&hosts, &vms_by_host, &req, STRICT).is_err());
+    }
+
+    /// A request's extra disks count against the host just like the
+    /// rootfs does — `ScheduleRequest::from(CreateMachineRequest)`
+    /// collapses them into a single `disk_gib` total.
+    #[test]
+    fn test_schedule_request_sums_extra_disks() {
+        let req = CreateMachineRequest {
+            cluster_id: "c".into(),
+            name: "n".into(),
+            cpu: 2,
+            memory_mib: 1024,
+            disk_gib: 100,
+            image: String::new(),
+            bootstrap_data: Vec::new(),
+            gpus: 0,
+            gpu_constraints: None,
+            extra_disks: vec![
+                basis_proto::ExtraDisk { size_gib: 400 },
+                basis_proto::ExtraDisk { size_gib: 100 },
+            ],
+        };
+        let sched_req: ScheduleRequest = (&req).into();
+        assert_eq!(sched_req.disk_gib, 600);
     }
 
     #[test]

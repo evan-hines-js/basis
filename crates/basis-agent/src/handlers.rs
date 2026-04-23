@@ -106,6 +106,7 @@ async fn create_vm_inner(
     // Persist the VM record up front so any later failure has a DB row
     // to drive rollback off of, and so a crash here can't produce a
     // running-but-unknown VM (see module doc).
+    let extra_disk_gibs: Vec<u32> = cmd.extra_disks.iter().map(|d| d.size_gib).collect();
     agent_db
         .insert_vm(&LocalVmRow {
             vm_id: cmd.vm_id.clone(),
@@ -117,15 +118,35 @@ async fn create_vm_inner(
             disk_gib: cmd.disk_gib as i64,
             gpu_pci_addresses: serde_json::to_string(&cmd.gpu_pci_addresses)
                 .expect("serializing Vec<String> to JSON is infallible"),
+            extra_disk_gibs: serde_json::to_string(&extra_disk_gibs)
+                .expect("serializing Vec<u32> to JSON is infallible"),
             image: cmd.image.clone(),
             created_at: now_rfc3339(),
         })
         .await?;
 
     let started = Instant::now();
-    let disk_path = lvm::create_vm_lv(&cmd.vm_id, &base.image_hash, cmd.disk_gib as u64).await?;
+    let rootfs_path =
+        lvm::create_vm_lv(&cmd.vm_id, &base.image_hash, cmd.disk_gib as u64).await?;
     metrics
         .lv_snapshot_seconds
+        .observe(started.elapsed().as_secs_f64());
+
+    // Create each extra data disk as a plain thin LV. Order is the
+    // caller's — the agent preserves indexes so post-reboot restarts
+    // reattach the same disk at the same virtio slot. A mid-loop
+    // failure leaves partials behind; rollback (`delete_vm`) calls
+    // `remove_vm_data_disks` which enumerates from `lvs` and cleans
+    // them up regardless of how far we got.
+    let started = Instant::now();
+    let mut data_disk_paths = Vec::with_capacity(cmd.extra_disks.len());
+    for (index, disk) in cmd.extra_disks.iter().enumerate() {
+        let path =
+            lvm::create_data_disk_lv(&cmd.vm_id, index as u32, disk.size_gib as u64).await?;
+        data_disk_paths.push(path);
+    }
+    metrics
+        .data_disk_create_seconds
         .observe(started.elapsed().as_secs_f64());
 
     let started = Instant::now();
@@ -169,8 +190,9 @@ async fn create_vm_inner(
             &BootArtifacts {
                 kernel: &base.kernel,
                 initrd: &base.initrd,
-                rootfs: &disk_path,
+                rootfs: &rootfs_path,
                 cloud_init: &cloud_init_path,
+                extra_disks: &data_disk_paths,
             },
             &tap,
             &vfio_devices,
@@ -240,11 +262,19 @@ pub async fn delete_vm(
         warn!(vm_id, error = %e, "failed to stop VM");
     }
     // lvremove comes last: cloud-hypervisor holds `/dev/basis/vm-<id>`
-    // exclusively until its process exits, so `vm_mgr.delete_vm` must
-    // return (with its `udevadm settle` draining pending release
-    // events) before we remove the LV.
+    // and any `/dev/basis/vmdata-<id>-*` exclusively until its process
+    // exits, so `vm_mgr.delete_vm` must return (with its `udevadm
+    // settle` draining pending release events) before we remove any
+    // LV. Rootfs LV first, then the (possibly empty) set of data
+    // disks; both failures are surfaced — a leaked LV of either kind
+    // is the leak that matters (the thin pool fills with orphans and
+    // lvm2 degrades to O(N)).
     lvm::remove_vm_lv(vm_id).await.map_err(|e| {
         warn!(vm_id, error = %e, "VM delete failed at lvremove; caller will retry");
+        anyhow::Error::from(e)
+    })?;
+    lvm::remove_vm_data_disks(vm_id).await.map_err(|e| {
+        warn!(vm_id, error = %e, "VM delete failed removing data disks; caller will retry");
         anyhow::Error::from(e)
     })?;
     info!(vm_id, "VM deleted");
@@ -409,6 +439,7 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 50,
             gpu_pci_addresses: "[]".to_string(),
+            extra_disk_gibs: "[]".to_string(),
             image: "img".to_string(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }

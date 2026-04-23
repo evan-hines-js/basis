@@ -63,6 +63,13 @@ pub struct BootArtifacts<'a> {
     pub rootfs: &'a Path,
     /// Generated cloud-init cidata ISO attached as a second disk.
     pub cloud_init: &'a Path,
+    /// Raw thin LVs attached as additional virtio-blk devices after
+    /// `rootfs` and `cloud_init`. Order is load-bearing: the N'th entry
+    /// becomes `/dev/vd{c,d,e,...}` in the guest (rootfs is `/dev/vda`,
+    /// cloud-init ISO is `/dev/vdb`). Callers produce this from
+    /// `CreateVmCommand.extra_disks` preserving the caller's order so a
+    /// post-reboot restart reattaches the same disk at the same index.
+    pub extra_disks: &'a [PathBuf],
 }
 
 /// Owner of "VMs running on this host" state.
@@ -150,36 +157,10 @@ impl VmManager {
         //
         // `--disk` takes multiple values as space-separated arguments
         // after a single flag (NOT as repeated `--disk` flags). Same
-        // shape for `--device` below.
-        //
-        // Rootfs disk is a raw LVM thin LV (see `lvm.rs`), attached with:
-        //   image_type=raw   MUST be set explicitly. When omitted,
-        //                    cloud-hypervisor autodetects the disk type
-        //                    and, for auto-detected raw images, silently
-        //                    rejects guest writes to sector 0 as a
-        //                    safety measure (PR #7728). That breaks
-        //                    cloud-init's growpart on first boot —
-        //                    sfdisk writes the new partition table to
-        //                    sector 0, the write gets rejected, growpart
-        //                    reverts, /dev/vda1 stays at the image's
-        //                    original size, the guest fills up in
-        //                    minutes. Declaring image_type explicitly
-        //                    bypasses autodetect and re-enables sector-0
-        //                    writes.
-        //   direct=on        O_DIRECT; bypass host page cache. Required
-        //                    for etcd durability — with the cache in the
-        //                    path, fsync can return before data hits the
-        //                    SSD, silently corrupting the WAL on a host
-        //                    crash.
-        //   num_queues=cpus  One virtio-blk queue per vCPU so kubelet,
-        //                    containerd, and etcd can all do I/O in
-        //                    parallel without contending on a single
-        //                    queue lock. Cloud-hypervisor's default is 1.
-        //   queue_size=256   Generous ring depth for small-write
-        //                    workloads like etcd's 4K fsyncs.
-        //
-        // The cidata ISO is a tiny raw file on the host FS — no tuning
-        // needed; it's read once at boot and never touched again.
+        // shape for `--device` below. Per-disk tuning lives in
+        // [`disk_spec`]; the three disk kinds (rootfs, cloud-init ISO,
+        // caller-supplied raw data disks) all flow through that one
+        // helper so the tuning knobs don't drift between call sites.
         let mut ch_args = vec![
             format!("--api-socket={}", socket_path.to_string_lossy()),
             format!("--cpus=boot={}", cmd.cpu),
@@ -197,13 +178,12 @@ impl VmManager {
             "--serial=tty".to_string(),
             "--console=off".to_string(),
             "--disk".to_string(),
-            format!(
-                "path={},image_type=raw,direct=on,num_queues={},queue_size=256",
-                boot.rootfs.to_string_lossy(),
-                cmd.cpu
-            ),
-            format!("path={}", boot.cloud_init.to_string_lossy()),
+            lv_disk_spec(boot.rootfs, cmd.cpu),
+            cloud_init_disk_spec(boot.cloud_init),
         ];
+        for dev in boot.extra_disks {
+            ch_args.push(lv_disk_spec(dev, cmd.cpu));
+        }
 
         if !vfio_devices.is_empty() {
             ch_args.push("--device".to_string());
@@ -464,6 +444,37 @@ pub fn unit_name_for_vm(vm_id: &str) -> String {
     format!("basis-vm-{vm_id}.service")
 }
 
+/// Build the `--disk` value for a raw LVM thin LV (rootfs or caller-
+/// supplied data disk). The tuning knobs apply uniformly to anything
+/// backed by a thin LV and are centralised here to keep the rootfs and
+/// data-disk call sites identical.
+///
+/// - `image_type=raw` bypasses cloud-hypervisor's autodetect for raw
+///   images, which otherwise silently rejects guest writes to sector 0
+///   (PR #7728) and breaks cloud-init's growpart on first boot.
+/// - `direct=on` is O_DIRECT on the host — mandatory for durability on
+///   the rootfs (etcd's WAL fsyncs) and on data disks (ceph's own sync
+///   semantics are defeated by the host page cache).
+/// - `num_queues` / `queue_size` scale virtio-blk parallelism with the
+///   guest's vCPU count. Cloud-hypervisor defaults are 1/128.
+/// - `discard=unmap` propagates guest TRIM through to `lvremove`'s
+///   `issue_discards=1` so freed extents return to the thin pool.
+///   Load-bearing for ceph/bluestore on data disks; nice-to-have for
+///   rootfs (containerd GC).
+fn lv_disk_spec(path: &Path, vcpus: u32) -> String {
+    format!(
+        "path={},image_type=raw,direct=on,discard=unmap,\
+         num_queues={vcpus},queue_size=256",
+        path.to_string_lossy()
+    )
+}
+
+/// Build the `--disk` value for the cloud-init cidata ISO. Read once at
+/// boot; no tuning needed.
+fn cloud_init_disk_spec(path: &Path) -> String {
+    format!("path={}", path.to_string_lossy())
+}
+
 /// Generate a deterministic MAC address from a VM ID.
 fn generate_mac(vm_id: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -519,5 +530,36 @@ mod tests {
     fn test_unit_name_format() {
         let name = unit_name_for_vm("abc-123");
         assert_eq!(name, "basis-vm-abc-123.service");
+    }
+
+    /// Rootfs and data disks must emit byte-identical specs: losing
+    /// `direct=on` or `discard=unmap` on data disks is silent and only
+    /// manifests later as ceph bluestore holding extents the operator
+    /// expected to be reclaimed.
+    #[test]
+    fn lv_disk_spec_carries_durability_and_discard() {
+        let spec = lv_disk_spec(Path::new("/dev/basis/vmdata-x-0"), 8);
+        assert!(spec.contains("direct=on"), "missing direct=on: {spec}");
+        assert!(
+            spec.contains("discard=unmap"),
+            "missing discard=unmap: {spec}"
+        );
+        assert!(
+            spec.contains("image_type=raw"),
+            "missing image_type=raw: {spec}"
+        );
+        assert!(
+            spec.contains("num_queues=8"),
+            "vcpu count not wired into num_queues: {spec}"
+        );
+    }
+
+    /// Cloud-init ISO spec is deliberately plain — no tuning keywords.
+    #[test]
+    fn cloud_init_disk_spec_is_path_only() {
+        assert_eq!(
+            cloud_init_disk_spec(Path::new("/var/lib/basis/vms/x/cidata.iso")),
+            "path=/var/lib/basis/vms/x/cidata.iso",
+        );
     }
 }

@@ -567,6 +567,7 @@ mod tests {
             memory_mib: 8192,
             disk_gib: 100,
             gpu_assignments: "[]".to_string(),
+            extra_disk_gibs: "[]".to_string(),
             image: "ubuntu:22.04".to_string(),
             error_message: String::new(),
             created_at: basis_common::time::now_rfc3339(),

@@ -207,6 +207,7 @@ fn basic_machine_req(name: &str, cluster_id: &str) -> CreateMachineRequest {
         bootstrap_data: b"#!/bin/bash\necho hello".to_vec(),
         gpus: 0,
         gpu_constraints: None,
+        extra_disks: Vec::new(),
     }
 }
 

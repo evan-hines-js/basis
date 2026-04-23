@@ -51,6 +51,11 @@ pub struct MachineSpec {
     pub gpus: u32,
     #[serde(default, rename = "minGpuGroupSize")]
     pub min_gpu_group_size: Option<u32>,
+    /// Extra raw data disks (GiB each) to attach alongside the rootfs,
+    /// in allocation order. Handed to the guest unformatted so a
+    /// storage operator (Rook/Ceph) can claim them.
+    #[serde(default, rename = "extraDiskGibs")]
+    pub extra_disk_gibs: Vec<u32>,
 }
 
 impl MachineSpec {
@@ -83,6 +88,7 @@ impl MachineSpec {
             bootstrap_data,
             gpus: self.gpus,
             min_gpu_group_size: self.min_gpu_group_size,
+            extra_disk_gibs: self.extra_disk_gibs.clone(),
         })
     }
 }

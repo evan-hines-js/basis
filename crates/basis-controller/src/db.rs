@@ -175,6 +175,7 @@ impl Db {
                 memory_mib INTEGER NOT NULL,
                 disk_gib INTEGER NOT NULL,
                 gpu_assignments TEXT NOT NULL DEFAULT '[]',
+                extra_disk_gibs TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL,
                 error_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -539,8 +540,8 @@ impl Db {
     pub async fn insert_vm(&self, vm: &VmRow) -> Result<(), DbError> {
         let result = sqlx::query(
             "INSERT INTO vms (id, name, cluster_id, host_id, ip_address, state, cpu, memory_mib, disk_gib,
-                gpu_assignments, image, error_message, created_at, updated_at)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                gpu_assignments, extra_disk_gibs, image, error_message, created_at, updated_at)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              WHERE EXISTS (SELECT 1 FROM hosts WHERE id = ? AND healthy = 1)",
         )
         .bind(&vm.id)
@@ -553,6 +554,7 @@ impl Db {
         .bind(vm.memory_mib)
         .bind(vm.disk_gib)
         .bind(&vm.gpu_assignments)
+        .bind(&vm.extra_disk_gibs)
         .bind(&vm.image)
         .bind(&vm.error_message)
         .bind(&vm.created_at)
@@ -729,10 +731,27 @@ pub struct VmRow {
     pub memory_mib: i64,
     pub disk_gib: i64,
     pub gpu_assignments: String,
+    /// JSON-encoded `Vec<u32>` of extra data-disk sizes in GiB, in
+    /// allocation order. Used by the scheduler to charge the host's
+    /// disk budget for the full VM footprint (rootfs + all extras)
+    /// and echoed back on `vm_to_machine` so CAPI readbacks match
+    /// the request.
+    pub extra_disk_gibs: String,
     pub image: String,
     pub error_message: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl VmRow {
+    /// Full host-side disk footprint of this VM — rootfs plus every
+    /// extra data disk. The thin pool charges both; the scheduler uses
+    /// this as the "used disk" contribution for each VM on a host.
+    pub fn total_disk_gib(&self) -> i64 {
+        let extras: Vec<u32> =
+            basis_common::json::parse_owned_json(&self.extra_disk_gibs, "vms.extra_disk_gibs");
+        self.disk_gib + extras.iter().map(|&g| g as i64).sum::<i64>()
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -876,6 +895,7 @@ mod tests {
             memory_mib: 8192,
             disk_gib: 100,
             gpu_assignments: "[]".to_string(),
+            extra_disk_gibs: "[]".to_string(),
             image: "test-image:latest".to_string(),
             error_message: String::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),

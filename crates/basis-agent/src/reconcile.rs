@@ -5,7 +5,7 @@ use futures::stream::{self, StreamExt};
 use tracing::{error, info, warn};
 
 use basis_common::json::parse_owned_json;
-use basis_proto::CreateVmCommand;
+use basis_proto::{CreateVmCommand, ExtraDisk};
 
 use crate::metrics;
 
@@ -133,7 +133,9 @@ impl<'a> GarbageCollectable for UnitCollector<'a> {
 
 /// Thin-pool LVs whose `vm_id` is not in the agent DB. Covers the
 /// leaked-snapshot case where a prior `delete_vm` hit EBUSY on
-/// `lvremove` and dropped it best-effort.
+/// `lvremove` and dropped it best-effort. Unifies rootfs LVs and data
+/// disk LVs into a single vm_id-keyed set so a VM whose rootfs was
+/// removed but whose data disks linger gets swept on the same pass.
 struct LvCollector;
 
 impl GarbageCollectable for LvCollector {
@@ -141,10 +143,11 @@ impl GarbageCollectable for LvCollector {
         "lv"
     }
     async fn list(&self) -> anyhow::Result<Vec<String>> {
-        Ok(lvm::list_vm_lvs().await?)
+        Ok(lvm::list_managed_vm_ids().await?.into_iter().collect())
     }
     async fn reclaim(&self, vm_id: &str) -> anyhow::Result<()> {
         lvm::remove_vm_lv(vm_id).await?;
+        lvm::remove_vm_data_disks(vm_id).await?;
         Ok(())
     }
 }
@@ -402,18 +405,39 @@ async fn restart_vm(
     image_mgr: &crate::image::ImageManager,
 ) -> Result<(), RestartError> {
     let vm_dir = config.vms_dir().join(&vm_record.vm_id);
-    let disk_path = lvm::vm_lv_path(&vm_record.vm_id);
+    let rootfs_path = lvm::vm_lv_path(&vm_record.vm_id);
     let cloud_init_path = vm_dir.join("cidata.iso");
 
     // `Path::exists` works on block devices — the thin LV shows up as
     // `/dev/basis/vm-<id>` while active. Missing LV means either the
     // thin pool was reinitialized or the operator removed the LV; we
     // can't restart from that state.
-    if !disk_path.exists() || !cloud_init_path.exists() {
+    if !rootfs_path.exists() || !cloud_init_path.exists() {
         return Err(RestartError::DiskMissing {
-            lv_path: disk_path,
+            lv_path: rootfs_path,
             cidata_path: cloud_init_path,
         });
+    }
+
+    // Reattach every data disk at the same virtio slot it occupied
+    // pre-reboot. Index N in `extra_disk_gibs` must line up with the
+    // `vmdata-<vm_id>-N` LV on the thin pool — missing any means the
+    // guest would see a different `/dev/vd*` layout after the reboot
+    // than before it, and anything persisted against the old layout
+    // (filesystem, LVM PV on top, ceph OSD metadata) silently diverges.
+    // Fail the restart loudly instead; CAPI sees FAILED and remediates.
+    let extra_disk_gibs: Vec<u32> =
+        parse_owned_json(&vm_record.extra_disk_gibs, "local_vms.extra_disk_gibs");
+    let mut data_disk_paths = Vec::with_capacity(extra_disk_gibs.len());
+    for index in 0..extra_disk_gibs.len() {
+        let path = lvm::data_disk_lv_path(&vm_record.vm_id, index as u32);
+        if !path.exists() {
+            return Err(RestartError::DiskMissing {
+                lv_path: path,
+                cidata_path: cloud_init_path,
+            });
+        }
+        data_disk_paths.push(path);
     }
 
     // Resolve the kernel + initrd paths out of the image cache. Same
@@ -489,6 +513,10 @@ async fn restart_vm(
         gpu_constraints: None,
         dns_servers: Vec::new(),
         gpu_pci_addresses: gpu_addrs,
+        extra_disks: extra_disk_gibs
+            .iter()
+            .map(|&size_gib| ExtraDisk { size_gib })
+            .collect(),
     };
 
     vm_mgr
@@ -497,8 +525,9 @@ async fn restart_vm(
             &BootArtifacts {
                 kernel: &cached.kernel,
                 initrd: &cached.initrd,
-                rootfs: &disk_path,
+                rootfs: &rootfs_path,
                 cloud_init: &cloud_init_path,
+                extra_disks: &data_disk_paths,
             },
             &tap_name,
             &vfio_devices,

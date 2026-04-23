@@ -213,6 +213,7 @@ async fn apply(
                 .gpu_constraints
                 .as_ref()
                 .map(|c| c.min_group_size),
+            extra_disk_gibs: machine.spec.extra_disk_gibs.clone(),
         })
         .await?;
 

@@ -18,7 +18,7 @@ use std::time::Duration;
 use basis_common::tls::{TlsIdentity, CONTROLLER_IDENTITY};
 use basis_proto::{
     basis_client::BasisClient as InnerClient, CreateClusterRequest, CreateMachineRequest,
-    DeleteClusterRequest, DeleteMachineRequest, GetClusterRequest, GetMachineRequest,
+    DeleteClusterRequest, DeleteMachineRequest, ExtraDisk, GetClusterRequest, GetMachineRequest,
     GpuConstraints, ListClustersRequest, ListMachinesRequest, Machine,
 };
 use tokio::sync::Mutex;
@@ -106,6 +106,10 @@ pub struct MachineRequest {
     pub bootstrap_data: Vec<u8>,
     pub gpus: u32,
     pub min_gpu_group_size: Option<u32>,
+    /// Extra raw block devices to attach alongside the rootfs, each a
+    /// size in GiB. Order is stable and becomes the guest virtio-blk
+    /// enumeration order after rootfs + cloud-init.
+    pub extra_disk_gibs: Vec<u32>,
 }
 
 pub struct BasisClient {
@@ -264,6 +268,11 @@ impl BasisClient {
             gpu_constraints: req
                 .min_gpu_group_size
                 .map(|min_group_size| GpuConstraints { min_group_size }),
+            extra_disks: req
+                .extra_disk_gibs
+                .into_iter()
+                .map(|size_gib| ExtraDisk { size_gib })
+                .collect(),
         };
         let resp = self
             .call(|mut c| {

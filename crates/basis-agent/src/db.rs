@@ -58,6 +58,7 @@ impl AgentDb {
                 memory_mib INTEGER NOT NULL,
                 disk_gib INTEGER NOT NULL,
                 gpu_pci_addresses TEXT NOT NULL DEFAULT '[]',
+                extra_disk_gibs TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )",
@@ -105,8 +106,8 @@ impl AgentDb {
     pub async fn insert_vm(&self, vm: &LocalVmRow) -> Result<(), AgentDbError> {
         sqlx::query(
             "INSERT INTO local_vms (vm_id, name, unit_name, ip_address, cpu, memory_mib, disk_gib,
-                gpu_pci_addresses, image, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                gpu_pci_addresses, image, created_at, extra_disk_gibs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&vm.vm_id)
         .bind(&vm.name)
@@ -118,6 +119,7 @@ impl AgentDb {
         .bind(&vm.gpu_pci_addresses)
         .bind(&vm.image)
         .bind(&vm.created_at)
+        .bind(&vm.extra_disk_gibs)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -185,6 +187,11 @@ pub struct LocalVmRow {
     pub gpu_pci_addresses: String,
     pub image: String,
     pub created_at: String,
+    /// JSON-encoded `Vec<u32>` of extra data-disk sizes in GiB, in the
+    /// same order the guest enumerates them as `/dev/vdb`, `/dev/vdc`, …
+    /// Persisted so a post-reboot restart can re-attach the data LVs
+    /// at the same indexes the guest saw before the reboot.
+    pub extra_disk_gibs: String,
 }
 
 #[cfg(test)]
@@ -207,6 +214,7 @@ mod tests {
             gpu_pci_addresses: "[]".to_string(),
             image: "test-image:latest".to_string(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
+            extra_disk_gibs: "[]".to_string(),
         }
     }
 
