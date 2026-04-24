@@ -11,7 +11,7 @@ use basis_agent::host_info::HostResources;
 use basis_agent::image::ImageManager;
 use basis_agent::lvm;
 use basis_agent::metrics::{self, Metrics};
-use basis_agent::network::NetworkManager;
+use basis_agent::network::{NetworkManager, TreeManager, UplinkBridge};
 use basis_agent::reconcile;
 use basis_agent::vm::VmManager;
 use basis_common::gpu::GpuInfo;
@@ -26,66 +26,24 @@ use tonic::Streaming;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// Cadence of the agent's heartbeat to the controller. Paired with the
-/// controller's `HEARTBEAT_STALE_THRESHOLD` (90 s = three intervals) so
-/// a single missed beat doesn't flip the host unhealthy.
+/// Cadence of the agent's heartbeat to the controller.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Cadence of the agent-side periodic local reconcile, which detects
-/// VMs the local DB believes are running but that systemd has lost
-/// (crash, OOM, manual stop) and reports them as FAILED.
+/// Cadence of the agent-side periodic local reconcile.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Wait between failed connect attempts. Short enough that recovery
-/// from a controller restart is sub-10s; long enough that we don't
-/// hammer a permanently-down endpoint.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
-
-/// Per-attempt connect deadline to the controller. Generous because
-/// the agent has nothing else to do; longer waits mostly hurt the
-/// "controller permanently down" case which isn't latency-sensitive.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Cadence for logging thin-pool capacity. Coarser than the heartbeat
-/// because operators don't need second-by-second fill graphs, and
-/// because every query forks `lvs` which can stall behind a busy VG
-/// lock during mass VM teardown. Decoupled from `HEARTBEAT_INTERVAL`
-/// so a stuck `lvs` can never delay a heartbeat.
 const POOL_CAPACITY_INTERVAL: Duration = Duration::from_secs(120);
-
-/// Upper bound on a single `lvs` call. If LVM is wedged long enough
-/// that we can't probe capacity, we log a warning and move on rather
-/// than accumulating stuck tasks.
 const POOL_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Idle cadence for the periodic orphan sweep. Reclaims systemd units,
-/// LVs, and taps whose owning VM id is no longer in the agent DB or
-/// running unit set. Handles the residue of `delete_vm` calls whose
-/// `lvremove` raced with a not-yet-released block-device handle and got
-/// skipped best-effort.
-///
-/// Used only when the previous pass found nothing to reclaim. On a
-/// non-zero pass the loop tail-chases at `ORPHAN_SWEEP_BUSY_INTERVAL`
-/// so a churn-heavy fleet drains its backlog in seconds instead of
-/// letting stale LVs accrete for multiples of this interval. For a
-/// long-running agent that's where the value is: self-healing is load-
-/// proportional rather than fixed.
 const ORPHAN_SWEEP_IDLE_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Wake interval after a non-zero sweep pass. Short enough to drain a
-/// large backlog quickly (hundreds of orphans in minutes, not hours);
-/// not so short that failed-lvremove retries hammer the thin pool.
 const ORPHAN_SWEEP_BUSY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Defense-in-depth grace window for periodic `ReconcileHostCommand`
-/// pushes: a VM younger than this is *not* deleted on a single push
-/// that omits it, so an in-flight CreateMachine the controller hasn't
-/// fully recorded yet can't be wiped out by a misbehaving controller.
-/// Sized to comfortably exceed the controller's `CREATE_MACHINE_TIMEOUT`
-/// of 600 s would be too long; 120 s covers a normal cold-start
-/// (~20 s) plus headroom. The post-register reconcile *does not* apply
-/// this grace — that one trusts the controller's authoritative list
-/// because the agent has been offline.
+/// Defense-in-depth grace window for controller-pushed reconcile
+/// commands — a VM younger than this is not deleted on a single push
+/// that omits it.
 const PERIODIC_RECONCILE_GRACE: Duration = Duration::from_secs(120);
 
 #[derive(Parser)]
@@ -95,8 +53,7 @@ struct Cli {
     config: PathBuf,
 }
 
-/// Long-lived agent-side context: filesystem managers, databases, and
-/// the host's resource snapshot. Stable across reconnects.
+/// Long-lived agent-side context. Stable across reconnects.
 struct AgentRuntime {
     hostname: String,
     spec: HostSpec,
@@ -107,8 +64,6 @@ struct AgentRuntime {
     metrics: Arc<Metrics>,
     host_resources: HostResources,
     gpus: Vec<GpuInfo>,
-    /// Flipped by the SIGHUP handler when the current stream should be
-    /// torn down (e.g., `controllerEndpoint` changed).
     reconnect_signal: CancellationToken,
 }
 
@@ -137,11 +92,6 @@ async fn main() -> anyhow::Result<()> {
     let runtime = Arc::new(tokio::sync::RwLock::new(initialize_runtime(host).await?));
     spawn_reload_loop(cli.config.clone(), runtime.clone());
 
-    // Expose Prometheus `/metrics` on a plain-HTTP port alongside the
-    // agent's gRPC stream to the controller. Separate port, no TLS —
-    // Prometheus scrapes it locally or via the observability stack's
-    // `basis-agents` job. Lives for the process lifetime; the shutdown
-    // token is a stub since the agent exits by process termination.
     {
         let metrics_listen = runtime.read().await.spec.metrics_listen.clone();
         let metrics = runtime.read().await.metrics.clone();
@@ -179,23 +129,16 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     std::fs::create_dir_all(spec.images_dir())?;
     std::fs::create_dir_all(spec.vms_dir())?;
 
-    let net_mgr = NetworkManager::new(
-        spec.network.bridge.clone(),
-        spec.network.physical_nic.clone(),
+    let uplink = UplinkBridge::new(
+        spec.network.uplink_bridge.clone(),
+        spec.network.uplink_interface.clone(),
+        spec.network.uplink_mtu,
     );
+    let trees = TreeManager::new(spec.network.vtep_address.clone(), spec.network.uplink_mtu);
+    let net_mgr = NetworkManager::new(uplink, trees);
 
-    // Run every host-level preflight in parallel so the agent either
-    // comes up with all its invariants satisfied, or fails with a
-    // specific, actionable error. Silent fallback at any of these
-    // layers — thin pool missing, NIC missing, IOMMU off, qemu-img
-    // absent — would let a VM be "created" on a host that can't run
-    // it, so we fail loudly instead. Each validator's error message
-    // includes remediation (usually "run basis-prereqs").
-    //
-    // NOTE: `tokio::try_join!` short-circuits on the first failure, so
-    // in the "everything is broken" case the operator only sees one
-    // error at a time. That's fine — once they fix it, the agent
-    // restarts and the next layer's error surfaces.
+    // Preflight everything in parallel. `try_join!` short-circuits on
+    // the first failure.
     let (pool_capacity, iso_tool, (), ()) = tokio::try_join!(
         async {
             lvm::validate_pool()
@@ -214,16 +157,16 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         },
         async {
             net_mgr
-                .validate_bridge()
+                .validate_uplink()
                 .await
-                .context("validating host network (bridge + physical NIC)")
+                .context("validating host uplink (bridge + NIC + MTU)")
         },
     )?;
 
     let agent_db = AgentDb::open(&spec.data_dir.join("agent.db")).await?;
     info!("agent database ready");
 
-    net_mgr.ensure_bridge().await?;
+    net_mgr.ensure_uplink_bridge().await?;
 
     let image_mgr = Arc::new(ImageManager::with_auth(
         spec.images_dir(),
@@ -256,10 +199,6 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     );
 
     let host_resources = HostResources::discover(pool_capacity.data_total_bytes);
-    // Fail loudly on GPU discovery errors. On a GPU host, silently
-    // registering with 0 GPUs means the scheduler packs CPU workloads
-    // onto it and customers never see their GPUs — the exact failure
-    // mode a GPU cloud can't have.
     let gpus = gpu::discover_gpus()
         .await
         .context("discovering GPUs (set RUST_LOG=basis=debug for driver details)")?;
@@ -269,6 +208,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         memory_mib = host_resources.total_memory_mib,
         disk_gib = host_resources.total_disk_gib,
         gpus = gpus.len(),
+        vtep = %spec.network.vtep_address,
         "discovered host resources"
     );
 
@@ -289,9 +229,6 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     })
 }
 
-/// SIGHUP re-reads the config file, diffs against the running spec,
-/// applies what's safe (reconnect on `controllerEndpoint` change), and
-/// warns loudly about anything that would require a restart.
 fn spawn_reload_loop(config_path: PathBuf, runtime: Arc<tokio::sync::RwLock<AgentRuntime>>) {
     tokio::spawn(async move {
         let Ok(mut sighup) = signal(SignalKind::hangup()) else {
@@ -422,6 +359,7 @@ async fn send_register(
                 total_memory_mib: rt.host_resources.total_memory_mib,
                 total_disk_gib: rt.host_resources.total_disk_gib,
                 gpus: gpu_devices,
+                vtep_address: rt.spec.network.vtep_address.clone(),
             })),
         })
         .await?;
@@ -442,22 +380,38 @@ async fn handshake(
         other => anyhow::bail!("expected RegisterHostResponse as first command, got {other:?}"),
     };
 
-    info!(
-        host_id = %ack.host_id,
-        expected_vms = ack.expected_vm_ids.len(),
-        "received registration ack"
-    );
+    info!(host_id = %ack.host_id, "received registration ack");
     let rt = runtime.read().await;
     rt.agent_db.set_host_id(&ack.host_id).await?;
+
+    // The controller's initial state covers both the authoritative
+    // VM list AND the authoritative tree list. Apply both through
+    // the same path we use for ongoing reconciles.
+    if let Some(initial) = ack.initial_state {
+        apply_reconcile(&rt, &initial, Duration::ZERO).await?;
+    }
+
+    Ok(ack.host_id)
+}
+
+/// Apply a `ReconcileHostCommand`: build/tear-down tree bridges to
+/// match the command's `trees`, then delete VMs absent from
+/// `expected_vm_ids`. Single path used by the handshake ack, periodic
+/// pushes, and ad-hoc broadcasts.
+async fn apply_reconcile(
+    rt: &AgentRuntime,
+    cmd: &ReconcileHostCommand,
+    vm_delete_grace: Duration,
+) -> anyhow::Result<()> {
+    rt.net_mgr.reconcile_trees(&cmd.trees).await?;
     handlers::reconcile_against_expected(
-        &ack.expected_vm_ids,
+        &cmd.expected_vm_ids,
         &rt.vm_mgr,
         &rt.net_mgr,
         &rt.agent_db,
-        Duration::ZERO,
+        vm_delete_grace,
     )
-    .await?;
-    Ok(ack.host_id)
+    .await
 }
 
 fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>, host_id: String) {
@@ -477,14 +431,6 @@ fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>, host_id: String) {
     });
 }
 
-/// Periodically log thin-pool capacity. Metadata free is the silent
-/// killer of thin pools — when it fills up the pool goes read-only and
-/// every running VM's disk errors out. No prometheus yet, so the
-/// journal is the warning channel.
-///
-/// Runs independently of the heartbeat so an `lvs` that gets stuck
-/// behind a busy VG lock (e.g. during mass VM teardown) can't delay
-/// liveness reporting.
 fn spawn_pool_capacity_loop() {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(POOL_CAPACITY_INTERVAL);
@@ -508,22 +454,8 @@ fn spawn_pool_capacity_loop() {
     });
 }
 
-/// Periodic orphan sweep. Reclaims host-level resources (systemd units,
-/// LVs, taps) that no authoritative source claims — typically the
-/// residue of `delete_vm` calls where `lvremove` raced with a held
-/// block-device handle and was skipped best-effort.
-///
-/// Adaptive cadence, not a fixed tick: on an idle fleet this runs every
-/// `ORPHAN_SWEEP_IDLE_INTERVAL`; on a churning fleet with a backlog the
-/// loop immediately re-enters after a non-zero pass, draining the
-/// backlog load-proportionally. This is what lets a long-lived agent
-/// self-heal after hours of crash/restart noise without needing an
-/// operator to prune the thin pool by hand.
 fn spawn_orphan_sweep_loop(runtime: Arc<tokio::sync::RwLock<AgentRuntime>>) {
     tokio::spawn(async move {
-        // Skip an immediate first sweep: startup already ran a full
-        // reconcile including the orphan sweep, so there's nothing to
-        // reclaim yet.
         tokio::time::sleep(ORPHAN_SWEEP_IDLE_INTERVAL).await;
         loop {
             let sleep = {
@@ -546,18 +478,11 @@ fn spawn_orphan_sweep_loop(runtime: Arc<tokio::sync::RwLock<AgentRuntime>>) {
     });
 }
 
-/// Periodic state-report loop. Tells the controller the current state
-/// (Running or Failed) of every locally-known VM on `RECONCILE_INTERVAL`,
-/// catching VMs whose systemd scope has disappeared (crash, OOM, manual
-/// stop). Same function as the post-handshake catch-up so there's one
-/// definition of "what state report should look like."
 fn spawn_periodic_reconciler(
     sender: mpsc::Sender<AgentMessage>,
     runtime: Arc<tokio::sync::RwLock<AgentRuntime>>,
 ) {
     tokio::spawn(async move {
-        // First tick fires immediately; skip it so we don't double up with
-        // the initial post-handshake state report.
         let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
         interval.tick().await;
         loop {
@@ -601,6 +526,8 @@ async fn process_inbound(
                             memory_mib = create.memory_mib,
                             disk_gib = create.disk_gib,
                             gpus = create.gpu_pci_addresses.len(),
+                            vni = create.vni,
+                            edge = !create.edge_ip.is_empty(),
                             "received CreateVm"
                         );
                         spawn_create(create, rt_snapshot, sender.clone());
@@ -609,8 +536,8 @@ async fn process_inbound(
                         info!(vm_id = %delete.vm_id, "received DeleteVm");
                         spawn_delete(delete, rt_snapshot, sender.clone());
                     }
-                    Some(controller_command::Command::ReconcileHost(reconcile)) => {
-                        spawn_reconcile(reconcile, rt_snapshot);
+                    Some(controller_command::Command::ReconcileHost(reconcile_cmd)) => {
+                        spawn_reconcile(reconcile_cmd, runtime.clone());
                     }
                     None => {}
                 }
@@ -634,10 +561,6 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
         let (state, err, transient) = match result {
             Ok(()) => (MachineState::Running, String::new(), false),
             Err(e) => {
-                // Walk the error chain to detect `LvmError::Busy` — this
-                // is a load-shedding signal, not a real fault. The
-                // controller's caller should retry the create on this
-                // response instead of bubbling a failure to the user.
                 let transient = e.chain().any(|c| {
                     matches!(
                         c.downcast_ref::<lvm::LvmError>(),
@@ -656,19 +579,8 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
     });
 }
 
-/// Controller-initiated delete. Reports the outcome back via the
-/// standard `ReportVMStateRequest` path so the controller's
-/// `DeleteCluster` / `DeleteMachine` RPC can block on real cleanup
-/// completion — that's what bounds queue depth under load
-/// (workers wait on the delete RPC rather than pipelining the next
-/// create behind an unresolved delete).
 fn spawn_delete(cmd: DeleteVmCommand, rt: TaskContext, sender: mpsc::Sender<AgentMessage>) {
     tokio::spawn(async move {
-        // Every surfaced delete error is retry-worthy: the only step
-        // that returns an error is `lvremove`, and either the kernel
-        // has the device still pending release (transient, next retry
-        // succeeds) or lvm2 itself is busy (semaphore timeout). The
-        // orphan sweep is the backstop if retries eventually give up.
         let (state, err, transient) =
             match handlers::delete_vm(&cmd.vm_id, &rt.vm_mgr, rt.net_mgr.as_ref(), &rt.agent_db)
                 .await
@@ -680,22 +592,13 @@ fn spawn_delete(cmd: DeleteVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
     });
 }
 
-/// Apply a controller-pushed authoritative VM list. Same contract as the
-/// initial list from `RegisterHostResponse` — locally-known VMs absent
-/// from the list have been forgotten by the controller and must be torn
-/// down. Delegated to the same handler so behavior is identical whether
-/// the trigger was registration or the periodic push.
-fn spawn_reconcile(cmd: ReconcileHostCommand, rt: TaskContext) {
+fn spawn_reconcile(
+    cmd: ReconcileHostCommand,
+    runtime: Arc<tokio::sync::RwLock<AgentRuntime>>,
+) {
     tokio::spawn(async move {
-        if let Err(e) = handlers::reconcile_against_expected(
-            &cmd.expected_vm_ids,
-            &rt.vm_mgr,
-            rt.net_mgr.as_ref(),
-            &rt.agent_db,
-            PERIODIC_RECONCILE_GRACE,
-        )
-        .await
-        {
+        let rt = runtime.read().await;
+        if let Err(e) = apply_reconcile(&rt, &cmd, PERIODIC_RECONCILE_GRACE).await {
             warn!(error = %e, "controller-driven reconcile failed");
         }
     });

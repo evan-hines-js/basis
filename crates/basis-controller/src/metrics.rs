@@ -530,6 +530,7 @@ async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{EdgePool, NetworkConfig, VniRange};
     use crate::db::{ClusterRow, HostRow, VmRow};
 
     fn make_host(id: &str, hostname: &str, total_cpu: i64, healthy: bool) -> HostRow {
@@ -540,18 +541,9 @@ mod tests {
             total_memory_mib: 65536,
             total_disk_gib: 1000,
             gpu_inventory: "[]".to_string(),
+            vtep_address: "10.100.0.1".to_string(),
             last_heartbeat: basis_common::time::now_rfc3339(),
             healthy,
-        }
-    }
-
-    fn make_cluster(id: &str) -> ClusterRow {
-        ClusterRow {
-            id: id.to_string(),
-            name: format!("cluster-{id}"),
-            ip_pool: "default".to_string(),
-            control_plane_endpoint: "10.0.10.1".to_string(),
-            created_at: basis_common::time::now_rfc3339(),
         }
     }
 
@@ -562,6 +554,7 @@ mod tests {
             cluster_id: cluster_id.to_string(),
             host_id: host_id.to_string(),
             ip_address: "10.0.10.10".to_string(),
+            edge_ip: None,
             state,
             cpu: 4,
             memory_mib: 8192,
@@ -575,6 +568,40 @@ mod tests {
         }
     }
 
+    fn net_config() -> NetworkConfig {
+        NetworkConfig {
+            tree_supernet: "10.0.0.0/8".to_string(),
+            tree_prefix: 20,
+            vip_reserve: 16,
+            vni_range: VniRange { start: 10_000, end: 10_010 },
+            vni_cooldown_secs: 60,
+            edge_pool: EdgePool {
+                cidr: "192.168.100.0/24".to_string(),
+                gateway: "192.168.100.1".to_string(),
+                range_start: "192.168.100.20".to_string(),
+                range_end: "192.168.100.30".to_string(),
+            },
+        }
+    }
+
+    /// Allocate a tree and insert a cluster into it. The FK from
+    /// `clusters.tree_id` to `trees.id` means tests that want to pre-
+    /// populate a cluster must materialize a tree first; this helper
+    /// keeps that boilerplate in one place.
+    async fn seed_cluster(db: &Db, id: &str) -> ClusterRow {
+        let tree = db.allocate_tree(&net_config(), 0).await.unwrap();
+        let row = ClusterRow {
+            id: id.to_string(),
+            name: format!("cluster-{id}"),
+            tree_id: tree.id,
+            parent_cluster_id: None,
+            control_plane_endpoint: tree.gateway_ip,
+            created_at: basis_common::time::now_rfc3339(),
+        };
+        db.insert_cluster(&row).await.unwrap();
+        row
+    }
+
     #[tokio::test]
     async fn refresh_populates_gauges() {
         let db = Db::open(":memory:".as_ref()).await.unwrap();
@@ -585,7 +612,7 @@ mod tests {
         db.upsert_host(&make_host("h2", "node-b", 16, false))
             .await
             .unwrap();
-        db.insert_cluster(&make_cluster("c1")).await.unwrap();
+        seed_cluster(&db, "c1").await;
         db.insert_vm(&make_vm("v1", "h1", "c1", 2)).await.unwrap(); // RUNNING
         db.insert_vm(&make_vm("v2", "h1", "c1", 1)).await.unwrap(); // CREATING
 
@@ -621,7 +648,7 @@ mod tests {
         db.upsert_host(&make_host("h1", "node-a", 16, true))
             .await
             .unwrap();
-        db.insert_cluster(&make_cluster("c1")).await.unwrap();
+        seed_cluster(&db, "c1").await;
         for n in 0..3 {
             let mut vm = make_vm(&format!("v{n}"), "h1", "c1", 2);
             vm.cpu = 16;
@@ -651,7 +678,7 @@ mod tests {
         db.upsert_host(&make_host("h1", "node-a", 32, true))
             .await
             .unwrap();
-        db.insert_cluster(&make_cluster("c1")).await.unwrap();
+        seed_cluster(&db, "c1").await;
         db.insert_vm(&make_vm("v1", "h1", "c1", 2)).await.unwrap();
 
         let metrics = Metrics::new(1.0).unwrap();

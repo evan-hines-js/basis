@@ -80,11 +80,13 @@ impl ClientError {
     }
 }
 
-/// A cluster as the caller cares about it — two fields, no proto
-/// envelopes.
+/// A cluster as the caller cares about it. Carries the IDs the caller
+/// needs to plumb onto CAPI CRs without exposing proto envelopes.
 pub struct Cluster {
     pub cluster_id: String,
     pub control_plane_endpoint: String,
+    pub tree_id: String,
+    pub vni: u32,
 }
 
 /// A successful `CreateMachine` result.
@@ -92,6 +94,9 @@ pub struct CreatedMachine {
     pub id: String,
     pub provider_id: String,
     pub ip_address: String,
+    /// Second-NIC address on the uplink, iff the machine was created
+    /// with `edge: true`. Empty otherwise.
+    pub edge_ip: String,
 }
 
 /// Non-cluster inputs to `create_machine`. Decoupled from any caller's
@@ -110,6 +115,16 @@ pub struct MachineRequest {
     /// size in GiB. Order is stable and becomes the guest virtio-blk
     /// enumeration order after rootfs + cloud-init.
     pub extra_disk_gibs: Vec<u32>,
+    /// When true, request a second NIC on the uplink for this machine
+    /// — makes this a Cilium BGP / edge-ingress node.
+    pub edge: bool,
+}
+
+/// Inputs to `create_cluster`. Roots (new trees) pass
+/// `parent_cluster_id: None`; children pass the parent's id.
+pub struct ClusterRequest {
+    pub name: String,
+    pub parent_cluster_id: Option<String>,
 }
 
 pub struct BasisClient {
@@ -203,12 +218,11 @@ impl BasisClient {
             .into())
     }
 
-    pub async fn create_cluster(
-        &self,
-        name: String,
-        ip_pool: String,
-    ) -> Result<Cluster, ClientError> {
-        let request = CreateClusterRequest { name, ip_pool };
+    pub async fn create_cluster(&self, req: ClusterRequest) -> Result<Cluster, ClientError> {
+        let request = CreateClusterRequest {
+            name: req.name,
+            parent_cluster_id: req.parent_cluster_id.unwrap_or_default(),
+        };
         let resp = self
             .call(|mut c| {
                 let request = request.clone();
@@ -218,6 +232,8 @@ impl BasisClient {
         Ok(Cluster {
             cluster_id: resp.cluster_id,
             control_plane_endpoint: resp.control_plane_endpoint,
+            tree_id: resp.tree_id,
+            vni: resp.vni,
         })
     }
 
@@ -242,6 +258,8 @@ impl BasisClient {
         Ok(Cluster {
             cluster_id: resp.cluster_id,
             control_plane_endpoint: resp.control_plane_endpoint,
+            tree_id: resp.tree_id,
+            vni: resp.vni,
         })
     }
 
@@ -273,6 +291,7 @@ impl BasisClient {
                 .into_iter()
                 .map(|size_gib| ExtraDisk { size_gib })
                 .collect(),
+            edge: req.edge,
         };
         let resp = self
             .call(|mut c| {
@@ -281,9 +300,6 @@ impl BasisClient {
             })
             .await?;
         // Server-side CreateMachine guarantees these fields on success.
-        // Guard the boundary so an empty value never reaches the caller
-        // — an empty IP would otherwise silently propagate into (e.g.)
-        // a CAPI status patch that Kubernetes rejects.
         if resp.id.is_empty() {
             return Err(ClientError::Malformed("CreateMachine returned empty id"));
         }
@@ -301,6 +317,7 @@ impl BasisClient {
             id: resp.id,
             provider_id: resp.provider_id,
             ip_address: resp.ip_address,
+            edge_ip: resp.edge_ip,
         })
     }
 

@@ -46,9 +46,6 @@ async fn main() -> anyhow::Result<()> {
     let db = Db::open(&config.db_path()).await?;
     info!(path = %config.db_path().display(), "database ready");
 
-    db.seed_ip_pools(&config.ip_pools).await?;
-    info!(count = config.ip_pools.len(), "IP pools seeded");
-
     let shutdown = CancellationToken::new();
 
     let metrics = Metrics::new(config.cpu_overcommit_ratio)?;
@@ -87,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         metrics,
         config.dns_servers,
+        config.network,
         config.cpu_overcommit_ratio,
     )
     .serve(listener, tls_config, shutdown)

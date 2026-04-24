@@ -106,13 +106,22 @@ async fn apply(client: &BasisClient, file: &Path) -> Result<()> {
     for resource in load_file(file)? {
         match resource {
             Resource::Cluster(c) => {
+                let parent_cluster_id = match c.spec.parent_cluster.as_deref() {
+                    Some(name) => Some(find_cluster_id(client, name).await?),
+                    None => None,
+                };
                 let created = client
-                    .create_cluster(c.metadata.name.clone(), c.spec.ip_pool.clone())
+                    .create_cluster(basis_client::ClusterRequest {
+                        name: c.metadata.name.clone(),
+                        parent_cluster_id,
+                    })
                     .await?;
                 println!(
-                    "cluster  {name:30}  id={id}  endpoint={ep}",
+                    "cluster  {name:30}  id={id}  tree={tree}  vni={vni}  endpoint={ep}",
                     name = c.metadata.name,
                     id = created.cluster_id,
+                    tree = created.tree_id,
+                    vni = created.vni,
                     ep = created.control_plane_endpoint,
                 );
             }
@@ -121,12 +130,18 @@ async fn apply(client: &BasisClient, file: &Path) -> Result<()> {
                 let mut req = m.spec.to_request(&m.metadata.name, file)?;
                 req.cluster_id = cluster_id;
                 let created = client.create_machine(req).await?;
+                let edge_suffix = if created.edge_ip.is_empty() {
+                    String::new()
+                } else {
+                    format!("  edge_ip={}", created.edge_ip)
+                };
                 println!(
-                    "machine  {name:30}  id={id}  ip={ip}  provider={pid}",
+                    "machine  {name:30}  id={id}  ip={ip}  provider={pid}{edge}",
                     name = m.metadata.name,
                     id = created.id,
                     ip = created.ip_address,
                     pid = created.provider_id,
+                    edge = edge_suffix,
                 );
             }
         }

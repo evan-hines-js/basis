@@ -31,6 +31,27 @@ async fn install_crypto_provider_once() {
     .await;
 }
 
+/// Small test-scale network: /24 per tree keeps VM IPs readable
+/// (10.0.0.2, .3, …) while leaving room for a handful of VIPs up top.
+fn test_network_config() -> basis_controller::config::NetworkConfig {
+    basis_controller::config::NetworkConfig {
+        tree_supernet: "10.0.0.0/8".to_string(),
+        tree_prefix: 24,
+        vip_reserve: 16,
+        vni_range: basis_controller::config::VniRange {
+            start: 10_000,
+            end: 11_000,
+        },
+        vni_cooldown_secs: 60,
+        edge_pool: basis_controller::config::EdgePool {
+            cidr: "192.168.100.0/24".to_string(),
+            gateway: "192.168.100.1".to_string(),
+            range_start: "192.168.100.20".to_string(),
+            range_end: "192.168.100.100".to_string(),
+        },
+    }
+}
+
 struct RunningController {
     endpoint: String,
     pki: Arc<TestPki>,
@@ -51,21 +72,6 @@ impl RunningController {
         let db = basis_controller::db::Db::open(":memory:".as_ref())
             .await
             .unwrap();
-        db.seed_ip_pools(&[basis_controller::config::IpPool {
-            name: "default".to_string(),
-            cidr: "10.0.10.0/24".to_string(),
-            gateway: "10.0.10.1".to_string(),
-            vm_range: basis_controller::config::IpRange {
-                start: "10.0.10.20".to_string(),
-                end: "10.0.10.250".to_string(),
-            },
-            vip_range: basis_controller::config::IpRange {
-                start: "10.0.10.10".to_string(),
-                end: "10.0.10.19".to_string(),
-            },
-        }])
-        .await
-        .unwrap();
 
         let pki = Arc::new(TestPki::new(CONTROLLER_IDENTITY));
         let server_tls = pki.server_tls_config();
@@ -79,6 +85,7 @@ impl RunningController {
             db.clone(),
             metrics,
             vec!["1.1.1.1".to_string()],
+            test_network_config(),
             1.0,
         )
         .with_reconcile_interval(reconcile_interval);
@@ -88,7 +95,6 @@ impl RunningController {
             let _ = server.serve(listener, server_tls, server_shutdown).await;
         });
 
-        // Give the runtime a moment to start accepting connections.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         (
@@ -142,14 +148,13 @@ impl Drop for RunningController {
     }
 }
 
-/// Create a cluster via the CAPI API and return its id + the VIP the
-/// controller allocated from the pool's vip sub-range.
+/// Create a cluster via the CAPI API and return its id + the VIP.
 async fn create_cluster(running: &RunningController, name: &str) -> (String, String) {
     let mut capi = running.capi_client().await;
     let resp = capi
         .create_cluster(CreateClusterRequest {
             name: name.to_string(),
-            ip_pool: "default".to_string(),
+            parent_cluster_id: String::new(),
         })
         .await
         .unwrap()
@@ -157,15 +162,17 @@ async fn create_cluster(running: &RunningController, name: &str) -> (String, Str
     (resp.cluster_id, resp.control_plane_endpoint)
 }
 
-/// Register an agent and consume its RegisterAck. Returns the outbound
-/// channel, the inbound command stream, and the ack.
+/// Register an agent and consume its RegisterAck, returning the
+/// outbound channel, inbound command stream, host_id, and the initial
+/// reconcile state the controller sent inline with the ack.
 async fn register_agent(
     running: &RunningController,
     hostname: &str,
 ) -> (
     mpsc::Sender<AgentMessage>,
     tonic::Streaming<ControllerCommand>,
-    RegisterHostResponse,
+    String,
+    ReconcileHostCommand,
 ) {
     let mut client = running.agent_client(hostname).await;
     let (tx, rx) = mpsc::channel::<AgentMessage>(32);
@@ -177,6 +184,7 @@ async fn register_agent(
             total_memory_mib: 65536,
             total_disk_gib: 1000,
             gpus: Vec::new(),
+            vtep_address: "10.100.0.1".to_string(),
         })),
     })
     .await
@@ -192,8 +200,11 @@ async fn register_agent(
         Some(controller_command::Command::RegisterAck(a)) => a,
         other => panic!("expected RegisterAck, got {:?}", other),
     };
+    let initial = ack
+        .initial_state
+        .expect("RegisterAck must carry initial_state");
 
-    (tx, inbound, ack)
+    (tx, inbound, ack.host_id, initial)
 }
 
 fn basic_machine_req(name: &str, cluster_id: &str) -> CreateMachineRequest {
@@ -208,6 +219,7 @@ fn basic_machine_req(name: &str, cluster_id: &str) -> CreateMachineRequest {
         gpus: 0,
         gpu_constraints: None,
         extra_disks: Vec::new(),
+        edge: false,
     }
 }
 
@@ -230,9 +242,7 @@ async fn drive_create_to_running(
 }
 
 /// Drive DeleteMachine: agent receives DeleteVm, reports STOPPED,
-/// DeleteMachine returns. Now that teardown is synchronous, every
-/// delete-in-a-test needs this to avoid hitting the server-side
-/// `DELETE_MACHINE_TIMEOUT`.
+/// DeleteMachine returns.
 async fn drive_delete_to_stopped(
     agent_tx: &mpsc::Sender<AgentMessage>,
     inbound: &mut tonic::Streaming<ControllerCommand>,
@@ -246,10 +256,8 @@ async fn drive_delete_to_stopped(
     handle.await.unwrap().unwrap()
 }
 
-/// Drive DeleteCluster: consume any number of cascading DeleteVm
-/// commands, sending STOPPED for each. Returns once DeleteCluster
-/// resolves — which only happens after every cascaded delete is
-/// confirmed by the agent.
+/// Drive DeleteCluster: consume cascading DeleteVm + any interleaved
+/// ReconcileHost pushes, sending STOPPED for each delete.
 async fn drive_delete_cluster_to_stopped(
     agent_tx: &mpsc::Sender<AgentMessage>,
     inbound: &mut tonic::Streaming<ControllerCommand>,
@@ -272,6 +280,9 @@ async fn drive_delete_cluster_to_stopped(
                         let vm_id = c.vm_id.clone();
                         report_vm_state(agent_tx, &vm_id, MachineState::Stopped, "", false).await;
                     }
+                    Some(controller_command::Command::ReconcileHost(_)) => {
+                        // Membership update; nothing for the test to do.
+                    }
                     other => panic!("expected DeleteVm during cluster cascade, got {:?}", other),
                 }
             }
@@ -279,19 +290,28 @@ async fn drive_delete_cluster_to_stopped(
     }
 }
 
+/// Consume inbound commands until we see a CreateVm; return its vm_id.
+/// Non-CreateVm commands (e.g. a ReconcileHost push that happens to
+/// overlap) are ignored — the controller interleaves the two freely.
 async fn expect_create_vm(inbound: &mut tonic::Streaming<ControllerCommand>) -> String {
-    let cmd = inbound.next().await.unwrap().unwrap();
-    match &cmd.command {
-        Some(controller_command::Command::CreateVm(c)) => c.vm_id.clone(),
-        other => panic!("expected CreateVm, got {:?}", other),
+    loop {
+        let cmd = inbound.next().await.unwrap().unwrap();
+        match &cmd.command {
+            Some(controller_command::Command::CreateVm(c)) => return c.vm_id.clone(),
+            Some(controller_command::Command::ReconcileHost(_)) => continue,
+            other => panic!("expected CreateVm, got {:?}", other),
+        }
     }
 }
 
 async fn expect_delete_vm(inbound: &mut tonic::Streaming<ControllerCommand>) -> String {
-    let cmd = inbound.next().await.unwrap().unwrap();
-    match &cmd.command {
-        Some(controller_command::Command::DeleteVm(c)) => c.vm_id.clone(),
-        other => panic!("expected DeleteVm, got {:?}", other),
+    loop {
+        let cmd = inbound.next().await.unwrap().unwrap();
+        match &cmd.command {
+            Some(controller_command::Command::DeleteVm(c)) => return c.vm_id.clone(),
+            Some(controller_command::Command::ReconcileHost(_)) => continue,
+            other => panic!("expected DeleteVm, got {:?}", other),
+        }
     }
 }
 
@@ -321,12 +341,10 @@ async fn test_create_cluster_reserves_vip() {
     let (cluster_id, vip) = create_cluster(&running, "my-cluster").await;
 
     assert!(!cluster_id.is_empty());
-    // VIP was auto-allocated from the pool's vip sub-range (see the
-    // `IpPool` seeded in `start_with_reconcile`: vip_range is
-    // 10.0.10.10 – 10.0.10.19).
-    assert!(vip.starts_with("10.0.10.1"), "vip={vip}");
+    // First tree carves 10.0.0.0/24; VIPs sit at the top. First VIP =
+    // broadcast(10.0.0.255) - 1 - (vip_reserve - 1) = 10.0.0.239.
+    assert_eq!(vip, "10.0.0.239");
 
-    // GetCluster returns the same values.
     let mut capi = running.capi_client().await;
     let got = capi
         .get_cluster(GetClusterRequest {
@@ -337,17 +355,43 @@ async fn test_create_cluster_reserves_vip() {
         .into_inner();
     assert_eq!(got.cluster_id, cluster_id);
     assert_eq!(got.control_plane_endpoint, vip);
-    assert_eq!(got.ip_pool, "default");
     assert_eq!(got.name, "my-cluster");
+    assert!(got.parent_cluster_id.is_empty(), "tree root has no parent");
+    assert_ne!(got.tree_id, "");
+    assert_eq!(got.vni, 10_000, "first tree gets the low end of the VNI range");
+}
+
+#[tokio::test]
+async fn test_child_cluster_inherits_parent_tree() {
+    let (running, _db) = RunningController::start().await;
+    let mut capi = running.capi_client().await;
+    let root = capi
+        .create_cluster(CreateClusterRequest {
+            name: "root".to_string(),
+            parent_cluster_id: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let child = capi
+        .create_cluster(CreateClusterRequest {
+            name: "child".to_string(),
+            parent_cluster_id: root.cluster_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(child.tree_id, root.tree_id, "child shares parent's tree");
+    assert_eq!(child.vni, root.vni, "child shares parent's VNI");
+    assert_ne!(
+        child.control_plane_endpoint, root.control_plane_endpoint,
+        "each cluster gets its own VIP"
+    );
 }
 
 #[tokio::test]
 async fn test_create_cluster_is_idempotent_by_name() {
-    // CAPI reconcilers retry after partial failures (cluster created in
-    // basis but status patch never landed). A second CreateCluster with
-    // the same name must return the existing record, not error — and
-    // crucially must return the SAME VIP, otherwise the reconciler would
-    // see drift between basis and the BasisCluster CR.
     let (running, _db) = RunningController::start().await;
     let (first_id, first_vip) = create_cluster(&running, "dup").await;
 
@@ -355,7 +399,7 @@ async fn test_create_cluster_is_idempotent_by_name() {
     let resp = capi
         .create_cluster(CreateClusterRequest {
             name: "dup".to_string(),
-            ip_pool: "default".to_string(),
+            parent_cluster_id: String::new(),
         })
         .await
         .unwrap()
@@ -367,10 +411,10 @@ async fn test_create_cluster_is_idempotent_by_name() {
 #[tokio::test]
 async fn test_full_create_delete_flow() {
     let (running, db) = RunningController::start().await;
-    let (cluster_id, vip) = create_cluster(&running, "test-cluster").await;
-    assert!(vip.starts_with("10.0.10."));
+    let (cluster_id, _vip) = create_cluster(&running, "test-cluster").await;
 
-    let (agent_tx, mut inbound, _ack) = register_agent(&running, "test-host-1").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "test-host-1").await;
     let mut capi = running.capi_client().await;
 
     let resp = drive_create_to_running(
@@ -380,13 +424,11 @@ async fn test_full_create_delete_flow() {
         basic_machine_req("test-vm", &cluster_id),
     )
     .await;
-    // VM allocations come from the pool's vm sub-range (starts at
-    // 10.0.10.20 — see the `IpPool` seeded in
-    // `start_with_reconcile`).
-    assert_eq!(resp.ip_address, "10.0.10.20");
+    // First VM IP in a /24 tree = gateway + 1 = 10.0.0.2.
+    assert_eq!(resp.ip_address, "10.0.0.2");
     assert!(resp.provider_id.contains(&resp.id));
+    assert!(resp.edge_ip.is_empty(), "non-edge machine gets no second IP");
 
-    // GetMachine / ListMachines
     let machine = capi
         .get_machine(GetMachineRequest {
             id: resp.id.clone(),
@@ -397,6 +439,7 @@ async fn test_full_create_delete_flow() {
     assert_eq!(machine.name, "test-vm");
     assert_eq!(machine.cluster_id, cluster_id);
     assert_eq!(machine.state, MachineState::Running as i32);
+    assert!(!machine.edge);
 
     let list = capi
         .list_machines(ListMachinesRequest {
@@ -407,9 +450,6 @@ async fn test_full_create_delete_flow() {
         .into_inner();
     assert_eq!(list.machines.len(), 1);
 
-    // Delete. Synchronous on the server side: DeleteMachine blocks
-    // until the agent reports STOPPED, so we have to drive the agent
-    // to completion.
     let vm_id = resp.id.clone();
     let delete_fut = {
         let mut capi = capi.clone();
@@ -420,15 +460,41 @@ async fn test_full_create_delete_flow() {
     };
     drive_delete_to_stopped(&agent_tx, &mut inbound, delete_fut).await;
 
-    // VM row is gone after the agent confirmed.
     assert!(db.get_vm(&resp.id).await.is_err());
+}
+
+#[tokio::test]
+async fn test_edge_machine_gets_second_nic_ip() {
+    let (running, _db) = RunningController::start().await;
+    let (cluster_id, _vip) = create_cluster(&running, "edge-cluster").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "edge-host").await;
+    let mut capi = running.capi_client().await;
+
+    let mut req = basic_machine_req("edge-vm", &cluster_id);
+    req.edge = true;
+    let resp = drive_create_to_running(&agent_tx, &mut inbound, &mut capi, req).await;
+
+    // Tree-side IP is the first in the VM range; edge IP is the first
+    // in the edge pool's range.
+    assert_eq!(resp.ip_address, "10.0.0.2");
+    assert_eq!(resp.edge_ip, "192.168.100.20");
+
+    let machine = capi
+        .get_machine(GetMachineRequest { id: resp.id })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(machine.edge);
+    assert_eq!(machine.edge_ip, "192.168.100.20");
 }
 
 #[tokio::test]
 async fn test_delete_cluster_cascades_machine_deletes() {
     let (running, db) = RunningController::start().await;
     let (cluster_id, doomed_vip) = create_cluster(&running, "doomed").await;
-    let (agent_tx, mut inbound, _ack) = register_agent(&running, "host-a").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "host-a").await;
     let mut capi = running.capi_client().await;
 
     let vm = drive_create_to_running(
@@ -439,9 +505,6 @@ async fn test_delete_cluster_cascades_machine_deletes() {
     )
     .await;
 
-    // DeleteCluster is synchronous: it won't return until every
-    // cascaded VM's agent has reported STOPPED, so we have to feed
-    // the confirmation while the RPC is in flight.
     let delete_fut = {
         let mut capi = capi.clone();
         let cluster_id = cluster_id.clone();
@@ -452,10 +515,7 @@ async fn test_delete_cluster_cascades_machine_deletes() {
     };
     drive_delete_cluster_to_stopped(&agent_tx, &mut inbound, delete_fut).await;
 
-    // VM row is gone once the cascade completed.
     assert!(db.get_vm(&vm.id).await.is_err());
-
-    // Cluster row is gone.
     assert_eq!(
         capi.get_cluster(GetClusterRequest {
             cluster_id: cluster_id.clone()
@@ -466,20 +526,24 @@ async fn test_delete_cluster_cascades_machine_deletes() {
         tonic::Code::NotFound
     );
 
-    // VIP is back in the pool — the next cluster we create reclaims the
-    // same address, proving `release_ips` ran during cluster teardown.
-    // (Both clusters were the only VIP holders and the sub-range
-    // allocator picks the lowest free address.)
+    // The tree's VIP is still in VNI-cooldown (no room for reuse) —
+    // but the sub-range itself is a per-tree allocation and the tree
+    // row persists until cooldown expires. The next cluster is a
+    // fresh tree on the next VNI and a different VIP entirely. This
+    // is a behaviour change from the single-pool model.
     let mut capi = running.capi_client().await;
     let resp = capi
         .create_cluster(CreateClusterRequest {
-            name: "reclaim".to_string(),
-            ip_pool: "default".to_string(),
+            name: "after-delete".to_string(),
+            parent_cluster_id: String::new(),
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.control_plane_endpoint, doomed_vip);
+    assert_ne!(
+        resp.control_plane_endpoint, doomed_vip,
+        "new tree gets its own CIDR and VIP space"
+    );
 }
 
 #[tokio::test]
@@ -495,6 +559,7 @@ async fn test_create_machine_no_agent() {
         total_memory_mib: 65536,
         total_disk_gib: 1000,
         gpu_inventory: "[]".to_string(),
+        vtep_address: "10.100.0.99".to_string(),
         last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
         healthy: true,
     })
@@ -525,7 +590,8 @@ async fn test_create_machine_unknown_cluster_fails() {
 async fn test_create_machine_agent_reports_failure() {
     let (running, db) = RunningController::start().await;
     let (cluster_id, _vip) = create_cluster(&running, "fail-cluster").await;
-    let (agent_tx, mut inbound, _ack) = register_agent(&running, "fail-host").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "fail-host").await;
 
     let capi = running.capi_client().await;
     let create_handle = {
@@ -534,11 +600,7 @@ async fn test_create_machine_agent_reports_failure() {
         tokio::spawn(async move { capi.create_machine(req).await })
     };
 
-    let cmd = inbound.next().await.unwrap().unwrap();
-    let vm_id = match &cmd.command {
-        Some(controller_command::Command::CreateVm(c)) => c.vm_id.clone(),
-        _ => panic!("expected CreateVm"),
-    };
+    let vm_id = expect_create_vm(&mut inbound).await;
 
     agent_tx
         .send(AgentMessage {
@@ -584,9 +646,6 @@ async fn test_wrong_cn_rejected_from_capi_rpc() {
 
 #[tokio::test]
 async fn test_capi_cn_cannot_open_agent_stream() {
-    // The CAPI provider's CN is authorised for CAPI RPCs only. Opening the
-    // agent stream with that CN must be rejected before any register
-    // message is inspected.
     let (running, _db) = RunningController::start().await;
     let mut client = running.agent_client(CAPI_PROVIDER_IDENTITY).await;
     let (_tx, rx) = mpsc::channel::<AgentMessage>(1);
@@ -610,6 +669,7 @@ async fn test_agent_cn_must_match_registered_hostname() {
             total_memory_mib: 65536,
             total_disk_gib: 1000,
             gpus: Vec::new(),
+            vtep_address: "10.100.0.1".to_string(),
         })),
     })
     .await
@@ -625,17 +685,16 @@ async fn test_agent_cn_must_match_registered_hostname() {
 #[tokio::test]
 async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
     let (running, db) = RunningController::start().await;
-    let (agent_tx, inbound, ack) = register_agent(&running, "capacity-host").await;
+    let (agent_tx, inbound, host_id, _initial) =
+        register_agent(&running, "capacity-host").await;
 
-    // Simulate a blip: the health checker has marked this host unhealthy.
-    // A fresh heartbeat should flip it back.
-    db.mark_host_unhealthy(&ack.host_id).await.unwrap();
-    assert!(!db.get_host(&ack.host_id).await.unwrap().healthy);
+    db.mark_host_unhealthy(&host_id).await.unwrap();
+    assert!(!db.get_host(&host_id).await.unwrap().healthy);
 
     agent_tx
         .send(AgentMessage {
             payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
-                host_id: ack.host_id.clone(),
+                host_id: host_id.clone(),
             })),
         })
         .await
@@ -643,7 +702,7 @@ async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
 
     let mut attempts = 0;
     loop {
-        if db.get_host(&ack.host_id).await.unwrap().healthy {
+        if db.get_host(&host_id).await.unwrap().healthy {
             break;
         }
         attempts += 1;
@@ -659,15 +718,10 @@ async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
 
 #[tokio::test]
 async fn test_controller_pushes_periodic_reconcile() {
-    // Closes the staleness gap: while the agent is already connected, the
-    // controller periodically pushes the authoritative VM list so a VM
-    // that was deleted but whose DeleteVm never landed still gets cleaned
-    // up without waiting for the agent to reconnect.
     let (running, _db) = RunningController::start_with_reconcile(Duration::from_millis(150)).await;
-    let (_agent_tx, mut inbound, _ack) = register_agent(&running, "reconcile-host").await;
+    let (_agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "reconcile-host").await;
 
-    // First ReconcileHostCommand must arrive within a few intervals. With
-    // no VMs on this host, it should carry an empty list.
     let cmd = tokio::time::timeout(Duration::from_secs(2), inbound.next())
         .await
         .expect("ReconcileHost command never arrived")
@@ -676,17 +730,20 @@ async fn test_controller_pushes_periodic_reconcile() {
     match cmd.command {
         Some(controller_command::Command::ReconcileHost(r)) => {
             assert!(r.expected_vm_ids.is_empty());
+            assert!(r.trees.is_empty(), "no VMs → no tree membership");
         }
         other => panic!("expected ReconcileHost, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn test_reconnect_reports_expected_vm_ids() {
+async fn test_reconnect_reports_expected_vm_ids_and_trees() {
     let (running, _db) = RunningController::start().await;
     let (cluster_id, _vip) = create_cluster(&running, "reconnect-cluster").await;
-    let (agent_tx, mut inbound, ack1) = register_agent(&running, "reconnect-host").await;
-    assert!(ack1.expected_vm_ids.is_empty());
+    let (agent_tx, mut inbound, host_id, initial1) =
+        register_agent(&running, "reconnect-host").await;
+    assert!(initial1.expected_vm_ids.is_empty());
+    assert!(initial1.trees.is_empty());
 
     let mut capi = running.capi_client().await;
     let resp = drive_create_to_running(
@@ -700,7 +757,13 @@ async fn test_reconnect_reports_expected_vm_ids() {
     drop(agent_tx);
     drop(inbound);
 
-    let (_tx2, _inbound2, ack2) = register_agent(&running, "reconnect-host").await;
-    assert_eq!(ack2.host_id, ack1.host_id);
-    assert_eq!(ack2.expected_vm_ids, vec![resp.id]);
+    let (_tx2, _inbound2, host_id2, initial2) = register_agent(&running, "reconnect-host").await;
+    assert_eq!(host_id2, host_id);
+    assert_eq!(initial2.expected_vm_ids, vec![resp.id]);
+    assert_eq!(initial2.trees.len(), 1, "host has one tree's worth of VMs");
+    let tree_state = &initial2.trees[0];
+    assert_eq!(tree_state.vni, 10_000);
+    // VTEP peer list contains this host's own address. (The agent
+    // filters itself out client-side before building FDB entries.)
+    assert_eq!(tree_state.vtep_addresses, vec!["10.100.0.1".to_string()]);
 }

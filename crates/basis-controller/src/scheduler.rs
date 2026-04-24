@@ -242,6 +242,7 @@ mod tests {
             total_memory_mib: mem,
             total_disk_gib: disk,
             gpu_inventory: serde_json::to_string(gpus).unwrap(),
+            vtep_address: format!("10.100.0.{id}"),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,
         }
@@ -288,6 +289,7 @@ mod tests {
             cluster_id: "c1".to_string(),
             host_id: host_id.to_string(),
             ip_address: "10.0.0.1".to_string(),
+            edge_ip: None,
             state: 2,
             cpu,
             memory_mib: mem,
@@ -442,6 +444,7 @@ mod tests {
                 basis_proto::ExtraDisk { size_gib: 400 },
                 basis_proto::ExtraDisk { size_gib: 100 },
             ],
+            edge: false,
         };
         let sched_req: ScheduleRequest = (&req).into();
         assert_eq!(sched_req.disk_gib, 600);

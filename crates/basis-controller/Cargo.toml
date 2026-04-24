@@ -37,6 +37,7 @@ serde_json.workspace = true
 humantime.workspace = true
 prometheus.workspace = true
 axum.workspace = true
+ipnet.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

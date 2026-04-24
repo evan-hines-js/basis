@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
-use crate::image::{GuestNetwork, ImageManager};
+use crate::image::{GuestEdgeNetwork, GuestNetwork, ImageManager};
 use crate::lvm;
 use crate::metrics::Metrics;
 use crate::network::NetworkManager;
@@ -27,27 +27,12 @@ use crate::vm::{unit_name_for_vm, BootArtifacts, VmManager};
 
 /// Prepare disk, network, GPU passthrough, and spawn cloud-hypervisor.
 ///
-/// On any failure mid-way through, every step that already ran is rolled
-/// back via [`delete_vm`] so the host is left as if the create never
-/// happened. The local DB row is inserted *before* the systemd-run spawn:
-/// if the spawn (or any later step) fails, rollback uses the row to find
-/// the GPU bindings to release; if a crash happens between insert and
-/// spawn, the startup reconciler sees a row pointing at non-existent
-/// disk artifacts and reports FAILED so CAPI remediates — strictly
-/// better than the prior ordering, where a successful spawn followed
-/// by a DB-insert failure produced a running-but-unknown VM that
-/// startup reconcile killed as an orphan.
-///
-/// Because the DB row exists before the systemd unit, the periodic
-/// `report_local_vm_states` would otherwise see a row for a VM whose
-/// systemd unit hasn't spawned yet and wrongly report FAILED during
-/// the create window — surfaced to the controller's in-flight RPC as
-/// "VM creation failed: systemd scope gone". We bracket the whole
-/// create flow with [`VmManager::mark_pending`] / `clear_pending`;
-/// the reporter skips pending VMs (their authoritative state comes
-/// from `spawn_create` on completion), and the orphan sweep also
-/// treats pending vm_ids as live so it won't reclaim in-flight
-/// resources.
+/// On any failure mid-way through, every step that already ran is
+/// rolled back via [`delete_vm`] so the host is left as if the create
+/// never happened. The local DB row is inserted *before* the systemd-
+/// run spawn so rollback can find the state it needs; if a crash
+/// happens between insert and spawn, the startup reconciler sees a row
+/// pointing at non-existent disk artifacts and reports FAILED.
 pub async fn create_vm(
     cmd: &CreateVmCommand,
     image_mgr: &ImageManager,
@@ -62,7 +47,7 @@ pub async fn create_vm(
 
     match result {
         Ok(()) => {
-            info!(vm_id = %cmd.vm_id, ip = %cmd.ip_address, "VM created");
+            info!(vm_id = %cmd.vm_id, ip = %cmd.ip_address, vni = cmd.vni, "VM created");
             Ok(())
         }
         Err(e) => {
@@ -71,10 +56,6 @@ pub async fn create_vm(
                 error = %e,
                 "create_vm failed; rolling back partial state"
             );
-            // Rollback is best-effort; any step that errors is picked
-            // up by the orphan sweep. We don't surface delete errors
-            // here because the caller already has the create error to
-            // report.
             let _ = delete_vm(&cmd.vm_id, vm_mgr, net_mgr, agent_db).await;
             Err(e)
         }
@@ -92,11 +73,6 @@ async fn create_vm_inner(
     let vm_dir = vm_mgr.vms_dir.join(&cmd.vm_id);
     std::fs::create_dir_all(&vm_dir)?;
 
-    // Each step is timed inline. Observations happen on the `Ok` path;
-    // a step that errors is not observed — its latency would skew the
-    // distribution (a failed OCI pull can dominate for minutes) and
-    // the error rate is visible via the controller's
-    // `basis_vm_create_result_total{result="vm_failed"}` counter.
     let started = Instant::now();
     let base = image_mgr.ensure_cached(&cmd.image).await?;
     metrics
@@ -104,8 +80,7 @@ async fn create_vm_inner(
         .observe(started.elapsed().as_secs_f64());
 
     // Persist the VM record up front so any later failure has a DB row
-    // to drive rollback off of, and so a crash here can't produce a
-    // running-but-unknown VM (see module doc).
+    // to drive rollback off of.
     let extra_disk_gibs: Vec<u32> = cmd.extra_disks.iter().map(|d| d.size_gib).collect();
     agent_db
         .insert_vm(&LocalVmRow {
@@ -121,6 +96,12 @@ async fn create_vm_inner(
             extra_disk_gibs: serde_json::to_string(&extra_disk_gibs)
                 .expect("serializing Vec<u32> to JSON is infallible"),
             image: cmd.image.clone(),
+            vni: cmd.vni as i64,
+            edge_ip: if cmd.edge_ip.is_empty() {
+                None
+            } else {
+                Some(cmd.edge_ip.clone())
+            },
             created_at: now_rfc3339(),
         })
         .await?;
@@ -132,12 +113,6 @@ async fn create_vm_inner(
         .lv_snapshot_seconds
         .observe(started.elapsed().as_secs_f64());
 
-    // Create each extra data disk as a plain thin LV. Order is the
-    // caller's — the agent preserves indexes so post-reboot restarts
-    // reattach the same disk at the same virtio slot. A mid-loop
-    // failure leaves partials behind; rollback (`delete_vm`) calls
-    // `remove_vm_data_disks` which enumerates from `lvs` and cleans
-    // them up regardless of how far we got.
     let started = Instant::now();
     let mut data_disk_paths = Vec::with_capacity(cmd.extra_disks.len());
     for (index, disk) in cmd.extra_disks.iter().enumerate() {
@@ -148,6 +123,16 @@ async fn create_vm_inner(
     metrics
         .data_disk_create_seconds
         .observe(started.elapsed().as_secs_f64());
+
+    let edge_network = if cmd.edge_ip.is_empty() {
+        None
+    } else {
+        Some(GuestEdgeNetwork {
+            ip_address: &cmd.edge_ip,
+            gateway: &cmd.edge_gateway,
+            prefix_len: cmd.edge_prefix_len,
+        })
+    };
 
     let started = Instant::now();
     let cloud_init_path = image_mgr
@@ -162,6 +147,7 @@ async fn create_vm_inner(
                 prefix_len: cmd.prefix_len,
                 dns_servers: &cmd.dns_servers,
             },
+            edge_network.as_ref(),
         )
         .await?;
     metrics
@@ -169,7 +155,12 @@ async fn create_vm_inner(
         .observe(started.elapsed().as_secs_f64());
 
     let started = Instant::now();
-    let tap = net_mgr.create_tap(&cmd.vm_id).await?;
+    let primary_tap = net_mgr.attach_vm_primary(&cmd.vm_id, cmd.vni).await?;
+    let edge_tap = if cmd.edge_ip.is_empty() {
+        None
+    } else {
+        Some(net_mgr.attach_vm_edge(&cmd.vm_id).await?)
+    };
     metrics
         .tap_create_seconds
         .observe(started.elapsed().as_secs_f64());
@@ -194,7 +185,8 @@ async fn create_vm_inner(
                 cloud_init: &cloud_init_path,
                 extra_disks: &data_disk_paths,
             },
-            &tap,
+            &primary_tap,
+            edge_tap.as_deref(),
             &vfio_devices,
         )
         .await?;
@@ -206,39 +198,15 @@ async fn create_vm_inner(
 
 /// Tear down a VM. Returns success only when every step succeeded so
 /// the controller can bound its `DeleteCluster` / `DeleteMachine` RPC
-/// on real cleanup completion — that's what gives workers genuine
-/// backpressure instead of pipelining creates behind unresolved
-/// deletes.
-///
-/// Row-first ordering is load-bearing. `vm_mgr.delete_vm` removes the
-/// VM from the tracked map immediately but its `systemctl stop` can
-/// take a few seconds and `lvremove` often waits for a still-open
-/// block-device handle. If the DB row survived the whole cleanup,
-/// `reconcile_running_vms` could tick during that window, see a row
-/// whose VM is no longer in the tracked map, and report FAILED for a
-/// VM that's just being deleted — which then surfaces to the
-/// controller's in-flight RPC as a spurious "VM creation failed".
-/// Dropping the row first means the reconciler simply doesn't consider
-/// the VM anymore.
-///
-/// Errors in GPU / tap / systemd steps are best-effort (logged, do not
-/// abort the delete) because those resources either don't exist yet or
-/// are already gone and retrying doesn't help. The one error we
-/// surface is `lvremove` — that's the leak that matters (the thin
-/// pool fills with orphans and lvm2 degrades to O(N)). All lvremove
-/// errors are treated as transient: the controller's client retries,
-/// and the orphan sweep picks up any LV that stays stuck across
-/// retries.
+/// on real cleanup completion.
 pub async fn delete_vm(
     vm_id: &str,
     vm_mgr: &Arc<VmManager>,
     net_mgr: &NetworkManager,
     agent_db: &AgentDb,
 ) -> anyhow::Result<()> {
-    // Read the record first so we still have the GPU PCI list after the
-    // row is gone. `get_vm` errors (bad JSON, sqlite failure) degrade to
-    // "skip GPU unbind" — the orphan sweep can't help here, but a stuck
-    // vfio binding is a single-host diagnostic.
+    // Read the record first so we still have the GPU PCI list after
+    // the row is gone.
     let record = agent_db.get_vm(vm_id).await.ok().flatten();
 
     if let Err(e) = agent_db.delete_vm(vm_id).await {
@@ -255,20 +223,13 @@ pub async fn delete_vm(
         }
     }
 
-    if let Err(e) = net_mgr.delete_tap(vm_id).await {
-        warn!(vm_id, error = %e, "failed to delete tap");
-    }
+    net_mgr.detach_vm_taps(vm_id).await;
+
     if let Err(e) = vm_mgr.delete_vm(vm_id).await {
         warn!(vm_id, error = %e, "failed to stop VM");
     }
-    // lvremove comes last: cloud-hypervisor holds `/dev/basis/vm-<id>`
-    // and any `/dev/basis/vmdata-<id>-*` exclusively until its process
-    // exits, so `vm_mgr.delete_vm` must return (with its `udevadm
-    // settle` draining pending release events) before we remove any
-    // LV. Rootfs LV first, then the (possibly empty) set of data
-    // disks; both failures are surfaced — a leaked LV of either kind
-    // is the leak that matters (the thin pool fills with orphans and
-    // lvm2 degrades to O(N)).
+    // lvremove comes last: cloud-hypervisor holds its LVs exclusively
+    // until its process exits.
     lvm::remove_vm_lv(vm_id).await.map_err(|e| {
         warn!(vm_id, error = %e, "VM delete failed at lvremove; caller will retry");
         anyhow::Error::from(e)
@@ -287,12 +248,11 @@ pub async fn delete_vm(
 /// controller — its disk overlay, tap, and GPU bindings are garbage.
 ///
 /// `delete_grace` defends against a buggy/incomplete `expected_vm_ids`
-/// push by skipping deletion of VMs younger than the grace window. Pass
-/// `Duration::ZERO` for the post-register reconcile (the agent has been
-/// offline; the controller's view *is* authoritative). Pass a non-zero
-/// grace for periodic pushes from `ReconcileHostCommand` so an in-flight
-/// CreateMachine that hasn't yet been added to the controller's view
-/// can't be wiped out by a single misbehaving push.
+/// push by skipping deletion of VMs younger than the grace window.
+/// Pass `Duration::ZERO` for the post-register reconcile (the agent
+/// has been offline; the controller's view *is* authoritative). Pass
+/// a non-zero grace for periodic pushes so an in-flight CreateMachine
+/// the controller hasn't fully recorded yet can't be wiped out.
 pub async fn reconcile_against_expected(
     expected_vm_ids: &[String],
     vm_mgr: &Arc<VmManager>,
@@ -323,11 +283,6 @@ pub async fn reconcile_against_expected(
         to_delete.push(vm);
     }
 
-    // Fan out the deletes. Each one does a systemctl-stop + lvremove
-    // which takes seconds per VM; serially this can block the reconcile
-    // (and any other path that waits on the same task) for minutes on
-    // a large forgotten set. `delete_vm` is best-effort and returns
-    // `()`, so `join_all` fits — no partial-failure propagation needed.
     futures::future::join_all(
         to_delete
             .iter()
@@ -337,9 +292,6 @@ pub async fn reconcile_against_expected(
     Ok(())
 }
 
-/// True iff `created_at` (RFC 3339) is less than `grace` ago. A
-/// malformed timestamp falls through to `false`: an unparseable
-/// created_at is older than any grace period worth defending.
 fn younger_than(created_at: &str, now: std::time::SystemTime, grace: Duration) -> bool {
     parse_rfc3339(created_at)
         .ok()
@@ -349,11 +301,6 @@ fn younger_than(created_at: &str, now: std::time::SystemTime, grace: Duration) -
 }
 
 /// Send a single VM state report to the controller.
-///
-/// `transient` distinguishes a load-shedding failure (queue timeout,
-/// semaphore full, backend busy) from a real fault. The controller
-/// maps it onto `Status::Unavailable` so callers retry, and labels
-/// the metric `{result="busy"}`. Ignored for state=RUNNING.
 pub async fn send_vm_state(
     sender: &mpsc::Sender<AgentMessage>,
     vm_id: String,
@@ -374,40 +321,16 @@ pub async fn send_vm_state(
     }
 }
 
-/// Report the state of every locally-known VM to the controller:
-/// `Running` if systemd still has the unit, `Failed` otherwise. Used
-/// both as the one-shot post-handshake catch-up (so the controller
-/// sees the full picture of VMs that survived an agent restart) and
-/// as the periodic "thick agent" drift detector that catches VMs
-/// whose systemd scope disappeared (crash, OOM, manual stop).
-///
-/// One function, one definition of "report VM state," because the
-/// previous split between this and a FAILED-only variant drifted
-/// apart (different error strings, different sites calling each) and
-/// made it easy to forget which semantics applied where.
+/// Report the state of every locally-known VM to the controller.
 pub async fn report_local_vm_states(
     agent_db: &AgentDb,
     vm_mgr: &Arc<VmManager>,
     sender: &mpsc::Sender<AgentMessage>,
 ) -> anyhow::Result<()> {
     for vm in agent_db.list_vms().await? {
-        // Skip VMs whose create is mid-flight. `spawn_create` will
-        // send the authoritative state once `systemd-run` returns;
-        // reporting Running here (while the systemd unit is only
-        // "pending start") would let the controller prematurely
-        // resolve its pending CreateMachine, which in turn lets a
-        // subsequent DeleteMachine race with the still-pending start
-        // job and produce `systemd-run: Job canceled`.
         if vm_mgr.is_pending(&vm.vm_id).await {
             continue;
         }
-        // `has_live_process` reads `SubState` directly from systemd so
-        // we catch guest-level crashes (virtio failure, kernel panic,
-        // OOM). Without this, a `cloud-hypervisor` that exited cleanly
-        // with `--remain-after-exit` would look "active" to any
-        // in-memory check and the VM would report `Running` forever
-        // while the guest is dead, blocking CAPI from triggering
-        // replacement.
         let (state, err) = if vm_mgr.has_live_process(&vm.vm_id).await {
             (MachineState::Running, String::new())
         } else {
@@ -428,6 +351,7 @@ pub async fn report_local_vm_states(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::{tree::TreeManager, NetworkManager, UplinkBridge};
 
     fn fake_vm(id: &str) -> LocalVmRow {
         LocalVmRow {
@@ -441,6 +365,8 @@ mod tests {
             gpu_pci_addresses: "[]".to_string(),
             extra_disk_gibs: "[]".to_string(),
             image: "img".to_string(),
+            vni: 10_000,
+            edge_ip: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }
     }
@@ -463,14 +389,11 @@ mod tests {
         let vm_mgr = Arc::new(VmManager::new(
             std::env::temp_dir().join("basis-test-reconcile"),
         ));
-        let net_mgr = NetworkManager::new("test-br".to_string(), "lo".to_string());
-        (vm_mgr, net_mgr)
+        let uplink = UplinkBridge::new("test-br".to_string(), "lo".to_string(), 9000);
+        let trees = TreeManager::new("127.0.0.1".to_string(), 9000);
+        (vm_mgr, NetworkManager::new(uplink, trees))
     }
 
-    /// `reconcile_against_expected` deletes everything the controller has
-    /// forgotten. We can't run the real delete (no systemd/network in
-    /// tests) so we verify the DB-level effect: rows for forgotten VMs
-    /// are gone, rows for expected VMs remain.
     #[tokio::test]
     async fn reconcile_deletes_forgotten_vm_records() {
         let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
@@ -519,9 +442,6 @@ mod tests {
         assert_eq!(db.list_vms().await.unwrap().len(), 2);
     }
 
-    /// A non-zero grace defers deletion of fresh VMs missing from the
-    /// list — defends in-flight CreateMachine work against a single
-    /// misbehaving controller push.
     #[tokio::test]
     async fn reconcile_grace_defers_delete_of_fresh_vms() {
         let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
@@ -540,15 +460,9 @@ mod tests {
             .into_iter()
             .map(|v| v.vm_id)
             .collect();
-        assert_eq!(
-            remaining,
-            vec!["just-created".to_string()],
-            "fresh VM should be deferred; old VM should be deleted"
-        );
+        assert_eq!(remaining, vec!["just-created".to_string()]);
     }
 
-    /// Zero grace deletes regardless of age — used for the post-register
-    /// reconcile where the controller's view is fully authoritative.
     #[tokio::test]
     async fn reconcile_zero_grace_deletes_fresh_vms() {
         let db = AgentDb::open(":memory:".as_ref()).await.unwrap();

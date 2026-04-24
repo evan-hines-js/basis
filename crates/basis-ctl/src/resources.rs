@@ -21,8 +21,11 @@ pub struct Metadata {
 
 #[derive(Debug, Deserialize)]
 pub struct ClusterSpec {
-    #[serde(rename = "ipPool")]
-    pub ip_pool: String,
+    /// Name of another Cluster resource that should be this cluster's
+    /// parent in the tree / trust domain. Unset → this cluster is a
+    /// tree root and gets a fresh VNI + CIDR.
+    #[serde(default, rename = "parentCluster")]
+    pub parent_cluster: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +59,10 @@ pub struct MachineSpec {
     /// storage operator (Rook/Ceph) can claim them.
     #[serde(default, rename = "extraDiskGibs")]
     pub extra_disk_gibs: Vec<u32>,
+    /// When true, Basis attaches a second NIC to the uplink for this
+    /// machine — used for Cilium BGP / edge ingress.
+    #[serde(default)]
+    pub edge: bool,
 }
 
 impl MachineSpec {
@@ -89,6 +96,7 @@ impl MachineSpec {
             gpus: self.gpus,
             min_gpu_group_size: self.min_gpu_group_size,
             extra_disk_gibs: self.extra_disk_gibs.clone(),
+            edge: self.edge,
         })
     }
 }

@@ -214,6 +214,7 @@ async fn apply(
                 .as_ref()
                 .map(|c| c.min_group_size),
             extra_disk_gibs: machine.spec.extra_disk_gibs.clone(),
+            edge: machine.spec.edge,
         })
         .await?;
 
@@ -263,16 +264,11 @@ async fn observe_vm(
     let state = MachineState::try_from(vm.state).unwrap_or(MachineState::Pending);
     match state {
         MachineState::Running => {
-            // Refresh the success patch on every tick. The kube apiserver
-            // merge is a no-op if nothing changed, and this is what
-            // self-heals a BasisMachine whose condition set was left
-            // stale by a prior transient failure (e.g. a past
-            // `Ready=False` from a BasisBackpressure that has since
-            // recovered to RUNNING).
             let created = CreatedMachine {
                 id: vm.id.clone(),
                 provider_id: vm.provider_id.clone(),
                 ip_address: vm.ip_address.clone(),
+                edge_ip: vm.edge_ip.clone(),
             };
             write_success_status(api, name, &created, machine, generation).await?;
             Ok(Action::requeue(Duration::from_secs(60)))
@@ -326,6 +322,20 @@ async fn write_success_status(
         conditions::ready_true("VMRunning", generation),
     );
 
+    // Primary tree-side IP is the node's InternalIP; edge IP (only
+    // present on edge nodes) is exposed as ExternalIP so CAPI and
+    // downstream consumers see the uplink-side address alongside it.
+    let mut addresses = vec![MachineAddress {
+        kind: "InternalIP".to_string(),
+        address: created.ip_address.clone(),
+    }];
+    if !created.edge_ip.is_empty() {
+        addresses.push(MachineAddress {
+            kind: "ExternalIP".to_string(),
+            address: created.edge_ip.clone(),
+        });
+    }
+
     merge_status(
         api,
         name,
@@ -335,10 +345,7 @@ async fn write_success_status(
                 "initialization": { "provisioned": true },
                 "providerID": created.provider_id,
                 "basisVmId": created.id,
-                "addresses": [MachineAddress {
-                    kind: "InternalIP".to_string(),
-                    address: created.ip_address.clone(),
-                }],
+                "addresses": addresses,
                 "failureMessage": serde_json::Value::Null,
                 "conditions": conditions,
             }

@@ -134,7 +134,8 @@ impl VmManager {
         &self,
         cmd: &CreateVmCommand,
         boot: &BootArtifacts<'_>,
-        tap_name: &str,
+        primary_tap: &str,
+        edge_tap: Option<&str>,
         vfio_devices: &[String],
     ) -> Result<(), VmError> {
         let vm_dir = self.vms_dir.join(&cmd.vm_id);
@@ -146,21 +147,14 @@ impl VmManager {
         // Direct kernel boot: we pass the guest kernel, initramfs, and a
         // hardcoded command line to cloud-hypervisor, bypassing the EFI
         // firmware / shim / grub chain entirely. Rationale lives in
-        // `image.rs`'s module doc; the practical effect is that boot is
-        // deterministic and doesn't depend on the minimal UEFI firmware
-        // exposing services Ubuntu's bootloader chain requires.
+        // `image.rs`'s module doc.
         //
-        // `root=/dev/vda1` is the Ubuntu cloud image layout (partition 1
-        // is the rootfs); `console=ttyS0` lets the guest kernel print
-        // through the serial `--serial=tty` cloud-hypervisor attaches
-        // into the systemd journal.
-        //
-        // `--disk` takes multiple values as space-separated arguments
-        // after a single flag (NOT as repeated `--disk` flags). Same
-        // shape for `--device` below. Per-disk tuning lives in
-        // [`disk_spec`]; the three disk kinds (rootfs, cloud-init ISO,
-        // caller-supplied raw data disks) all flow through that one
-        // helper so the tuning knobs don't drift between call sites.
+        // `--net` takes multiple values as space-separated arguments
+        // after a single flag. The guest enumerates NICs in the order
+        // we list them; primary first → `ens3` in the guest, edge
+        // second → `ens4`. The cloud-init network config in
+        // `image::create_cloud_init_iso` relies on that ordering.
+        let primary_mac = primary_mac(&cmd.vm_id);
         let mut ch_args = vec![
             format!("--api-socket={}", socket_path.to_string_lossy()),
             format!("--cpus=boot={}", cmd.cpu),
@@ -170,17 +164,21 @@ impl VmManager {
             // transparent_hugepage=never: etcd's own docs call this out —
             // THP defragmentation stalls the mutator for seconds at a
             // time, which pushes WAL fsync latency past raft election
-            // timeouts and kicks off leader flaps. "never" > "madvise"
-            // because containerd's heap is large enough that even madvise
-            // scanning is enough to hurt.
+            // timeouts and kicks off leader flaps.
             "--cmdline=root=/dev/vda1 ro console=ttyS0 transparent_hugepage=never".to_string(),
-            format!("--net=tap={tap_name},mac={}", generate_mac(&cmd.vm_id)),
+            "--net".to_string(),
+            format!("tap={primary_tap},mac={primary_mac}"),
+        ];
+        if let Some(edge) = edge_tap {
+            ch_args.push(format!("tap={edge},mac={}", edge_mac(&cmd.vm_id)));
+        }
+        ch_args.extend([
             "--serial=tty".to_string(),
             "--console=off".to_string(),
             "--disk".to_string(),
             lv_disk_spec(boot.rootfs, cmd.cpu),
             cloud_init_disk_spec(boot.cloud_init),
-        ];
+        ]);
         for dev in boot.extra_disks {
             ch_args.push(lv_disk_spec(dev, cmd.cpu));
         }
@@ -457,13 +455,12 @@ pub fn unit_name_for_vm(vm_id: &str) -> String {
 ///   semantics are defeated by the host page cache).
 /// - `num_queues` / `queue_size` scale virtio-blk parallelism with the
 ///   guest's vCPU count. Cloud-hypervisor defaults are 1/128.
-/// - `discard=unmap` propagates guest TRIM through to `lvremove`'s
-///   `issue_discards=1` so freed extents return to the thin pool.
-///   Load-bearing for ceph/bluestore on data disks; nice-to-have for
-///   rootfs (containerd GC).
+///
+/// Guest TRIM reaches the thin pool via cloud-hypervisor's default
+/// `sparse=on` (PR #7666); no flag needed here.
 fn lv_disk_spec(path: &Path, vcpus: u32) -> String {
     format!(
-        "path={},image_type=raw,direct=on,discard=unmap,\
+        "path={},image_type=raw,direct=on,\
          num_queues={vcpus},queue_size=256",
         path.to_string_lossy()
     )
@@ -475,14 +472,25 @@ fn cloud_init_disk_spec(path: &Path) -> String {
     format!("path={}", path.to_string_lossy())
 }
 
-/// Generate a deterministic MAC address from a VM ID.
-fn generate_mac(vm_id: &str) -> String {
+/// Deterministic MAC for the primary (tree-side) NIC.
+fn primary_mac(vm_id: &str) -> String {
+    deterministic_mac(vm_id, 0x00)
+}
+
+/// Deterministic MAC for the edge (uplink-side) NIC. The second-byte
+/// salt guarantees a distinct MAC from the primary so both NICs coexist
+/// on their respective broadcast domains without collision.
+fn edge_mac(vm_id: &str) -> String {
+    deterministic_mac(vm_id, 0x01)
+}
+
+fn deterministic_mac(vm_id: &str, salt: u8) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     vm_id.hash(&mut hasher);
+    salt.hash(&mut hasher);
     let hash = hasher.finish();
-
-    // Locally administered, unicast MAC (bit 1 of first octet = 1, bit 0 = 0)
+    // 52:54:00 is the locally-administered OUI QEMU/KVM uses.
     format!(
         "52:54:00:{:02x}:{:02x}:{:02x}",
         (hash >> 16) & 0xff,
@@ -496,34 +504,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mac_is_deterministic() {
-        let a = generate_mac("vm-123");
-        let b = generate_mac("vm-123");
-        assert_eq!(a, b);
+    fn macs_are_deterministic() {
+        assert_eq!(primary_mac("vm-123"), primary_mac("vm-123"));
+        assert_eq!(edge_mac("vm-123"), edge_mac("vm-123"));
     }
 
     #[test]
-    fn test_mac_unique_for_different_vms() {
-        let a = generate_mac("vm-1");
-        let b = generate_mac("vm-2");
-        assert_ne!(a, b);
+    fn macs_differ_across_vms() {
+        assert_ne!(primary_mac("vm-1"), primary_mac("vm-2"));
+        assert_ne!(edge_mac("vm-1"), edge_mac("vm-2"));
     }
 
     #[test]
-    fn test_mac_has_locally_administered_prefix() {
-        let mac = generate_mac("any-vm");
-        // 52:54:00 is the KVM/QEMU locally administered OUI
-        assert!(mac.starts_with("52:54:00:"));
+    fn primary_and_edge_macs_differ_for_same_vm() {
+        assert_ne!(primary_mac("vm-1"), edge_mac("vm-1"));
     }
 
     #[test]
-    fn test_mac_format() {
-        let mac = generate_mac("test");
-        let parts: Vec<&str> = mac.split(':').collect();
-        assert_eq!(parts.len(), 6);
-        for part in &parts {
-            assert_eq!(part.len(), 2);
-        }
+    fn macs_use_qemu_locally_administered_oui() {
+        assert!(primary_mac("any").starts_with("52:54:00:"));
+        assert!(edge_mac("any").starts_with("52:54:00:"));
     }
 
     #[test]
@@ -533,17 +533,12 @@ mod tests {
     }
 
     /// Rootfs and data disks must emit byte-identical specs: losing
-    /// `direct=on` or `discard=unmap` on data disks is silent and only
-    /// manifests later as ceph bluestore holding extents the operator
-    /// expected to be reclaimed.
+    /// `direct=on` on data disks is silent and only manifests later as
+    /// data corruption under host crash.
     #[test]
-    fn lv_disk_spec_carries_durability_and_discard() {
+    fn lv_disk_spec_carries_durability_tunings() {
         let spec = lv_disk_spec(Path::new("/dev/basis/vmdata-x-0"), 8);
         assert!(spec.contains("direct=on"), "missing direct=on: {spec}");
-        assert!(
-            spec.contains("discard=unmap"),
-            "missing discard=unmap: {spec}"
-        );
         assert!(
             spec.contains("image_type=raw"),
             "missing image_type=raw: {spec}"

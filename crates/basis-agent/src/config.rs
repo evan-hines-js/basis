@@ -8,7 +8,11 @@
 //! spec:
 //!   controllerEndpoint: "https://10.0.0.1:7443"
 //!   dataDir: /var/lib/basis
-//!   network: { bridge: basis0, physicalNic: eno1 }
+//!   network:
+//!     uplinkBridge: basis0       # name of the Linux bridge that masters `uplinkInterface`
+//!     uplinkInterface: eno1       # physical NIC carrying VXLAN + edge NIC traffic
+//!     vtepAddress: 10.100.0.17    # this host's IP for VXLAN outer header
+//!     uplinkMtu: 9000             # physical link MTU; must be ≥ 1550 (jumbo recommended)
 //!   tls: { ... }
 //! ```
 //!
@@ -33,16 +37,11 @@ pub struct HostSpec {
     pub tls: TlsConfig,
 
     /// Credentials for private OCI registries the agent pulls VM images
-    /// from. Omit or leave empty for public-only pulls. Entries are
-    /// matched against the registry portion of the image reference
-    /// (e.g., `ghcr.io`).
+    /// from. Omit or leave empty for public-only pulls.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registries: Vec<RegistryCredentials>,
 
     /// Plain-HTTP `host:port` for the Prometheus `/metrics` endpoint.
-    /// Defaults to `0.0.0.0:9444` — one above the controller's 9443 so
-    /// a single-host dev setup doesn't collide. Operators point their
-    /// Prometheus `basis-agents` scrape job at this address.
     #[serde(default = "default_metrics_listen")]
     pub metrics_listen: String,
 }
@@ -54,7 +53,6 @@ fn default_metrics_listen() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryCredentials {
-    /// Registry host to match (e.g., `ghcr.io`, `docker.io`).
     pub host: String,
     pub username: String,
     pub password: String,
@@ -63,8 +61,22 @@ pub struct RegistryCredentials {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkSpec {
-    pub bridge: String,
-    pub physical_nic: String,
+    /// Linux bridge that masters the physical uplink NIC. Edge-flagged
+    /// VMs attach a second TAP here. Tree VMs never touch this bridge
+    /// — they live on per-VNI bridges (`brt<vni>`).
+    pub uplink_bridge: String,
+    /// Physical NIC name, e.g. `eno1`. Becomes a slave of
+    /// `uplink_bridge` and is the egress interface for VXLAN frames.
+    pub uplink_interface: String,
+    /// IP address used as the outer source of VXLAN frames. Almost
+    /// always the uplink NIC's address. Reported to the controller on
+    /// `RegisterHostRequest.vtep_address`.
+    pub vtep_address: String,
+    /// Physical uplink MTU. VXLAN adds 50 bytes of outer header, so
+    /// this must be ≥ 1550 to carry standard 1500-byte inner frames.
+    /// Jumbo frames (9000) are strongly recommended — the tree bridges
+    /// derive their inner MTU from this.
+    pub uplink_mtu: u32,
 }
 
 impl HostSpec {
@@ -77,8 +89,7 @@ impl HostSpec {
     }
 }
 
-/// Load and validate a `Host` YAML file, returning the full resource so
-/// callers have access to `metadata.name` (the hostname).
+/// Load and validate a `Host` YAML file.
 pub fn load(path: &Path) -> Result<Host, ResourceError> {
     load_resource(path, KIND)
 }
@@ -105,8 +116,10 @@ spec:
   controllerEndpoint: "https://10.0.0.1:7443"
   dataDir: /var/lib/basis
   network:
-    bridge: basis0
-    physicalNic: eno1
+    uplinkBridge: basis0
+    uplinkInterface: eno1
+    vtepAddress: 10.100.0.17
+    uplinkMtu: 9000
   tls:
     cert: /etc/basis/tls/agent.crt
     key: /etc/basis/tls/agent.key
@@ -115,12 +128,10 @@ spec:
         );
         let host = load(f.path()).unwrap();
         assert_eq!(host.metadata.name, "node-1");
-        assert_eq!(host.spec.controller_endpoint, "https://10.0.0.1:7443");
-        assert_eq!(host.spec.network.bridge, "basis0");
-        assert_eq!(
-            host.spec.images_dir(),
-            PathBuf::from("/var/lib/basis/images")
-        );
+        assert_eq!(host.spec.network.uplink_bridge, "basis0");
+        assert_eq!(host.spec.network.uplink_interface, "eno1");
+        assert_eq!(host.spec.network.vtep_address, "10.100.0.17");
+        assert_eq!(host.spec.network.uplink_mtu, 9000);
     }
 
     #[test]

@@ -18,48 +18,26 @@ use basis_common::json::parse_owned_json;
 use basis_common::time::now_rfc3339;
 use basis_common::tls;
 
-use crate::db::{ClusterRow, Db, DbError, IpOwner, VmRow};
+use crate::config::NetworkConfig;
+use crate::db::{ClusterRow, Db, DbError, IpOwner, TreeRow, VmRow};
 use crate::metrics::Metrics;
 use crate::scheduler::{self, ScheduleRequest, SchedulerError};
 
 /// Map a [`DbError`] to the gRPC status the API should return.
-///
-/// Centralised so every call site agrees: `NotFound` is 404, `Conflict`
-/// is `AlreadyExists`, `Exhausted` is `ResourceExhausted`,
-/// `HostUnavailable` is `Unavailable`, and everything else is `Internal`.
-/// Replaces the previous ad-hoc `map_err(|e| Status::not_found(...))`
-/// pattern that incorrectly surfaced transient sqlx errors as 404s.
 fn db_status(e: DbError) -> Status {
     match e {
         DbError::NotFound(_) => Status::not_found(e.to_string()),
         DbError::Conflict(_) => Status::already_exists(e.to_string()),
         DbError::Exhausted(_) => Status::resource_exhausted(e.to_string()),
         DbError::HostUnavailable(_) => Status::unavailable(e.to_string()),
-        DbError::Sqlx(_) | DbError::Migrate(_) | DbError::MalformedIpPool { .. } => {
+        DbError::Sqlx(_) | DbError::Migrate(_) | DbError::MalformedTree { .. } => {
             Status::internal(e.to_string())
         }
     }
 }
 
-fn cluster_response(row: ClusterRow) -> Response<CreateClusterResponse> {
-    Response::new(CreateClusterResponse {
-        cluster_id: row.id,
-        control_plane_endpoint: row.control_plane_endpoint,
-    })
-}
-
-fn create_machine_response(row: VmRow) -> Response<CreateMachineResponse> {
-    Response::new(CreateMachineResponse {
-        id: row.id.clone(),
-        provider_id: provider_id(&row.id),
-        ip_address: row.ip_address,
-        host: row.host_id,
-    })
-}
-
 /// Require that a CAPI-facing RPC was issued by a client whose peer
-/// identity is [`tls::CAPI_PROVIDER_IDENTITY`]. Rejects any other
-/// identity, including a missing one.
+/// identity is [`tls::CAPI_PROVIDER_IDENTITY`].
 fn require_capi_caller<T>(req: &Request<T>) -> Result<(), Status> {
     let id = peer_identity(req)?;
     if id == tls::CAPI_PROVIDER_IDENTITY {
@@ -73,16 +51,24 @@ fn require_capi_caller<T>(req: &Request<T>) -> Result<(), Status> {
     }
 }
 
-/// Extract the peer identity (SAN-DNS preferred, CN fallback) from the
-/// request, treating anything less as an authentication failure. The
-/// server is always TLS-terminated so the only reason this returns an
-/// error is misconfiguration or a missing cert.
 fn peer_identity<T>(req: &Request<T>) -> Result<String, Status> {
     match tls::request_peer_identity(req) {
         Ok(Some(id)) => Ok(id),
         Ok(None) => Err(Status::unauthenticated("TLS required")),
         Err(e) => Err(Status::unauthenticated(format!("peer certificate: {e}"))),
     }
+}
+
+/// CAPI-shaped provider ID for a VM.
+///
+/// Must match what the kubelet inside the guest reports on
+/// `Node.spec.providerID`. Lattice templates
+/// `provider-id=basis://{{ ds.meta_data.instance_id }}` into kubeadm's
+/// kubelet args, and basis-agent writes `instance-id: <vm_id>` into
+/// cloud-init's meta-data — so the VM's reported providerID is
+/// `basis://<vm_id>`.
+pub fn provider_id(vm_id: &str) -> String {
+    format!("basis://{vm_id}")
 }
 
 /// Agent-reported VM create failure. Carries enough to tell a real
@@ -94,28 +80,22 @@ struct VmFailure {
     transient: bool,
 }
 
-/// Which RPC is waiting on an agent-reported VM state transition.
-/// Create waits for [`MachineState::Running`]; delete waits for
-/// [`MachineState::Stopped`]. Either may instead see
-/// [`MachineState::Failed`] and is resolved with the agent's error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmOpKind {
     Create,
     Delete,
 }
 
-/// Pending create-or-delete request waiting for the agent to report
-/// terminal VM state. One map holds both kinds because a vm_id is only
-/// ever waiting on one op at a time (create-then-delete is strictly
-/// sequential), and the agent-message handler routes terminal reports
-/// to whichever is pending.
+/// Pending create-or-delete waiting for the agent to report terminal VM
+/// state. One map holds both kinds because a vm_id is only ever waiting
+/// on one op at a time.
 struct PendingVmOp {
     tx: oneshot::Sender<Result<(), VmFailure>>,
     kind: VmOpKind,
     /// Host this op was dispatched to. When the host's agent stream
-    /// drops, the stream handler removes every entry matching this
-    /// host_id so the awaiting RPC fails immediately instead of
-    /// stalling for the full timeout window.
+    /// drops, we remove every entry matching this host_id so the
+    /// awaiting RPC fails immediately instead of stalling for the full
+    /// timeout window.
     host_id: String,
 }
 
@@ -128,28 +108,39 @@ pub struct BasisServer {
     db: Db,
     metrics: Arc<Metrics>,
     dns_servers: Arc<Vec<String>>,
+    network: Arc<NetworkConfig>,
     cpu_overcommit_ratio: f32,
     reconcile_interval: std::time::Duration,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_ops: Arc<DashMap<String, PendingVmOp>>,
 }
 
-/// How often the controller pushes `ReconcileHostCommand` to each
-/// connected agent. Matches the agent's own periodic local-reconcile
-/// cadence so drift is converged on within one minute.
+/// How often the controller pushes the authoritative reconcile command
+/// to each connected agent. Short enough that a missed incremental push
+/// (network blip, agent reconnect) still converges within a minute;
+/// long enough that steady-state fleet chatter stays sub-1Hz/agent.
 const DEFAULT_AGENT_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Total time `CreateMachine` will wait for the agent to report RUNNING.
+const CREATE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Total time `DeleteMachine` / `DeleteCluster` will wait for the agent
+/// to confirm teardown.
+const DELETE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl BasisServer {
     pub fn new(
         db: Db,
         metrics: Arc<Metrics>,
         dns_servers: Vec<String>,
+        network: NetworkConfig,
         cpu_overcommit_ratio: f32,
     ) -> Self {
         Self {
             db,
             metrics,
             dns_servers: Arc::new(dns_servers),
+            network: Arc::new(network),
             cpu_overcommit_ratio,
             reconcile_interval: DEFAULT_AGENT_RECONCILE_INTERVAL,
             agents: Arc::new(DashMap::new()),
@@ -157,16 +148,13 @@ impl BasisServer {
         }
     }
 
-    /// Override the controller→agent reconcile cadence. Intended for tests
-    /// that need to observe a `ReconcileHostCommand` without waiting a
-    /// minute.
+    /// Override the controller→agent reconcile cadence. For tests only.
     pub fn with_reconcile_interval(mut self, interval: std::time::Duration) -> Self {
         self.reconcile_interval = interval;
         self
     }
 
-    /// Serve on a caller-provided TCP listener with a caller-provided TLS
-    /// config. The listener must already be bound.
+    /// Serve on a caller-provided TCP listener with a caller-provided TLS config.
     pub async fn serve(
         self,
         listener: tokio::net::TcpListener,
@@ -197,53 +185,142 @@ impl BasisServer {
         basis_server::BasisServer<BasisApiService>,
         basis_agent_server::BasisAgentServer<BasisAgentService>,
     ) {
-        let basis_svc = basis_server::BasisServer::new(BasisApiService {
+        let shared = Arc::new(SharedCtx {
             db: self.db.clone(),
             metrics: self.metrics.clone(),
             dns_servers: self.dns_servers.clone(),
+            network: self.network.clone(),
+            agents: self.agents.clone(),
+        });
+        let basis_svc = basis_server::BasisServer::new(BasisApiService {
+            shared: shared.clone(),
             cpu_overcommit_ratio: self.cpu_overcommit_ratio,
-            agents: self.agents.clone(),
             pending_ops: self.pending_ops.clone(),
         });
-
         let agent_svc = basis_agent_server::BasisAgentServer::new(BasisAgentService {
-            db: self.db.clone(),
-            metrics: self.metrics.clone(),
+            shared,
             reconcile_interval: self.reconcile_interval,
-            agents: self.agents.clone(),
             pending_ops: self.pending_ops.clone(),
         });
-
         (basis_svc, agent_svc)
+    }
+}
+
+/// State shared across the CAPI-facing and agent-facing services. Both
+/// need the DB, the metrics handle, and the live agent map; sharing
+/// one struct makes it easy to add helpers (like
+/// `push_reconcile_to_host`) that both sides call.
+struct SharedCtx {
+    db: Db,
+    metrics: Arc<Metrics>,
+    dns_servers: Arc<Vec<String>>,
+    network: Arc<NetworkConfig>,
+    agents: Arc<DashMap<String, ConnectedAgent>>,
+}
+
+impl SharedCtx {
+    /// Assemble the full authoritative `ReconcileHostCommand` for a
+    /// host from DB state. Single source of truth: register-ack,
+    /// periodic tick, and after-change broadcasts all go through here.
+    async fn build_reconcile_command(&self, host_id: &str) -> Result<ReconcileHostCommand, DbError> {
+        let expected_vm_ids: Vec<String> = self
+            .db
+            .list_vms_on_host(host_id)
+            .await?
+            .into_iter()
+            .map(|v| v.id)
+            .collect();
+        let trees = self.db.list_host_trees(host_id).await?;
+        let mut tree_states = Vec::with_capacity(trees.len());
+        for tree in trees {
+            let vteps = self.db.list_tree_vteps(&tree.id).await?;
+            tree_states.push(TreeState {
+                tree_id: tree.id,
+                vni: tree.vni as u32,
+                cidr: tree.cidr,
+                gateway_ip: tree.gateway_ip,
+                prefix_len: tree.prefix_len as u32,
+                vtep_addresses: vteps,
+            });
+        }
+        Ok(ReconcileHostCommand {
+            expected_vm_ids,
+            trees: tree_states,
+        })
+    }
+
+    /// Send a fresh reconcile to the given host if its agent is
+    /// connected. Best-effort — a disconnected agent picks up the
+    /// state on reconnect.
+    async fn push_reconcile(&self, host_id: &str) {
+        let cmd = match self.build_reconcile_command(host_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(host_id, error = %e, "push_reconcile: failed to build command");
+                return;
+            }
+        };
+        if let Some(agent) = self.agents.get(host_id) {
+            let _ = agent
+                .command_tx
+                .send(ControllerCommand {
+                    request_id: String::new(),
+                    command: Some(controller_command::Command::ReconcileHost(cmd)),
+                })
+                .await;
+        }
+    }
+
+    /// Re-broadcast reconcile to every host currently carrying the
+    /// given tree. Called after a VM create/delete that shifts the
+    /// peer VTEP set.
+    async fn broadcast_tree(&self, tree_id: &str) {
+        let hosts = match self.db.list_hosts_in_tree(tree_id).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(tree_id, error = %e, "broadcast_tree: list hosts failed");
+                return;
+            }
+        };
+        for host_id in hosts {
+            self.push_reconcile(&host_id).await;
+        }
     }
 }
 
 // --- CAPI-facing service ---
 
 struct BasisApiService {
-    db: Db,
-    metrics: Arc<Metrics>,
-    dns_servers: Arc<Vec<String>>,
+    shared: Arc<SharedCtx>,
     cpu_overcommit_ratio: f32,
-    agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_ops: Arc<DashMap<String, PendingVmOp>>,
 }
 
 impl BasisApiService {
-    /// Clean up a VM that failed to create: release IP, delete DB record.
-    async fn cleanup_failed_vm(&self, vm_id: &str) {
-        if let Err(e) = self.db.release_ips(IpOwner::Vm(vm_id)).await {
-            warn!(vm_id, error = %e, "failed to release IP during cleanup");
+    async fn cleanup_failed_vm(&self, vm_id: &str, tree_id: &str, host_id: &str) {
+        if let Err(e) = self.shared.db.release_ips(IpOwner::Vm(vm_id)).await {
+            warn!(vm_id, error = %e, "cleanup: release IPs");
         }
-        if let Err(e) = self.db.delete_vm(vm_id).await {
-            warn!(vm_id, error = %e, "failed to delete VM record during cleanup");
+        if let Err(e) = self.shared.db.delete_vm(vm_id).await {
+            warn!(vm_id, error = %e, "cleanup: delete VM row");
+        }
+        // Membership may have flipped if this was the host's only VM
+        // in the tree; reconcile converges.
+        match self
+            .shared
+            .db
+            .remove_host_in_tree_if_empty(host_id, tree_id)
+            .await
+        {
+            Ok(removed) => {
+                if removed {
+                    self.shared.broadcast_tree(tree_id).await;
+                }
+            }
+            Err(e) => warn!(vm_id, error = %e, "cleanup: host_in_tree teardown"),
         }
     }
 
-    /// Register a pending create or delete and return the receiver its
-    /// completion will be signalled on. The handler side
-    /// (`handle_agent_message`) keys off the vm_id and routes the
-    /// agent's terminal state report to the matching sender.
     fn register_pending_op(
         &self,
         vm_id: &str,
@@ -262,27 +339,19 @@ impl BasisApiService {
         rx
     }
 
-    /// Tear down a single VM: notify its agent and block on the agent's
-    /// confirmation. Once we get it, release the IP and delete the DB
-    /// row. The synchronous confirmation is what bounds queue depth —
-    /// callers (CAPI, smoke.sh) wait on the RPC rather than pipelining
-    /// creates behind an unacknowledged delete.
-    ///
-    /// Transient failure (agent is shedding load, e.g. LVM semaphore
-    /// timeout) returns `Unavailable`; the DB row stays so the client's
-    /// retry sees the VM still present and tries again. A permanent
-    /// failure returns `Internal` for operator attention; the periodic
-    /// reconcile still converges on the desired state eventually.
+    /// Tear down a single VM synchronously: notify the agent, wait for
+    /// terminal state, release resources, update host_in_tree. The
+    /// synchronous confirmation is what bounds queue depth (callers
+    /// wait on the RPC rather than pipelining creates behind an
+    /// unresolved delete).
     async fn teardown_vm(&self, vm: &VmRow) -> Result<(), Status> {
-        self.db
+        self.shared
+            .db
             .update_vm_state(&vm.id, MachineState::Stopping as i64, "", &now_rfc3339())
             .await
             .map_err(db_status)?;
 
-        let Some(agent) = self.agents.get(&vm.host_id) else {
-            // Agent not connected — transient by nature (it'll reconnect
-            // and reconcile from `expected_vm_ids`). Surface it so the
-            // client retries rather than treating the VM as deleted.
+        let Some(agent) = self.shared.agents.get(&vm.host_id) else {
             info!(host_id = %vm.host_id, vm_id = %vm.id,
                 "DeleteVm: agent not connected; returning Unavailable");
             return Err(Status::unavailable(format!(
@@ -307,12 +376,40 @@ impl BasisApiService {
         }
         drop(agent);
 
+        let tree_id = self
+            .shared
+            .db
+            .get_cluster(&vm.cluster_id)
+            .await
+            .ok()
+            .map(|c| c.tree_id);
+
         match tokio::time::timeout(DELETE_MACHINE_TIMEOUT, wait_rx).await {
             Ok(Ok(Ok(()))) => {
-                if let Err(e) = self.db.release_ips(IpOwner::Vm(&vm.id)).await {
-                    warn!(vm_id = %vm.id, error = %e, "failed to release VM IP during teardown");
+                if let Err(e) = self.shared.db.release_ips(IpOwner::Vm(&vm.id)).await {
+                    warn!(vm_id = %vm.id, error = %e, "failed to release VM IPs during teardown");
                 }
-                self.db.delete_vm(&vm.id).await.map_err(db_status)?;
+                self.shared.db.delete_vm(&vm.id).await.map_err(db_status)?;
+
+                // If this was the last VM of the tree on this host,
+                // drop the membership row and push a fresh reconcile
+                // to everyone still in the tree so their peer lists
+                // shrink.
+                if let Some(tid) = tree_id {
+                    match self
+                        .shared
+                        .db
+                        .remove_host_in_tree_if_empty(&vm.host_id, &tid)
+                        .await
+                    {
+                        Ok(true) => self.shared.broadcast_tree(&tid).await,
+                        Ok(false) => self.shared.push_reconcile(&vm.host_id).await,
+                        Err(e) => {
+                            warn!(vm_id = %vm.id, error = %e, "teardown: host_in_tree update failed");
+                        }
+                    }
+                }
+
                 info!(vm_id = %vm.id, host_id = %vm.host_id, "DeleteMachine: agent confirmed STOPPED");
                 Ok(())
             }
@@ -342,10 +439,6 @@ impl BasisApiService {
                 Err(Status::unavailable("agent disconnected during VM deletion"))
             }
             Err(_) => {
-                // Timeout: clear the waiter so a late state report
-                // doesn't try to fire a dead oneshot. The DB row stays
-                // — the client retries; the periodic reconcile picks up
-                // any VM stuck in STOPPING.
                 self.pending_ops.remove(&vm.id);
                 warn!(
                     vm_id = %vm.id, host_id = %vm.host_id,
@@ -359,26 +452,75 @@ impl BasisApiService {
             }
         }
     }
+
+    async fn pick_host(
+        &self,
+        req: &CreateMachineRequest,
+    ) -> Result<(String, Vec<GpuDevice>), Status> {
+        let hosts = self.shared.db.list_healthy_hosts().await.map_err(db_status)?;
+        let mut vms_by_host: HashMap<String, Vec<VmRow>> = HashMap::new();
+        for host in &hosts {
+            let vms = self
+                .shared
+                .db
+                .list_vms_on_host(&host.id)
+                .await
+                .map_err(db_status)?;
+            vms_by_host.insert(host.id.clone(), vms);
+        }
+
+        let sched_req = ScheduleRequest::from(req);
+        match scheduler::schedule(&hosts, &vms_by_host, &sched_req, self.cpu_overcommit_ratio) {
+            Ok((host_id, gpus)) => {
+                self.shared
+                    .metrics
+                    .scheduler_decisions_total
+                    .with_label_values(&["placed"])
+                    .inc();
+                info!(
+                    host_id = %host_id,
+                    gpus = gpus.len(),
+                    cpu = req.cpu,
+                    memory_mib = req.memory_mib,
+                    disk_gib = req.disk_gib,
+                    "scheduler placed VM"
+                );
+                Ok((host_id, gpus))
+            }
+            Err(SchedulerError::NoCapacity(msg)) => {
+                self.shared
+                    .metrics
+                    .scheduler_decisions_total
+                    .with_label_values(&["no_capacity"])
+                    .inc();
+                warn!(
+                    reason = %msg,
+                    healthy_hosts = hosts.len(),
+                    cpu = req.cpu,
+                    memory_mib = req.memory_mib,
+                    disk_gib = req.disk_gib,
+                    gpus = req.gpus,
+                    cpu_overcommit_ratio = self.cpu_overcommit_ratio,
+                    "scheduler rejected VM: no capacity"
+                );
+                Err(Status::resource_exhausted(msg))
+            }
+        }
+    }
+
+    fn record_create_result(&self, result: &'static str, started: Instant) {
+        self.shared
+            .metrics
+            .vm_create_result_total
+            .with_label_values(&[result])
+            .inc();
+        self.shared
+            .metrics
+            .vm_create_duration_seconds
+            .with_label_values(&[result])
+            .observe(started.elapsed().as_secs_f64());
+    }
 }
-
-/// Total time `CreateMachine` will wait for the agent to report RUNNING.
-///
-/// Sized for cold starts on a fresh agent: a node-image pull is ~600 MB
-/// plus a qemu-img decompress pass on the qcow2 layer, so the first VM
-/// of a given image easily takes several minutes end-to-end. Subsequent
-/// VMs hit the cache and return in ~20 s. Clients that want to bail
-/// earlier set their own gRPC deadline — this is only the server-side
-/// ceiling.
-const CREATE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Total time `DeleteMachine` / `DeleteCluster` will wait for the agent
-/// to confirm teardown. Delete is inherently bounded — the agent's work
-/// is `systemctl stop` plus `lvremove`, both of which complete in
-/// single-digit seconds on a healthy pool — so 120s is well clear of
-/// the normal path while staying short enough that a genuinely stuck
-/// delete surfaces to the client as `DeadlineExceeded` and triggers
-/// retry rather than hanging indefinitely.
-const DELETE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[tonic::async_trait]
 impl basis_server::Basis for BasisApiService {
@@ -390,64 +532,99 @@ impl basis_server::Basis for BasisApiService {
         let req = request.into_inner();
         info!(
             name = %req.name,
-            ip_pool = %req.ip_pool,
+            parent = %req.parent_cluster_id,
             "CreateCluster received"
         );
-        if req.name.is_empty() || req.ip_pool.is_empty() {
-            return Err(Status::invalid_argument("name and ip_pool are required"));
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
         }
 
-        // Idempotent by name: CAPI reconcilers retry after partial failures
-        // (cluster created in basis but status patch never landed in k8s).
-        // Returning the existing record lets the reconciler recover on its
-        // next pass instead of spinning on AlreadyExists.
+        // Idempotent by name.
         if let Some(existing) = self
+            .shared
             .db
             .get_cluster_by_name(&req.name)
             .await
             .map_err(db_status)?
         {
+            let tree = self
+                .shared
+                .db
+                .get_tree(&existing.tree_id)
+                .await
+                .map_err(db_status)?;
             info!(
                 cluster_id = %existing.id,
                 name = %req.name,
-                endpoint = %existing.control_plane_endpoint,
-                "CreateCluster idempotent return: cluster already exists"
+                tree_id = %tree.id,
+                vni = tree.vni,
+                "CreateCluster idempotent return"
             );
-            return Ok(cluster_response(existing));
+            return Ok(Response::new(create_cluster_response(&existing, &tree)));
         }
 
-        let cluster_id = uuid::Uuid::new_v4().to_string();
+        // Resolve or allocate the tree.
+        let tree = if req.parent_cluster_id.is_empty() {
+            let now_unix = basis_common::time::now_unix();
+            self.shared
+                .db
+                .allocate_tree(&self.shared.network, now_unix)
+                .await
+                .map_err(db_status)?
+        } else {
+            let parent = self
+                .shared
+                .db
+                .get_cluster(&req.parent_cluster_id)
+                .await
+                .map_err(|e| match e {
+                    DbError::NotFound(_) => Status::not_found(format!(
+                        "parent cluster '{}' not found",
+                        req.parent_cluster_id
+                    )),
+                    other => db_status(other),
+                })?;
+            self.shared
+                .db
+                .get_tree(&parent.tree_id)
+                .await
+                .map_err(db_status)?
+        };
 
-        // Allocate a VIP from the pool's VIP sub-range before inserting
-        // the cluster row so we don't commit a partial cluster on
-        // failure. The VIP sub-range is disjoint from the VM auto-
-        // allocation range, so this never races a concurrent VM create.
+        let cluster_id = uuid::Uuid::new_v4().to_string();
         let control_plane_endpoint = self
+            .shared
             .db
-            .allocate_vip(&req.ip_pool, IpOwner::ClusterVip(&cluster_id))
+            .allocate_tree_vip(&tree, IpOwner::ClusterVip(&cluster_id))
             .await
             .map_err(db_status)?;
 
         let row = ClusterRow {
             id: cluster_id.clone(),
             name: req.name.clone(),
-            ip_pool: req.ip_pool.clone(),
+            tree_id: tree.id.clone(),
+            parent_cluster_id: if req.parent_cluster_id.is_empty() {
+                None
+            } else {
+                Some(req.parent_cluster_id.clone())
+            },
             control_plane_endpoint: control_plane_endpoint.clone(),
             created_at: now_rfc3339(),
         };
-        if let Err(e) = self.db.insert_cluster(&row).await {
-            // Insert failed — roll back our VIP allocation so we don't
-            // leak an IP.
-            if let Err(re) = self.db.release_ips(IpOwner::ClusterVip(&cluster_id)).await {
+        if let Err(e) = self.shared.db.insert_cluster(&row).await {
+            if let Err(re) = self
+                .shared
+                .db
+                .release_ips(IpOwner::ClusterVip(&cluster_id))
+                .await
+            {
                 warn!(cluster_id = %cluster_id, error = %re,
                     "failed to release VIP after cluster insert failure");
             }
             return match e {
-                // Narrow race: idempotency check above passed but a
-                // concurrent CreateCluster inserted the same name
-                // first. Return the winner's row.
                 DbError::Conflict(_) => {
                     let existing = self
+                        .shared
                         .db
                         .get_cluster_by_name(&req.name)
                         .await
@@ -458,7 +635,13 @@ impl basis_server::Basis for BasisApiService {
                                 req.name,
                             ))
                         })?;
-                    Ok(cluster_response(existing))
+                    let etree = self
+                        .shared
+                        .db
+                        .get_tree(&existing.tree_id)
+                        .await
+                        .map_err(db_status)?;
+                    Ok(Response::new(create_cluster_response(&existing, &etree)))
                 }
                 other => Err(db_status(other)),
             };
@@ -468,13 +651,11 @@ impl basis_server::Basis for BasisApiService {
             cluster_id = %cluster_id,
             name = %req.name,
             endpoint = %control_plane_endpoint,
-            ip_pool = %req.ip_pool,
+            tree_id = %tree.id,
+            vni = tree.vni,
             "CreateCluster: new cluster provisioned"
         );
-        Ok(Response::new(CreateClusterResponse {
-            cluster_id,
-            control_plane_endpoint,
-        }))
+        Ok(Response::new(create_cluster_response(&row, &tree)))
     }
 
     async fn delete_cluster(
@@ -485,44 +666,73 @@ impl basis_server::Basis for BasisApiService {
         let req = request.into_inner();
         info!(cluster_id = %req.cluster_id, "DeleteCluster received");
 
-        // Ensure the cluster exists — returns NotFound otherwise.
-        self.db
+        let cluster = self
+            .shared
+            .db
             .get_cluster(&req.cluster_id)
             .await
             .map_err(db_status)?;
 
-        // Tear down every VM in the cluster first, then release the VIP,
-        // then remove the row.
+        // Refuse to orphan a subtree — children share this cluster's
+        // tree membership but are their own lifecycle units in Lattice.
+        let children = self
+            .shared
+            .db
+            .list_child_clusters(&req.cluster_id)
+            .await
+            .map_err(db_status)?;
+        if !children.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "cluster '{}' has {} child cluster(s); delete them first",
+                cluster.name,
+                children.len()
+            )));
+        }
+
         let vms = self
+            .shared
             .db
             .list_vms(Some(&req.cluster_id))
             .await
             .map_err(db_status)?;
         info!(cluster_id = %req.cluster_id, vm_count = vms.len(), "DeleteCluster: cascading VM deletes");
-        // Fan out the teardowns. Each VM's slow path is the agent-side
-        // LV / systemd cleanup; serially that's O(N * per-vm), in
-        // parallel it's ~max(per-vm) + per-RPC overhead. `try_join_all`
-        // short-circuits on the first failure, matching the old
-        // `?`-in-a-loop behavior.
         futures::future::try_join_all(vms.iter().map(|vm| self.teardown_vm(vm))).await?;
 
         if let Err(e) = self
+            .shared
             .db
             .release_ips(IpOwner::ClusterVip(&req.cluster_id))
             .await
         {
-            // Cluster row delete still proceeds — operators see the
-            // orphaned VIP via the leak rather than via a hung DELETE.
-            warn!(
-                cluster_id = %req.cluster_id,
-                error = %e,
-                "failed to release cluster VIP during DeleteCluster"
-            );
+            warn!(cluster_id = %req.cluster_id, error = %e,
+                "failed to release cluster VIP during DeleteCluster");
         }
-        self.db
+        self.shared
+            .db
             .delete_cluster(&req.cluster_id)
             .await
             .map_err(db_status)?;
+
+        // If this was the last cluster in the tree, mark it deleted
+        // (VNI cooldown kicks in). The next allocate_tree call will
+        // reap it once the cooldown expires.
+        let remaining = self
+            .shared
+            .db
+            .count_clusters_in_tree(&cluster.tree_id)
+            .await
+            .map_err(db_status)?;
+        if remaining == 0 {
+            let now_unix = basis_common::time::now_unix();
+            if let Err(e) = self
+                .shared
+                .db
+                .mark_tree_deleted(&cluster.tree_id, now_unix)
+                .await
+            {
+                warn!(tree_id = %cluster.tree_id, error = %e, "mark_tree_deleted failed");
+            }
+        }
 
         info!(cluster_id = %req.cluster_id, "DeleteCluster complete");
         Ok(Response::new(DeleteClusterResponse {}))
@@ -535,11 +745,18 @@ impl basis_server::Basis for BasisApiService {
         require_capi_caller(&request)?;
         let req = request.into_inner();
         let cluster = self
+            .shared
             .db
             .get_cluster(&req.cluster_id)
             .await
             .map_err(db_status)?;
-        Ok(Response::new(cluster_row_to_proto(cluster)))
+        let tree = self
+            .shared
+            .db
+            .get_tree(&cluster.tree_id)
+            .await
+            .map_err(db_status)?;
+        Ok(Response::new(cluster_to_proto(&cluster, &tree)))
     }
 
     async fn list_clusters(
@@ -547,10 +764,23 @@ impl basis_server::Basis for BasisApiService {
         request: Request<ListClustersRequest>,
     ) -> Result<Response<ListClustersResponse>, Status> {
         require_capi_caller(&request)?;
-        let clusters = self.db.list_clusters().await.map_err(db_status)?;
-        Ok(Response::new(ListClustersResponse {
-            clusters: clusters.into_iter().map(cluster_row_to_proto).collect(),
-        }))
+        let clusters = self.shared.db.list_clusters().await.map_err(db_status)?;
+        // Batch-load trees into a map so we only hit the reader pool
+        // once per distinct tree rather than N times per cluster.
+        let mut tree_cache: HashMap<String, TreeRow> = HashMap::new();
+        let mut out = Vec::with_capacity(clusters.len());
+        for c in clusters {
+            let tree = match tree_cache.get(&c.tree_id) {
+                Some(t) => t.clone(),
+                None => {
+                    let t = self.shared.db.get_tree(&c.tree_id).await.map_err(db_status)?;
+                    tree_cache.insert(c.tree_id.clone(), t.clone());
+                    t
+                }
+            };
+            out.push(cluster_to_proto(&c, &tree));
+        }
+        Ok(Response::new(ListClustersResponse { clusters: out }))
     }
 
     async fn create_machine(
@@ -559,10 +789,6 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<CreateMachineResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
-        // Wall-clock start of the create — feeds `vm_create_duration_seconds`
-        // at every terminal exit via `record_create_result`. Idempotent
-        // fast-returns (existing VM by name, Conflict) intentionally
-        // skip the histogram: they don't represent new create work.
         let started = Instant::now();
         info!(
             cluster_id = %req.cluster_id,
@@ -571,24 +797,26 @@ impl basis_server::Basis for BasisApiService {
             memory_mib = req.memory_mib,
             disk_gib = req.disk_gib,
             gpus = req.gpus,
+            edge = req.edge,
             image = %req.image,
             "CreateMachine received"
         );
 
-        let cluster = self.db.get_cluster(&req.cluster_id).await.map_err(|e| {
-            warn!(
-                cluster_id = %req.cluster_id, name = %req.name, error = %e,
-                "CreateMachine rejected: cluster not found"
-            );
-            db_status(e)
-        })?;
+        let cluster = self
+            .shared
+            .db
+            .get_cluster(&req.cluster_id)
+            .await
+            .map_err(|e| {
+                warn!(
+                    cluster_id = %req.cluster_id, name = %req.name, error = %e,
+                    "CreateMachine rejected: cluster not found"
+                );
+                db_status(e)
+            })?;
 
-        // Idempotent by (cluster_id, name): if the CAPI provider retries
-        // after a partial failure (VM created on the basis side but the
-        // status patch never landed in k8s), return the existing row so
-        // the reconciler can recover on the next pass instead of creating
-        // a duplicate VM.
         if let Some(existing) = self
+            .shared
             .db
             .get_vm_by_name(&req.cluster_id, &req.name)
             .await
@@ -601,8 +829,15 @@ impl basis_server::Basis for BasisApiService {
                 host_id = %existing.host_id,
                 "CreateMachine idempotent return: VM already exists"
             );
-            return Ok(create_machine_response(existing));
+            return Ok(Response::new(vm_to_create_response(&existing)));
         }
+
+        let tree = self
+            .shared
+            .db
+            .get_tree(&cluster.tree_id)
+            .await
+            .map_err(db_status)?;
 
         let vm_id = uuid::Uuid::new_v4().to_string();
         let now = now_rfc3339();
@@ -610,9 +845,6 @@ impl basis_server::Basis for BasisApiService {
         let (host_id, gpu_devices) = match self.pick_host(&req).await {
             Ok(v) => v,
             Err(status) => {
-                // The only path pick_host can return is `ResourceExhausted`
-                // (NoCapacity) — DB errors map to Internal/Unavailable and
-                // are treated as infrastructure failures, not create outcomes.
                 if status.code() == tonic::Code::ResourceExhausted {
                     self.record_create_result("no_capacity", started);
                 }
@@ -620,18 +852,36 @@ impl basis_server::Basis for BasisApiService {
             }
         };
 
+        // Allocate all IPs up front. Rollback on insert failure
+        // releases every row keyed by vm_id (tree + edge).
         let ip_address = self
+            .shared
             .db
-            .allocate_ip(&cluster.ip_pool, IpOwner::Vm(&vm_id))
+            .allocate_tree_vm_ip(&tree, IpOwner::Vm(&vm_id))
             .await
             .map_err(db_status)?;
 
-        let ip_pool = self
-            .db
-            .get_ip_pool(&cluster.ip_pool)
-            .await
-            .map_err(db_status)?;
-        let prefix_len = u32::from(ip_pool.prefix_len().map_err(db_status)?);
+        let edge_ip = if req.edge {
+            match self
+                .shared
+                .db
+                .allocate_edge_ip(&self.shared.network, IpOwner::Vm(&vm_id))
+                .await
+            {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    // All IPs keyed by this vm_id; single release drops
+                    // the primary that already succeeded.
+                    warn!(vm_id = %vm_id, error = %e, "edge IP allocation failed; rolling back");
+                    if let Err(re) = self.shared.db.release_ips(IpOwner::Vm(&vm_id)).await {
+                        warn!(vm_id = %vm_id, error = %re, "rollback failed");
+                    }
+                    return Err(db_status(e));
+                }
+            }
+        } else {
+            None
+        };
 
         let gpu_json = serde_json::to_string(&gpu_devices)
             .expect("serializing Vec<GpuDevice> to JSON is infallible");
@@ -644,6 +894,7 @@ impl basis_server::Basis for BasisApiService {
             cluster_id: req.cluster_id.clone(),
             host_id: host_id.clone(),
             ip_address: ip_address.clone(),
+            edge_ip: edge_ip.clone(),
             state: MachineState::Creating as i64,
             cpu: req.cpu as i64,
             memory_mib: req.memory_mib as i64,
@@ -655,21 +906,15 @@ impl basis_server::Basis for BasisApiService {
             created_at: now.clone(),
             updated_at: now,
         };
-        // Two failure modes share this rollback:
-        //   - `Conflict`: a concurrent CreateMachine inserted the same
-        //     (cluster_id, name) first; the UNIQUE index rejects ours,
-        //     and we return the winner's row to keep the API idempotent.
-        //   - `HostUnavailable`: the scheduled host went unhealthy
-        //     between `pick_host` and now. Atomically detected by
-        //     `insert_vm`'s `WHERE EXISTS … healthy = 1` predicate.
-        if let Err(e) = self.db.insert_vm(&vm).await {
-            if let Err(re) = self.db.release_ips(IpOwner::Vm(&vm_id)).await {
+        if let Err(e) = self.shared.db.insert_vm(&vm).await {
+            if let Err(re) = self.shared.db.release_ips(IpOwner::Vm(&vm_id)).await {
                 warn!(vm_id = %vm_id, error = %re,
-                    "failed to release VM IP after insert failure");
+                    "failed to release VM IPs after insert failure");
             }
             return match e {
                 DbError::Conflict(_) => {
                     let existing = self
+                        .shared
                         .db
                         .get_vm_by_name(&req.cluster_id, &req.name)
                         .await
@@ -680,7 +925,7 @@ impl basis_server::Basis for BasisApiService {
                                 req.cluster_id, req.name,
                             ))
                         })?;
-                    Ok(create_machine_response(existing))
+                    Ok(Response::new(vm_to_create_response(&existing)))
                 }
                 DbError::HostUnavailable(host) => {
                     warn!(
@@ -696,7 +941,29 @@ impl basis_server::Basis for BasisApiService {
             };
         }
 
-        let agent = self.agents.get(&host_id).ok_or_else(|| {
+        // Record host ⇄ tree membership and push the authoritative
+        // reconcile before we dispatch the CreateVm command. Ordering
+        // matters: the agent needs the bridge for this tree on this
+        // host before it processes CreateVm, and mpsc preserves send
+        // order from the same task.
+        let first_of_tree_on_host = self
+            .shared
+            .db
+            .upsert_host_in_tree(&host_id, &tree.id)
+            .await
+            .map_err(db_status)?;
+        if first_of_tree_on_host {
+            // Broadcast to every host in the tree (including this one)
+            // so existing peers learn the new VTEP and this host
+            // learns the existing ones.
+            self.shared.broadcast_tree(&tree.id).await;
+        } else {
+            // No membership change; still push this host so its
+            // expected_vm_ids includes the new VM promptly.
+            self.shared.push_reconcile(&host_id).await;
+        }
+
+        let agent = self.shared.agents.get(&host_id).ok_or_else(|| {
             self.record_create_result("no_agent", started);
             warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: scheduled host has no connected agent");
             Status::unavailable(format!("agent for host '{host_id}' not connected"))
@@ -715,24 +982,38 @@ impl basis_server::Basis for BasisApiService {
                 image: req.image,
                 bootstrap_data: req.bootstrap_data,
                 ip_address: ip_address.clone(),
-                gateway: ip_pool.gateway,
-                prefix_len,
+                gateway: tree.gateway_ip.clone(),
+                prefix_len: tree.prefix_len as u32,
                 gpus: req.gpus,
                 gpu_constraints: req.gpu_constraints,
-                dns_servers: self.dns_servers.as_ref().clone(),
+                dns_servers: self.shared.dns_servers.as_ref().clone(),
                 gpu_pci_addresses: gpu_devices.iter().map(|g| g.pci_address.clone()).collect(),
                 extra_disks: req.extra_disks,
+                vni: tree.vni as u32,
+                edge_ip: edge_ip.clone().unwrap_or_default(),
+                edge_gateway: if edge_ip.is_some() {
+                    self.shared.network.edge_pool.gateway.clone()
+                } else {
+                    String::new()
+                },
+                edge_prefix_len: if edge_ip.is_some() {
+                    u32::from(
+                        self.shared
+                            .network
+                            .edge_pool
+                            .prefix_len()
+                            .map_err(|e| Status::internal(format!("edge prefix: {e}")))?,
+                    )
+                } else {
+                    0
+                },
             })),
         };
 
-        info!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: dispatching CreateVm to agent");
+        info!(vm_id = %vm_id, host_id = %host_id, vni = tree.vni, "CreateMachine: dispatching CreateVm to agent");
         if agent.command_tx.send(cmd).await.is_err() {
-            // Agent stream dropped between the lookup and the send. Roll
-            // back the IP and the VM row before returning so we don't
-            // leak pool capacity on a flaky link — the next CreateMachine
-            // for this name will then start clean.
             self.pending_ops.remove(&vm_id);
-            self.cleanup_failed_vm(&vm_id).await;
+            self.cleanup_failed_vm(&vm_id, &tree.id, &host_id).await;
             self.record_create_result("stream_closed", started);
             warn!(
                 vm_id = %vm_id,
@@ -741,21 +1022,18 @@ impl basis_server::Basis for BasisApiService {
             );
             return Err(Status::unavailable("agent stream closed"));
         }
+        drop(agent);
 
         let result_label: &'static str;
         let response = match tokio::time::timeout(CREATE_MACHINE_TIMEOUT, wait_rx).await {
             Ok(Ok(Ok(()))) => {
                 result_label = "placed";
                 info!(vm_id = %vm_id, host_id = %host_id, ip = %ip_address, "CreateMachine: agent reported RUNNING");
-                Ok(Response::new(CreateMachineResponse {
-                    id: vm_id.clone(),
-                    provider_id: provider_id(&vm_id),
-                    ip_address,
-                    host: host_id,
-                }))
+                let row = self.shared.db.get_vm(&vm_id).await.map_err(db_status)?;
+                Ok(Response::new(vm_to_create_response(&row)))
             }
             Ok(Ok(Err(failure))) => {
-                self.cleanup_failed_vm(&vm_id).await;
+                self.cleanup_failed_vm(&vm_id, &tree.id, &host_id).await;
                 if failure.transient {
                     warn!(
                         vm_id = %vm_id, host_id = %host_id, error = %failure.message,
@@ -780,27 +1058,18 @@ impl basis_server::Basis for BasisApiService {
             }
             Ok(Err(_)) => {
                 warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: agent disconnected during VM creation");
-                self.cleanup_failed_vm(&vm_id).await;
+                self.cleanup_failed_vm(&vm_id, &tree.id, &host_id).await;
                 result_label = "agent_error";
                 Err(Status::internal("agent disconnected during VM creation"))
             }
             Err(_) => {
-                // Clear the waiter so the agent's eventual state report
-                // (handle_agent_message) doesn't try to fire a dead
-                // oneshot. Mark the row FAILED with a clear error so the
-                // VM doesn't sit in CREATING forever — if the agent
-                // succeeds late, its ReportVmState(RUNNING) will overwrite
-                // FAILED back to RUNNING; if it never reports, CAPI sees
-                // a clear failure and either retries (idempotent by name)
-                // or deletes. The IP and DB row are intentionally NOT
-                // released: the agent may still be running the VM and
-                // we'd be racing it.
                 self.pending_ops.remove(&vm_id);
                 let timeout_msg = format!(
                     "VM creation timed out ({}s)",
                     CREATE_MACHINE_TIMEOUT.as_secs()
                 );
                 if let Err(e) = self
+                    .shared
                     .db
                     .update_vm_state(
                         &vm_id,
@@ -838,7 +1107,7 @@ impl basis_server::Basis for BasisApiService {
         require_capi_caller(&request)?;
         let req = request.into_inner();
         info!(vm_id = %req.id, "DeleteMachine received");
-        let vm = self.db.get_vm(&req.id).await.map_err(db_status)?;
+        let vm = self.shared.db.get_vm(&req.id).await.map_err(db_status)?;
         self.teardown_vm(&vm).await?;
         Ok(Response::new(DeleteMachineResponse {}))
     }
@@ -849,7 +1118,7 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<Machine>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
-        let vm = self.db.get_vm(&req.id).await.map_err(db_status)?;
+        let vm = self.shared.db.get_vm(&req.id).await.map_err(db_status)?;
         Ok(Response::new(vm_to_machine(&vm)))
     }
 
@@ -864,95 +1133,18 @@ impl basis_server::Basis for BasisApiService {
         } else {
             Some(req.cluster_id.as_str())
         };
-
-        let vms = self.db.list_vms(cluster).await.map_err(db_status)?;
+        let vms = self.shared.db.list_vms(cluster).await.map_err(db_status)?;
         Ok(Response::new(ListMachinesResponse {
             machines: vms.iter().map(vm_to_machine).collect(),
         }))
     }
 }
 
-impl BasisApiService {
-    /// Collect hosts + current GPU assignments, run the scheduler, return the
-    /// chosen host and the set of selected GPU devices.
-    async fn pick_host(
-        &self,
-        req: &CreateMachineRequest,
-    ) -> Result<(String, Vec<GpuDevice>), Status> {
-        let hosts = self.db.list_healthy_hosts().await.map_err(db_status)?;
-
-        // Gather all VMs currently assigned to each healthy host. The
-        // scheduler uses this to compute both per-host capacity (totals
-        // minus VM allocations) and GPU availability.
-        let mut vms_by_host: HashMap<String, Vec<VmRow>> = HashMap::new();
-        for host in &hosts {
-            let vms = self
-                .db
-                .list_vms_on_host(&host.id)
-                .await
-                .map_err(db_status)?;
-            vms_by_host.insert(host.id.clone(), vms);
-        }
-
-        let sched_req = ScheduleRequest::from(req);
-        match scheduler::schedule(&hosts, &vms_by_host, &sched_req, self.cpu_overcommit_ratio) {
-            Ok((host_id, gpus)) => {
-                self.metrics
-                    .scheduler_decisions_total
-                    .with_label_values(&["placed"])
-                    .inc();
-                info!(
-                    host_id = %host_id,
-                    gpus = gpus.len(),
-                    cpu = req.cpu,
-                    memory_mib = req.memory_mib,
-                    disk_gib = req.disk_gib,
-                    "scheduler placed VM"
-                );
-                Ok((host_id, gpus))
-            }
-            Err(SchedulerError::NoCapacity(msg)) => {
-                self.metrics
-                    .scheduler_decisions_total
-                    .with_label_values(&["no_capacity"])
-                    .inc();
-                warn!(
-                    reason = %msg,
-                    healthy_hosts = hosts.len(),
-                    cpu = req.cpu,
-                    memory_mib = req.memory_mib,
-                    disk_gib = req.disk_gib,
-                    gpus = req.gpus,
-                    cpu_overcommit_ratio = self.cpu_overcommit_ratio,
-                    "scheduler rejected VM: no capacity"
-                );
-                Err(Status::resource_exhausted(msg))
-            }
-        }
-    }
-
-    /// Record the terminal outcome of a `CreateMachine` call on both the
-    /// counter and the latency histogram. Keeping the two emissions in
-    /// one helper guarantees they never drift in label or call site.
-    fn record_create_result(&self, result: &'static str, started: Instant) {
-        self.metrics
-            .vm_create_result_total
-            .with_label_values(&[result])
-            .inc();
-        self.metrics
-            .vm_create_duration_seconds
-            .with_label_values(&[result])
-            .observe(started.elapsed().as_secs_f64());
-    }
-}
-
 // --- Agent-facing service ---
 
 struct BasisAgentService {
-    db: Db,
-    metrics: Arc<Metrics>,
+    shared: Arc<SharedCtx>,
     reconcile_interval: std::time::Duration,
-    agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_ops: Arc<DashMap<String, PendingVmOp>>,
 }
 
@@ -965,14 +1157,7 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
         &self,
         request: Request<Streaming<AgentMessage>>,
     ) -> Result<Response<Self::StreamMessagesStream>, Status> {
-        // Capture the peer identity before consuming the request.
         let peer_id = peer_identity(&request)?;
-
-        // Belt-and-suspenders: the CAPI provider identity would only slip
-        // through the hostname check below if someone literally registered
-        // a host named `basis-capi-provider`. Reject it explicitly so the
-        // agent stream is unreachable to that identity even under that
-        // accident.
         if peer_id == tls::CAPI_PROVIDER_IDENTITY {
             return Err(Status::permission_denied(format!(
                 "peer identity '{peer_id}' is not authorized for agent RPCs"
@@ -981,7 +1166,6 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
 
         let mut inbound = request.into_inner();
 
-        // First message must be a RegisterHost
         let first = inbound
             .next()
             .await
@@ -997,7 +1181,6 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
             }
         };
 
-        // Agent's peer identity must match the hostname it's registering as.
         if peer_id != register.hostname {
             return Err(Status::permission_denied(format!(
                 "agent identity '{peer_id}' does not match registered hostname '{}'",
@@ -1005,51 +1188,17 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
             )));
         }
 
-        // Check if host already registered
-        let host_id = match self.db.get_host_by_hostname(&register.hostname).await {
-            Ok(Some(existing)) => {
-                info!(host_id = %existing.id, hostname = %register.hostname, "agent reconnected");
-                existing.id
-            }
-            Ok(None) => {
-                let host_id = uuid::Uuid::new_v4().to_string();
-                let gpu_json = serde_json::to_string(&register.gpus)
-                    .expect("serializing Vec<GpuDevice> to JSON is infallible");
+        let host_id = self.register_or_lookup_host(&register).await?;
 
-                let host = crate::db::HostRow {
-                    id: host_id.clone(),
-                    hostname: register.hostname.clone(),
-                    total_cpu: register.total_cpu as i64,
-                    total_memory_mib: register.total_memory_mib as i64,
-                    total_disk_gib: register.total_disk_gib as i64,
-                    gpu_inventory: gpu_json,
-                    last_heartbeat: now_rfc3339(),
-                    healthy: true,
-                };
-                self.db
-                    .upsert_host(&host)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-
-                info!(host_id = %host_id, hostname = %register.hostname, "new host registered");
-                host_id
-            }
-            Err(e) => return Err(Status::internal(e.to_string())),
-        };
-
-        // Set up command channel
         let (command_tx, command_rx) = mpsc::channel::<ControllerCommand>(32);
 
-        // Authoritative VM list for this host — agent uses this to drop any
-        // local VMs the controller has forgotten.
-        let expected_vm_ids: Vec<String> = self
-            .db
-            .list_vms_on_host(&host_id)
+        // Initial reconcile — agent uses this to build bridges + tear
+        // down forgotten VMs before processing any CreateVm.
+        let initial_state = self
+            .shared
+            .build_reconcile_command(&host_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .into_iter()
-            .map(|vm| vm.id)
-            .collect();
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         command_tx
             .send(ControllerCommand {
@@ -1057,82 +1206,71 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
                 command: Some(controller_command::Command::RegisterAck(
                     RegisterHostResponse {
                         host_id: host_id.clone(),
-                        expected_vm_ids,
+                        initial_state: Some(initial_state),
                     },
                 )),
             })
             .await
             .map_err(|_| Status::internal("failed to send registration ack"))?;
 
-        self.agents.insert(
+        self.shared.agents.insert(
             host_id.clone(),
             ConnectedAgent {
                 command_tx: command_tx.clone(),
             },
         );
-        self.metrics
+        self.shared
+            .metrics
             .agent_connected
             .with_label_values(&[&register.hostname])
             .set(1);
 
-        // Periodic controller→agent authoritative VM list. Runs for as
-        // long as the stream is alive; send fails when the receiver side
-        // drops (client disconnect or inbound handler removes the agent),
-        // which is how this task terminates.
-        let reconcile_db = self.db.clone();
-        let reconcile_host_id = host_id.clone();
-        let reconcile_interval = self.reconcile_interval;
-        let reconcile_handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(reconcile_interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // First tick fires immediately — skip it. The initial list was
-            // already sent inside `RegisterHostResponse` at handshake.
-            ticker.tick().await;
-            loop {
+        // Periodic authoritative push. Same command shape as the
+        // initial reconcile; single code path converges all drift.
+        let reconcile_handle = {
+            let shared = self.shared.clone();
+            let host_id = host_id.clone();
+            let interval = self.reconcile_interval;
+            let command_tx = command_tx.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Skip first tick — initial_state already sent.
                 ticker.tick().await;
-                let expected = match reconcile_db.list_vms_on_host(&reconcile_host_id).await {
-                    Ok(vms) => vms.into_iter().map(|vm| vm.id).collect::<Vec<_>>(),
-                    Err(e) => {
-                        warn!(error = %e, host_id = %reconcile_host_id, "reconcile list_vms_on_host failed");
-                        continue;
+                loop {
+                    ticker.tick().await;
+                    let cmd = match shared.build_reconcile_command(&host_id).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(error = %e, host_id = %host_id, "periodic reconcile build failed");
+                            continue;
+                        }
+                    };
+                    if command_tx
+                        .send(ControllerCommand {
+                            request_id: String::new(),
+                            command: Some(controller_command::Command::ReconcileHost(cmd)),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
-                };
-                let cmd = ControllerCommand {
-                    request_id: String::new(),
-                    command: Some(controller_command::Command::ReconcileHost(
-                        ReconcileHostCommand {
-                            expected_vm_ids: expected,
-                        },
-                    )),
-                };
-                if command_tx.send(cmd).await.is_err() {
-                    // Receiver dropped — agent stream is gone.
-                    break;
                 }
-            }
-        });
+            })
+        };
 
-        // Spawn task to process inbound agent messages
-        let db = self.db.clone();
-        let agents = self.agents.clone();
+        // Inbound handler.
+        let shared = self.shared.clone();
         let pending_ops = self.pending_ops.clone();
-        let metrics = self.metrics.clone();
         let agent_host_id = host_id.clone();
         let agent_hostname = register.hostname.clone();
-
-        let inbound_metrics = metrics.clone();
         tokio::spawn(async move {
             while let Some(result) = inbound.next().await {
                 match result {
                     Ok(msg) => {
-                        if let Err(e) = handle_agent_message(
-                            &db,
-                            &pending_ops,
-                            &inbound_metrics,
-                            &agent_host_id,
-                            msg,
-                        )
-                        .await
+                        if let Err(e) =
+                            handle_agent_message(&shared, &pending_ops, &agent_host_id, msg).await
                         {
                             warn!(error = %e, host_id = %agent_host_id, "error handling agent message");
                         }
@@ -1144,15 +1282,8 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
                 }
             }
             info!(host_id = %agent_host_id, "agent disconnected");
-            agents.remove(&agent_host_id);
+            shared.agents.remove(&agent_host_id);
             reconcile_handle.abort();
-            // Drop every pending VM op (create or delete) routed to
-            // this host so the awaiting RPC returns immediately via
-            // its "agent disconnected" branch — for creates that
-            // releases the IP and VM row; for deletes that surfaces
-            // `Unavailable` so the client retries. Removing the entry
-            // drops the oneshot Sender, which wakes the receiver with
-            // RecvError.
             let stale: Vec<String> = pending_ops
                 .iter()
                 .filter(|e| e.value().host_id == agent_host_id)
@@ -1168,7 +1299,8 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
                     "cancelled in-flight VM op waiters for disconnected agent"
                 );
             }
-            metrics
+            shared
+                .metrics
                 .agent_connected
                 .with_label_values(&[&agent_hostname])
                 .set(0);
@@ -1179,29 +1311,78 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
     }
 }
 
+impl BasisAgentService {
+    async fn register_or_lookup_host(
+        &self,
+        register: &RegisterHostRequest,
+    ) -> Result<String, Status> {
+        let gpu_json = serde_json::to_string(&register.gpus)
+            .expect("serializing Vec<GpuDevice> to JSON is infallible");
+
+        // Upsert is idempotent and refreshes capacity + vtep_address
+        // on reconnect. For a first-time host we mint a UUID;
+        // otherwise we reuse the existing id so VM rows stay stable.
+        let host_id = match self
+            .shared
+            .db
+            .get_host_by_hostname(&register.hostname)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            Some(existing) => {
+                info!(host_id = %existing.id, hostname = %register.hostname, "agent reconnected");
+                existing.id
+            }
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                info!(host_id = %id, hostname = %register.hostname, "new host registered");
+                id
+            }
+        };
+
+        let host = crate::db::HostRow {
+            id: host_id.clone(),
+            hostname: register.hostname.clone(),
+            total_cpu: register.total_cpu as i64,
+            total_memory_mib: register.total_memory_mib as i64,
+            total_disk_gib: register.total_disk_gib as i64,
+            gpu_inventory: gpu_json,
+            vtep_address: register.vtep_address.clone(),
+            last_heartbeat: now_rfc3339(),
+            healthy: true,
+        };
+        self.shared
+            .db
+            .upsert_host(&host)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(host_id)
+    }
+}
+
 async fn handle_agent_message(
-    db: &Db,
+    shared: &SharedCtx,
     pending_ops: &DashMap<String, PendingVmOp>,
-    metrics: &Metrics,
     host_id: &str,
     msg: AgentMessage,
 ) -> anyhow::Result<()> {
     match msg.payload {
         Some(agent_message::Payload::Heartbeat(hb)) => {
-            db.update_host_heartbeat(&hb.host_id, &now_rfc3339())
+            shared
+                .db
+                .update_host_heartbeat(&hb.host_id, &now_rfc3339())
                 .await?;
         }
         Some(agent_message::Payload::VmState(report)) => {
             let state = report.state();
             let now = now_rfc3339();
 
-            // Peek at the current row before the update so we can detect
-            // the edge into RUNNING and observe `vm_time_to_running_seconds`
-            // exactly once per VM (idempotent re-reports of RUNNING after
-            // the first one must not re-observe).
-            let prev = db.get_vm(&report.vm_id).await.ok();
+            let prev = shared.db.get_vm(&report.vm_id).await.ok();
 
-            db.update_vm_state(&report.vm_id, state as i64, &report.error_message, &now)
+            shared
+                .db
+                .update_vm_state(&report.vm_id, state as i64, &report.error_message, &now)
                 .await?;
 
             if state == MachineState::Running {
@@ -1213,7 +1394,8 @@ async fn handle_agent_message(
                             if let Ok(elapsed) =
                                 std::time::SystemTime::now().duration_since(created)
                             {
-                                metrics
+                                shared
+                                    .metrics
                                     .vm_time_to_running_seconds
                                     .observe(elapsed.as_secs_f64());
                             }
@@ -1222,19 +1404,6 @@ async fn handle_agent_message(
                 }
             }
 
-            // Resolve the pending op — if any — for this vm_id. A
-            // state only resolves a pending op if it matches:
-            //   * Running resolves a pending Create
-            //   * Stopped resolves a pending Delete
-            //   * Failed resolves either
-            // Other combinations are background noise from
-            // `report_local_vm_states` on the agent (which walks every
-            // tracked VM on a timer and reports state=Running for it,
-            // even while a Delete is mid-flight between DeleteVm
-            // dispatch and the agent's row-first `agent_db.delete_vm`).
-            // Treating that noise as a mismatch would produce spurious
-            // DeleteMachine failures. Peek the kind before removing so
-            // a non-matching state leaves the waiter intact.
             let resolves = matches!(
                 (pending_ops.get(&report.vm_id).map(|p| p.kind), state),
                 (Some(VmOpKind::Create), MachineState::Running)
@@ -1264,32 +1433,30 @@ async fn handle_agent_message(
     Ok(())
 }
 
-/// CAPI-shaped provider ID for a VM.
-///
-/// This value has to match what the kubelet inside the guest ends up
-/// reporting on `Node.spec.providerID`. Lattice templates
-/// `provider-id=basis://{{ ds.meta_data.instance_id }}` into kubeadm's
-/// kubelet args, and basis-agent writes `instance-id: <vm_id>` into
-/// cloud-init's meta-data — so the VM's reported providerID is
-/// `basis://<vm_id>`. We return the same here. If the two ever drift,
-/// CAPI's Machine reconciler never binds a NodeRef and the control
-/// plane never comes up.
-fn provider_id(vm_id: &str) -> String {
-    format!("basis://{vm_id}")
+// --- Proto conversions — single source of truth ---
+
+fn cluster_to_proto(c: &ClusterRow, tree: &TreeRow) -> Cluster {
+    Cluster {
+        cluster_id: c.id.clone(),
+        name: c.name.clone(),
+        tree_id: tree.id.clone(),
+        parent_cluster_id: c.parent_cluster_id.clone().unwrap_or_default(),
+        control_plane_endpoint: c.control_plane_endpoint.clone(),
+        vni: tree.vni as u32,
+    }
 }
 
-fn cluster_row_to_proto(row: ClusterRow) -> Cluster {
-    Cluster {
-        cluster_id: row.id,
-        name: row.name,
-        ip_pool: row.ip_pool,
-        control_plane_endpoint: row.control_plane_endpoint,
+fn create_cluster_response(c: &ClusterRow, tree: &TreeRow) -> CreateClusterResponse {
+    CreateClusterResponse {
+        cluster_id: c.id.clone(),
+        control_plane_endpoint: c.control_plane_endpoint.clone(),
+        tree_id: tree.id.clone(),
+        vni: tree.vni as u32,
     }
 }
 
 fn vm_to_machine(vm: &VmRow) -> Machine {
     let gpu_devices: Vec<GpuDevice> = parse_owned_json(&vm.gpu_assignments, "vms.gpu_assignments");
-
     let gpus = gpu_devices
         .into_iter()
         .map(|g| MachineGpu {
@@ -1305,10 +1472,6 @@ fn vm_to_machine(vm: &VmRow) -> Machine {
             .map(|size_gib| ExtraDisk { size_gib })
             .collect();
 
-    // `vms.cpu/memory_mib/disk_gib` originate from u32-typed proto
-    // fields and are CHECK-bounded by sqlite (see migration). A panic
-    // here would mean the DB was hand-edited to an out-of-range value;
-    // fail loudly rather than silently truncating the response.
     let narrow = |field: &'static str, v: i64| -> u32 {
         u32::try_from(v).unwrap_or_else(|_| {
             panic!(
@@ -1332,5 +1495,18 @@ fn vm_to_machine(vm: &VmRow) -> Machine {
         gpus,
         error_message: vm.error_message.clone(),
         extra_disks,
+        edge: vm.edge_ip.is_some(),
+        edge_ip: vm.edge_ip.clone().unwrap_or_default(),
+    }
+}
+
+/// Narrower response wrapper for create/idempotent-return paths.
+fn vm_to_create_response(vm: &VmRow) -> CreateMachineResponse {
+    CreateMachineResponse {
+        id: vm.id.clone(),
+        provider_id: provider_id(&vm.id),
+        ip_address: vm.ip_address.clone(),
+        host: vm.host_id.clone(),
+        edge_ip: vm.edge_ip.clone().unwrap_or_default(),
     }
 }

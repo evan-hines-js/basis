@@ -3,7 +3,7 @@
 //! Create flow is driven by two idempotency primitives:
 //!   - `Basis.CreateCluster` is idempotent by name server-side (see
 //!     basis-controller/src/server.rs). Calling it twice with the same
-//!     `(name, ip_pool)` returns the same `(cluster_id, endpoint)`.
+//!     `(name, parent_cluster_id)` returns the same result.
 //!   - Every reconcile rewrites `spec.controlPlaneEndpoint` and the
 //!     `status` fields as merge patches. Writing identical values is a
 //!     no-op on the API server, so repeated reconciles converge without
@@ -32,7 +32,9 @@ use tracing::{error, info, warn};
 
 use crate::client_cache::CacheError;
 use crate::conditions;
-use crate::crds::BasisCluster;
+use basis_client::ClusterRequest;
+
+use crate::crds::{BasisCluster, ParentClusterRef};
 use crate::reconciler::{
     merge_spec, merge_status, namespace_of, record_failure_status, ProviderContext, ReconcileError,
 };
@@ -59,6 +61,9 @@ pub enum ClusterError {
 
     #[error("resolving credentials: {0}")]
     Credentials(#[from] CacheError),
+
+    #[error("parent cluster '{0}' has no basisClusterId yet — retrying")]
+    ParentNotReady(String),
 }
 
 impl ReconcileError for ClusterError {
@@ -70,6 +75,7 @@ impl ReconcileError for ClusterError {
             ClusterError::Basis(e) if e.is_transient() => "BasisBackpressure",
             ClusterError::Basis(_) => "BasisRpcError",
             ClusterError::Credentials(_) => "BasisCredentialsInvalid",
+            ClusterError::ParentNotReady(_) => "ParentNotReady",
         }
     }
 
@@ -80,7 +86,30 @@ impl ReconcileError for ClusterError {
 
     fn is_transient(&self) -> bool {
         matches!(self, ClusterError::Basis(e) if e.is_transient())
+            || matches!(self, ClusterError::ParentNotReady(_))
     }
+}
+
+/// Resolve a parent `BasisCluster` reference to the parent's
+/// basis-side cluster id. Returns `None` when no parent is configured
+/// (the cluster is a tree root). Errors with `ParentNotReady` if the
+/// referenced parent exists but hasn't finished its own create yet —
+/// the error policy requeues quickly on that.
+async fn resolve_parent_id(
+    client: &Client,
+    own_namespace: &str,
+    parent: Option<&ParentClusterRef>,
+) -> Result<Option<String>, ClusterError> {
+    let Some(parent) = parent else { return Ok(None) };
+    let ns = parent.namespace.as_deref().unwrap_or(own_namespace);
+    let api: Api<BasisCluster> = Api::namespaced(client.clone(), ns);
+    let pcr = api.get(&parent.name).await?;
+    let id = pcr
+        .status
+        .as_ref()
+        .and_then(|s| s.basis_cluster_id.clone())
+        .ok_or_else(|| ClusterError::ParentNotReady(pcr.name_any()))?;
+    Ok(Some(id))
 }
 
 pub async fn run(
@@ -141,17 +170,27 @@ async fn apply(
         .get(&cluster.spec.credentials_ref, &namespace)
         .await?;
 
-    // Server-side `CreateCluster` allocates the VIP and is idempotent
-    // by name: retrying returns the same `(cluster_id, endpoint)` pair,
-    // so we can issue the RPC on every reconcile and self-heal from
-    // partial writes below without ever creating duplicate clusters.
+    // Resolve the parent's basis-side cluster id (if any). The referenced
+    // `BasisCluster` must have finished its own create first —
+    // `ClusterNotReady` surfaces through the error policy and requeues
+    // quickly.
+    let parent_cluster_id =
+        resolve_parent_id(&ctx.client, &namespace, cluster.spec.parent_cluster_ref.as_ref())
+            .await?;
+
+    // Server-side `CreateCluster` materialises (or joins) a tree,
+    // allocates a VIP, and is idempotent by name: retrying returns the
+    // same result.
     info!(
         cluster = %name,
-        ip_pool = %cluster.spec.ip_pool,
+        parent = ?parent_cluster_id,
         "calling Basis.CreateCluster"
     );
     let created = basis
-        .create_cluster(name.clone(), cluster.spec.ip_pool.clone())
+        .create_cluster(ClusterRequest {
+            name: name.clone(),
+            parent_cluster_id: parent_cluster_id.clone(),
+        })
         .await?;
 
     // Write the allocated endpoint to spec first: CAPI core watches
@@ -191,6 +230,8 @@ async fn apply(
         &json!({
             "status": {
                 "basisClusterId": created.cluster_id,
+                "treeId": created.tree_id,
+                "vni": created.vni,
                 "ready": true,
                 "initialization": { "provisioned": true },
                 "failureMessage": serde_json::Value::Null,

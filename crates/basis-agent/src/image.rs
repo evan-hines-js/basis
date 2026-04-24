@@ -117,14 +117,23 @@ pub struct CachedImage {
     pub initrd: PathBuf,
 }
 
-/// Guest-side network configuration baked into the cloud-init ISO.
-/// Grouped here so the ISO builder has one parameter instead of four
-/// positional `&str`s that are easy to transpose at the call site.
+/// Guest-side primary-NIC configuration. The primary NIC carries the
+/// default route and DNS; it's the tree's VXLAN-attached interface.
 pub struct GuestNetwork<'a> {
     pub ip_address: &'a str,
     pub gateway: &'a str,
     pub prefix_len: u32,
     pub dns_servers: &'a [String],
+}
+
+/// Optional edge-NIC configuration. When present, a second interface
+/// (`ens4`) is configured with the supplied IP but no default route —
+/// its purpose is Cilium BGP / LB ingress / egress gateway, not general
+/// egress. The guest's routing on top of this is the CNI's job.
+pub struct GuestEdgeNetwork<'a> {
+    pub ip_address: &'a str,
+    pub gateway: &'a str,
+    pub prefix_len: u32,
 }
 
 /// Name of the ISO-9660 producer resolved at startup. `mkisofs` and
@@ -401,7 +410,8 @@ impl ImageManager {
         instance_id: &str,
         hostname: &str,
         userdata: &[u8],
-        net: &GuestNetwork<'_>,
+        primary: &GuestNetwork<'_>,
+        edge: Option<&GuestEdgeNetwork<'_>>,
     ) -> Result<PathBuf, ImageError> {
         let cidata_dir = vm_dir.join("cidata");
         std::fs::create_dir_all(&cidata_dir)?;
@@ -412,30 +422,7 @@ impl ImageManager {
             format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n"),
         )?;
 
-        let dns_entries: String = net
-            .dns_servers
-            .iter()
-            .map(|s| format!("          - {s}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let network_config = format!(
-            r#"network:
-  version: 2
-  ethernets:
-    ens3:
-      addresses:
-        - {ip}/{prefix}
-      gateway4: {gw}
-      nameservers:
-        addresses:
-{dns_entries}
-"#,
-            ip = net.ip_address,
-            prefix = net.prefix_len,
-            gw = net.gateway,
-        );
-        std::fs::write(cidata_dir.join("network-config"), &network_config)?;
+        std::fs::write(cidata_dir.join("network-config"), network_config(primary, edge))?;
 
         let iso_path = vm_dir.join("cidata.iso");
         // Use the tool resolved at startup (see `validate_tools`). No
@@ -472,9 +459,49 @@ impl ImageManager {
     }
 }
 
+/// Render the cloud-init netplan v2 network-config. `ens3` is the
+/// primary (tree) NIC carrying the default route and DNS; `ens4` is
+/// the optional edge NIC with an address but no default route. Pure
+/// string building so it's testable in isolation.
+fn network_config(primary: &GuestNetwork<'_>, edge: Option<&GuestEdgeNetwork<'_>>) -> String {
+    let dns_entries: String = primary
+        .dns_servers
+        .iter()
+        .map(|s| format!("          - {s}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = format!(
+        r#"network:
+  version: 2
+  ethernets:
+    ens3:
+      addresses:
+        - {ip}/{prefix}
+      gateway4: {gw}
+      nameservers:
+        addresses:
+{dns_entries}
+"#,
+        ip = primary.ip_address,
+        prefix = primary.prefix_len,
+        gw = primary.gateway,
+    );
+    if let Some(e) = edge {
+        // No `gateway4` on the edge NIC: the tree's default route wins,
+        // and the CNI programs whatever routing it needs per-pod.
+        out.push_str(&format!(
+            r#"    ens4:
+      addresses:
+        - {ip}/{prefix}
+"#,
+            ip = e.ip_address,
+            prefix = e.prefix_len,
+        ));
+    }
+    out
+}
+
 /// Convert an image reference to a safe filename stem for the cache.
-/// The three layers share this stem with different extensions — see
-/// `ensure_cached`.
 fn image_ref_to_prefix(image_ref: &str) -> String {
     image_ref.replace(['/', ':', '.'], "_")
 }
@@ -545,6 +572,45 @@ mod tests {
         assert_eq!(
             image_ref_to_prefix("test:latest"),
             image_ref_to_prefix("test:latest"),
+        );
+    }
+
+    #[test]
+    fn network_config_primary_only() {
+        let primary = GuestNetwork {
+            ip_address: "10.1.0.20",
+            gateway: "10.1.0.1",
+            prefix_len: 20,
+            dns_servers: &["8.8.8.8".to_string()],
+        };
+        let s = network_config(&primary, None);
+        assert!(s.contains("ens3:"), "{s}");
+        assert!(s.contains("10.1.0.20/20"), "{s}");
+        assert!(s.contains("gateway4: 10.1.0.1"), "{s}");
+        assert!(!s.contains("ens4:"), "{s}");
+    }
+
+    #[test]
+    fn network_config_primary_plus_edge() {
+        let primary = GuestNetwork {
+            ip_address: "10.1.0.20",
+            gateway: "10.1.0.1",
+            prefix_len: 20,
+            dns_servers: &["8.8.8.8".to_string()],
+        };
+        let edge = GuestEdgeNetwork {
+            ip_address: "192.168.100.5",
+            gateway: "192.168.100.1",
+            prefix_len: 24,
+        };
+        let s = network_config(&primary, Some(&edge));
+        assert!(s.contains("ens3:"), "{s}");
+        assert!(s.contains("ens4:"), "{s}");
+        assert!(s.contains("192.168.100.5/24"), "{s}");
+        // Edge NIC must NOT carry a default gateway.
+        assert!(
+            !s.split("ens4:").nth(1).unwrap_or("").contains("gateway4"),
+            "edge NIC section should not have gateway4 — {s}"
         );
     }
 }

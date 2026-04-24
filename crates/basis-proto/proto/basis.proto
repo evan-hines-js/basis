@@ -3,10 +3,10 @@ package basis.v1;
 
 // CAPI-facing service — called by basis-capi-provider running in Kubernetes.
 //
-// Two-level model: a caller first creates a Cluster (reserves a VIP and
-// binds an IP pool), then creates Machines inside that cluster. All VM
-// placement decisions (host, GPUs, IP) belong to the controller — callers
-// describe intent, not placement.
+// Two-level model: a caller first creates a Cluster (which materializes
+// or joins a tree and reserves a VIP), then creates Machines inside that
+// cluster. All placement decisions (host, GPUs, IP) belong to the
+// controller — callers describe intent, not placement.
 service Basis {
   rpc CreateCluster(CreateClusterRequest) returns (CreateClusterResponse);
   rpc DeleteCluster(DeleteClusterRequest) returns (DeleteClusterResponse);
@@ -19,9 +19,8 @@ service Basis {
   rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse);
 }
 
-// Agent-facing service — agents connect outbound and receive commands over
-// a bidirectional stream. This matches Lattice's outbound-only architecture:
-// agents need zero inbound firewall rules.
+// Agent-facing service — agents connect outbound and receive commands
+// over a bidirectional stream.
 service BasisAgent {
   rpc StreamMessages(stream AgentMessage) returns (stream ControllerCommand);
 }
@@ -32,19 +31,27 @@ message CreateClusterRequest {
   // Human-readable cluster name. Must be unique across the Basis
   // controller. Used in logs and as the `cluster` label on VMs.
   string name = 1;
-  // Name of the IP pool (configured in controller.toml) to allocate
-  // VM IPs and a control-plane VIP from for this cluster.
-  string ip_pool = 2;
+  // If set, this cluster joins the tree of the referenced parent
+  // cluster. If empty, this cluster is a tree root — the controller
+  // materializes a new tree (allocates a VNI, carves a CIDR) before
+  // inserting the cluster row.
+  string parent_cluster_id = 2;
 }
 
 message CreateClusterResponse {
   string cluster_id = 1;
   // Control-plane endpoint VIP, allocated by the controller from the
-  // pool's `vip_range` sub-range. kube-vip inside the first control-
-  // plane guest claims this address via gratuitous ARP. The caller
-  // records this on its `InfrastructureCluster` CR so the rest of CAPI
-  // can read it from `Cluster.spec.controlPlaneEndpoint`.
+  // tree's `vip_range` sub-range. kube-vip inside the first control-
+  // plane guest claims this address via gratuitous ARP on the tree's
+  // VXLAN. The caller records this on its `InfrastructureCluster` CR
+  // so the rest of CAPI can read it from
+  // `Cluster.spec.controlPlaneEndpoint`.
   string control_plane_endpoint = 2;
+  // Tree this cluster belongs to. Root clusters materialize a new
+  // tree; children inherit their parent's.
+  string tree_id = 3;
+  // VXLAN Network Identifier for the tree. 24-bit.
+  uint32 vni = 4;
 }
 
 message DeleteClusterRequest {
@@ -60,8 +67,10 @@ message GetClusterRequest {
 message Cluster {
   string cluster_id = 1;
   string name = 2;
-  string ip_pool = 3;
-  string control_plane_endpoint = 4;
+  string tree_id = 3;
+  string parent_cluster_id = 4;
+  string control_plane_endpoint = 5;
+  uint32 vni = 6;
 }
 
 message ListClustersRequest {}
@@ -83,18 +92,18 @@ message CreateMachineRequest {
   bytes bootstrap_data = 7;
   uint32 gpus = 8;
   GPUConstraints gpu_constraints = 9;
-  // Additional raw block devices to attach to the guest alongside the
-  // rootfs. Each becomes a plain virtio-blk device (`/dev/vdb`, `/dev/vdc`,
-  // …). Basis does not format, partition, or mount them — they're handed
-  // to the guest unformatted so an in-cluster storage operator (Rook/Ceph)
-  // can claim and manage them directly.
+  // Additional raw block devices attached alongside the rootfs. Each
+  // becomes a plain virtio-blk device (`/dev/vdc`, `/dev/vdd`, …) —
+  // handed to the guest unformatted so an in-cluster storage operator
+  // (Rook/Ceph) can claim and manage them directly.
   repeated ExtraDisk extra_disks = 10;
+  // If true, the agent attaches a second NIC to the uplink bridge
+  // (outside the tree's VXLAN) and the controller allocates an IP
+  // from the global `edge_pool`. Used for Cilium BGP / EgressGateway
+  // nodes — the cluster's north/south ingress/egress boundary.
+  bool edge = 11;
 }
 
-// A raw data disk requested alongside a VM's rootfs. Deliberately
-// minimal: just a size. Basis creates an LVM thin volume of this size
-// and attaches it as a virtio-blk device; anything richer (filesystem,
-// partitioning, mount point, device class) is the guest's problem.
 message ExtraDisk {
   uint32 size_gib = 1;
 }
@@ -104,6 +113,8 @@ message CreateMachineResponse {
   string provider_id = 2;
   string ip_address = 3;
   string host = 4;
+  // Non-empty iff the machine was created with `edge: true`.
+  string edge_ip = 5;
 }
 
 message DeleteMachineRequest {
@@ -117,7 +128,6 @@ message GetMachineRequest {
 }
 
 message ListMachinesRequest {
-  // Filter by cluster_id. Empty string means all clusters.
   string cluster_id = 1;
 }
 
@@ -137,24 +147,13 @@ message Machine {
   uint32 memory_mib = 9;
   uint32 disk_gib = 10;
   repeated MachineGPU gpus = 11;
-  // Populated when state = FAILED: the agent-reported reason the VM
-  // could not be created or stopped running (e.g. "cloud-hypervisor
-  // process exited", "image pull failed"). Empty for non-failed states.
-  // Surfaced by basis-capi-provider onto BasisMachine.status.failureMessage
-  // so operators see the actual fault rather than a generic "VM failed".
   string error_message = 12;
-  // Extra raw data disks provisioned alongside the rootfs, in the
-  // order the guest enumerates them after `/dev/vda` (rootfs) and
-  // `/dev/vdb` (cloud-init ISO). Echoed from the caller's
-  // `CreateMachineRequest.extra_disks` so CAPI reconcilers can compare
-  // against the desired spec without a second lookup.
   repeated ExtraDisk extra_disks = 13;
+  bool edge = 14;
+  // Set iff `edge = true`.
+  string edge_ip = 15;
 }
 
-// GPU detail exposed to CAPI consumers. Strictly a subset of the internal
-// `GPUDevice`: iommu groups are a host-internal passthrough detail the
-// scheduler needs, but CAPI has no use for them and they shouldn't leak
-// out on the read path.
 message MachineGPU {
   string pci_address = 1;
   string model = 2;
@@ -197,30 +196,48 @@ message ControllerCommand {
     CreateVMCommand create_vm = 2;
     DeleteVMCommand delete_vm = 3;
     RegisterHostResponse register_ack = 4;
+    // Authoritative list of VMs + trees this host should carry. Fired
+    // on every relevant state change (VM create/delete, host joins or
+    // leaves a tree, peer-set shift) AND periodically so missed pushes
+    // converge. Agent reconciles local state to match — deletes VMs
+    // not in the list, builds bridges for trees not yet present,
+    // tears down bridges for trees no longer in the list, replaces
+    // FDB entries to match each tree's `vtep_addresses`.
     ReconcileHostCommand reconcile_host = 5;
   }
 }
 
-// Periodic authoritative VM list for this host. Carries the same contract
-// as `RegisterHostResponse.expected_vm_ids` but fires on an interval while
-// the agent is already connected — so a controller that loses track of a
-// VM (e.g. a fire-and-forget DeleteVm that dropped) is still converged on
-// without requiring the agent to reconnect. The agent deletes any local
-// VM not in this list.
+// The full authoritative view the controller holds of a single host.
+// One message drives three invariants: VM set, tree set, per-tree
+// peer VTEPs. There is no separate incremental message — every
+// relevant change re-sends this, and the periodic tick does too, so
+// there's exactly one code path on the agent that turns controller
+// state into host state.
 message ReconcileHostCommand {
   repeated string expected_vm_ids = 1;
+  repeated TreeState trees = 2;
 }
 
-// Sent as the first command after the agent's RegisterHostRequest.
-//
-// The controller is authoritative: `expected_vm_ids` is the complete list
-// of VMs this host should have. The agent MUST delete any local VM not in
-// this list before reporting state — those VMs were forgotten by the
-// controller (e.g., deleted while the agent was offline) and their disks
-// and tap devices are garbage.
 message RegisterHostResponse {
   string host_id = 1;
-  repeated string expected_vm_ids = 2;
+  // Initial state the agent should reconcile against. Equivalent to
+  // the first `ReconcileHostCommand` the agent would receive on the
+  // next tick — sent inline so the agent can converge before
+  // accepting CreateVm commands.
+  ReconcileHostCommand initial_state = 2;
+}
+
+// One tree's full dataplane state: VNI, CIDR layout, and VTEP peers.
+message TreeState {
+  string tree_id = 1;
+  uint32 vni = 2;
+  string cidr = 3;
+  string gateway_ip = 4;
+  uint32 prefix_len = 5;
+  // VTEP addresses of every hypervisor currently carrying a VM of
+  // this tree. Learning is disabled on the VXLAN device, so this list
+  // is the FDB's BUM destination set.
+  repeated string vtep_addresses = 6;
 }
 
 // --- Agent registration ---
@@ -230,15 +247,14 @@ message RegisterHostRequest {
   uint32 total_cpu = 2;
   uint64 total_memory_mib = 3;
   uint64 total_disk_gib = 4;
-  // Per-GPU iommu_group is carried inside each GPUDevice; no separate
-  // aggregate field needed.
   repeated GPUDevice gpus = 5;
+  // IP address the agent will use as the source for outgoing VXLAN
+  // frames. Almost always the uplink interface's address. Reported
+  // once at registration; the controller stores it on `hosts` and
+  // includes it in `TreeState.vtep_addresses` broadcasts.
+  string vtep_address = 6;
 }
 
-// Agent liveness signal. The controller is authoritative for capacity:
-// `available = total - sum(vms on host)` is computed server-side at
-// scheduling time from the VM table. The agent only needs to tell the
-// controller it is alive.
 message HeartbeatRequest {
   string host_id = 1;
 }
@@ -247,12 +263,6 @@ message ReportVMStateRequest {
   string vm_id = 1;
   MachineState state = 2;
   string error_message = 3;
-  // True when the failure is a load-shedding signal (e.g., the LVM
-  // mutation semaphore timed out because the agent couldn't keep up
-  // with arrival rate) rather than a real fault. The controller maps
-  // this to a transient RPC status (`Unavailable`) so callers retry
-  // instead of alerting, and labels the result as `busy` in metrics.
-  // Ignored for state=RUNNING.
   bool transient = 4;
 }
 
@@ -266,21 +276,27 @@ message CreateVMCommand {
   uint32 disk_gib = 5;
   string image = 6;
   bytes bootstrap_data = 7;
+  // Primary IP (on the tree's VXLAN), gateway and prefix are the tree's.
   string ip_address = 8;
   string gateway = 9;
   uint32 prefix_len = 10;
   uint32 gpus = 11;
   GPUConstraints gpu_constraints = 12;
   repeated string dns_servers = 13;
-  // PCI addresses of GPUs selected by the scheduler. The agent binds
-  // these to vfio-pci and passes them to cloud-hypervisor.
   repeated string gpu_pci_addresses = 14;
-  // Forwarded from `CreateMachineRequest.extra_disks`. Order is
-  // stable and load-bearing: the N'th entry becomes `vmdata-<vm_id>-<N>`
-  // in LVM and enumerates as the (N+1)'th virtio-blk device in the
-  // guest (after rootfs and cloud-init ISO). Agents must preserve it
-  // so a restart reattaches the same disk at the same index.
   repeated ExtraDisk extra_disks = 15;
+  // VXLAN Network Identifier of the tree this VM joins at L2. The
+  // agent derives the bridge name from this and attaches the VM's
+  // primary TAP to it. The bridge itself is kept alive by
+  // `ReconcileHostCommand` — which precedes this command on the same
+  // mpsc stream whenever a new tree shows up on the host.
+  uint32 vni = 16;
+  // Non-empty string iff the machine was created with `edge: true`.
+  // The agent creates a second TAP on the uplink bridge with this IP
+  // and plumbs it into cloud-init as `eth1`.
+  string edge_ip = 17;
+  string edge_gateway = 18;
+  uint32 edge_prefix_len = 19;
 }
 
 message DeleteVMCommand {

@@ -9,10 +9,27 @@
 //!   listen: "0.0.0.0:7443"
 //!   dataDir: /var/lib/basis
 //!   tls: { ... }
-//!   ipPools: [...]
+//!   network:
+//!     treeSupernet: 10.0.0.0/8
+//!     treePrefix: 20
+//!     vipReserve: 16
+//!     vniRange: { start: 10000, end: 16000000 }
+//!     vniCooldownSecs: 60
+//!     edgePool:
+//!       cidr: 192.168.100.0/24
+//!       gateway: 192.168.100.1
+//!       rangeStart: 192.168.100.20
+//!       rangeEnd: 192.168.100.250
 //!   cpuOvercommitRatio: 4.0
 //! ```
+//!
+//! One-pool-per-controller by design: every cluster carves its own
+//! sub-CIDR out of `treeSupernet`, so there's no "pick a pool by name"
+//! step on create. Edge IPs (second NIC for `edge: true` machines) live
+//! in a single global `edgePool` on the uplink — carve per-tree edge
+//! pools if you ever need per-tree uplink isolation (not yet).
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use basis_common::resource::{load_resource, Resource, ResourceError};
@@ -22,6 +39,11 @@ use serde::{Deserialize, Serialize};
 pub const KIND: &str = "BasisController";
 
 pub type BasisController = Resource<BasisControllerSpec>;
+
+/// Sentinel scope value for edge-pool IP allocations. Stored in
+/// `ip_allocations.scope` alongside tree UUIDs; the two never collide
+/// because UUIDs can't match the literal "edge".
+pub const EDGE_SCOPE: &str = "edge";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,8 +56,9 @@ pub struct BasisControllerSpec {
     /// Persistent state directory (holds `controller.db`).
     pub data_dir: PathBuf,
     pub tls: TlsConfig,
-    #[serde(default)]
-    pub ip_pools: Vec<IpPool>,
+    /// Networking fabric configuration: per-tree CIDR carving, VNI
+    /// allocation bounds, and the shared edge-NIC IP pool.
+    pub network: NetworkConfig,
     /// Resolvers the agent bakes into each VM's cloud-init network config.
     /// Defaults to public Google DNS so a stock deployment boots; override
     /// in any environment without outbound 8.8.8.8 reachability.
@@ -61,34 +84,73 @@ fn default_cpu_overcommit_ratio() -> f32 {
     4.0
 }
 
-/// Inclusive IPv4 range used by the IP-pool allocators.
-///
-/// Both ends are parsed to `Ipv4Addr` at allocation time; this type
-/// just carries the config strings verbatim so YAML round-trips cleanly.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct IpRange {
-    pub start: String,
-    pub end: String,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IpPool {
-    pub name: String,
+pub struct NetworkConfig {
+    /// RFC1918 supernet that per-tree CIDRs are carved from, e.g.
+    /// `10.0.0.0/8`. Every tree gets its own disjoint
+    /// `/tree_prefix` slice.
+    pub tree_supernet: String,
+
+    /// Prefix length of each per-tree CIDR. Default /20 — 4094 usable
+    /// addresses per tree, plenty for one trust domain's worth of
+    /// control-plane VMs + worker VMs + VIPs.
+    #[serde(default = "default_tree_prefix")]
+    pub tree_prefix: u8,
+
+    /// Number of addresses at the TOP of each tree's CIDR reserved for
+    /// control-plane VIPs. Default 16 — one VIP per cluster comfortably
+    /// handles cell + children.
+    #[serde(default = "default_vip_reserve")]
+    pub vip_reserve: u32,
+
+    /// VNI allocation bounds, inclusive. Default 10000..=16_000_000 —
+    /// leaves low VNIs for infrastructure, stays well below the 2^24
+    /// VXLAN ceiling.
+    #[serde(default = "default_vni_range")]
+    pub vni_range: VniRange,
+
+    /// Seconds a deleted tree's VNI is held before reuse. Protects
+    /// in-flight VXLAN frames for the prior tree from being
+    /// decapsulated into the new tree's bridge.
+    #[serde(default = "default_vni_cooldown_secs")]
+    pub vni_cooldown_secs: u64,
+
+    /// Edge IP pool on the uplink for `edge: true` machines' second NICs.
+    pub edge_pool: EdgePool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VniRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgePool {
+    /// CIDR the uplink NIC lives on (e.g. the TOR switch's LAN).
     pub cidr: String,
     pub gateway: String,
-    /// Range the controller auto-picks VM IPs from (`allocate_ip`).
-    /// Must be disjoint from `vip_range` — the two allocators write to
-    /// the same `ip_allocations` table and rely on range-level
-    /// separation so VM auto-allocation can never race a pending VIP
-    /// reservation for a sibling cluster that hasn't been created yet.
-    pub vm_range: IpRange,
-    /// Range the controller auto-picks control-plane VIPs from
-    /// (`allocate_vip`). Sized to the number of concurrent clusters you
-    /// expect; a homelab with a handful of clusters can get away with
-    /// 4–8 addresses.
-    pub vip_range: IpRange,
+    pub range_start: String,
+    pub range_end: String,
+}
+
+fn default_tree_prefix() -> u8 {
+    20
+}
+fn default_vip_reserve() -> u32 {
+    16
+}
+fn default_vni_range() -> VniRange {
+    VniRange {
+        start: 10_000,
+        end: 16_000_000,
+    }
+}
+fn default_vni_cooldown_secs() -> u64 {
+    60
 }
 
 impl BasisControllerSpec {
@@ -111,68 +173,94 @@ impl BasisControllerSpec {
                 self.cpu_overcommit_ratio
             );
         }
-        for pool in &self.ip_pools {
-            pool.validate()
-                .map_err(|e| anyhow::anyhow!("ipPools['{}']: {e}", pool.name))?;
-        }
+        self.network.validate()?;
         Ok(())
     }
 }
 
 /// Parse a CIDR string like `"10.0.10.0/24"` and return the prefix
-/// length. Used by both config validation (loud anyhow error) and the
-/// runtime allocator path (typed `DbError::MalformedIpPool`).
+/// length.
 pub fn parse_cidr_prefix(cidr: &str) -> anyhow::Result<u8> {
-    let (addr, prefix) = cidr
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("cidr '{cidr}' must be in the form 'A.B.C.D/N'"))?;
-    addr.parse::<std::net::Ipv4Addr>()
-        .map_err(|e| anyhow::anyhow!("cidr '{cidr}' has bad address: {e}"))?;
-    let n: u8 = prefix
+    let net: ipnet::Ipv4Net = cidr
         .parse()
-        .map_err(|e| anyhow::anyhow!("cidr '{cidr}' prefix '{prefix}' is not a u8: {e}"))?;
-    if n > 32 {
-        anyhow::bail!("cidr '{cidr}' prefix /{n} exceeds 32");
-    }
-    Ok(n)
+        .map_err(|e| anyhow::anyhow!("cidr '{cidr}' invalid: {e}"))?;
+    Ok(net.prefix_len())
 }
 
-impl IpPool {
-    /// Parse every IP field and confirm the ranges are non-empty and
-    /// disjoint. Called from [`BasisControllerSpec::validate`] so a
-    /// malformed pool is rejected at config load, not at first allocation.
+impl NetworkConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        use std::net::Ipv4Addr;
-        let parse_ip = |label: &str, s: &str| -> anyhow::Result<Ipv4Addr> {
-            s.parse::<Ipv4Addr>()
-                .map_err(|e| anyhow::anyhow!("{label} '{s}' is not a valid IPv4 address: {e}"))
-        };
-        parse_cidr_prefix(&self.cidr)?;
-        parse_ip("gateway", &self.gateway)?;
-        let vm_start = parse_ip("vmRange.start", &self.vm_range.start)?;
-        let vm_end = parse_ip("vmRange.end", &self.vm_range.end)?;
-        let vip_start = parse_ip("vipRange.start", &self.vip_range.start)?;
-        let vip_end = parse_ip("vipRange.end", &self.vip_range.end)?;
-
-        if u32::from(vm_start) > u32::from(vm_end) {
-            anyhow::bail!("vmRange.start ({vm_start}) must be <= vmRange.end ({vm_end})");
-        }
-        if u32::from(vip_start) > u32::from(vip_end) {
-            anyhow::bail!("vipRange.start ({vip_start}) must be <= vipRange.end ({vip_end})");
-        }
-
-        // Ranges must be disjoint — the allocator keys off range
-        // membership to decide which pool an IP came from, and overlap
-        // would make reservations race.
-        let (a, b) = (u32::from(vm_start), u32::from(vm_end));
-        let (c, d) = (u32::from(vip_start), u32::from(vip_end));
-        if a <= d && c <= b {
+        let supernet: ipnet::Ipv4Net = self
+            .tree_supernet
+            .parse()
+            .map_err(|e| anyhow::anyhow!("network.treeSupernet '{}' invalid: {e}", self.tree_supernet))?;
+        if self.tree_prefix < supernet.prefix_len() || self.tree_prefix > 30 {
             anyhow::bail!(
-                "vmRange ({vm_start}..={vm_end}) overlaps vipRange ({vip_start}..={vip_end}) \
-                 — the allocator requires them to be disjoint"
+                "network.treePrefix /{} must be between /{} (supernet) and /30 inclusive",
+                self.tree_prefix,
+                supernet.prefix_len()
             );
         }
+        // Per-tree CIDRs carry: network, broadcast, gateway (first host),
+        // plus `vipReserve` VIPs at the top, and everything else is VM
+        // range. For /20 that's 4096 total, 4091 VMs; even for /28 (16
+        // total) the layout still leaves a handful of VMs after
+        // reserving 16 VIPs is refused here.
+        let addrs_per_tree: u32 = 1u32 << (32 - self.tree_prefix);
+        let need = self.vip_reserve.saturating_add(3); // net + bcast + gateway
+        if addrs_per_tree <= need {
+            anyhow::bail!(
+                "network.treePrefix /{} holds {} addresses; vipReserve={} leaves no VM capacity",
+                self.tree_prefix,
+                addrs_per_tree,
+                self.vip_reserve,
+            );
+        }
+        if self.vni_range.start == 0 || self.vni_range.end < self.vni_range.start {
+            anyhow::bail!(
+                "network.vniRange invalid: start={}, end={}",
+                self.vni_range.start,
+                self.vni_range.end,
+            );
+        }
+        // 24-bit ceiling: VXLAN VNI field is 24 bits.
+        if self.vni_range.end >= 1 << 24 {
+            anyhow::bail!(
+                "network.vniRange.end {} exceeds VXLAN 24-bit limit (16_777_215)",
+                self.vni_range.end,
+            );
+        }
+        self.edge_pool.validate()?;
         Ok(())
+    }
+}
+
+impl EdgePool {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let net: ipnet::Ipv4Net = self
+            .cidr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("edgePool.cidr '{}' invalid: {e}", self.cidr))?;
+        let parse_ip = |label: &str, s: &str| -> anyhow::Result<Ipv4Addr> {
+            s.parse::<Ipv4Addr>()
+                .map_err(|e| anyhow::anyhow!("edgePool.{label} '{s}' invalid: {e}"))
+        };
+        let gw = parse_ip("gateway", &self.gateway)?;
+        let start = parse_ip("rangeStart", &self.range_start)?;
+        let end = parse_ip("rangeEnd", &self.range_end)?;
+        if !net.contains(&gw) {
+            anyhow::bail!("edgePool.gateway {gw} not in {net}");
+        }
+        if !net.contains(&start) || !net.contains(&end) {
+            anyhow::bail!("edgePool.range [{start}..={end}] not inside {net}");
+        }
+        if u32::from(start) > u32::from(end) {
+            anyhow::bail!("edgePool.rangeStart {start} > rangeEnd {end}");
+        }
+        Ok(())
+    }
+
+    pub fn prefix_len(&self) -> anyhow::Result<u8> {
+        parse_cidr_prefix(&self.cidr)
     }
 }
 
@@ -187,10 +275,8 @@ mod tests {
         f
     }
 
-    #[test]
-    fn loads_valid_controller_config() {
-        let f = write(
-            r#"apiVersion: basis.dev/v1alpha1
+    fn base_yaml() -> String {
+        r#"apiVersion: basis.dev/v1alpha1
 kind: BasisController
 metadata:
   name: primary
@@ -201,167 +287,57 @@ spec:
     cert: /etc/basis/tls/controller.crt
     key: /etc/basis/tls/controller.key
     ca: /etc/basis/tls/ca.crt
-  ipPools:
-    - name: default
-      cidr: 10.0.10.0/24
-      gateway: 10.0.10.1
-      vmRange:
-        start: 10.0.10.20
-        end: 10.0.10.250
-      vipRange:
-        start: 10.0.10.10
-        end: 10.0.10.19
-"#,
-        );
-        let spec = BasisControllerSpec::load(f.path()).unwrap();
-        assert_eq!(spec.listen, "0.0.0.0:7443");
-        assert_eq!(
-            spec.db_path(),
-            PathBuf::from("/var/lib/basis/controller.db")
-        );
-        assert_eq!(spec.ip_pools.len(), 1);
-        assert_eq!(spec.ip_pools[0].name, "default");
-        assert_eq!(spec.ip_pools[0].vm_range.start, "10.0.10.20");
-        assert_eq!(spec.ip_pools[0].vip_range.end, "10.0.10.19");
+  network:
+    treeSupernet: 10.0.0.0/8
+    edgePool:
+      cidr: 192.168.100.0/24
+      gateway: 192.168.100.1
+      rangeStart: 192.168.100.20
+      rangeEnd: 192.168.100.250
+"#
+        .to_string()
     }
 
     #[test]
-    fn ip_pools_default_to_empty() {
-        let f = write(
-            r#"apiVersion: basis.dev/v1alpha1
-kind: BasisController
-metadata: { name: p }
-spec:
-  listen: "0.0.0.0:7443"
-  dataDir: /var/lib/basis
-  tls: { cert: /a, key: /b, ca: /c }
-"#,
-        );
+    fn loads_with_defaults() {
+        let f = write(&base_yaml());
         let spec = BasisControllerSpec::load(f.path()).unwrap();
-        assert!(spec.ip_pools.is_empty());
-    }
-
-    #[test]
-    fn cpu_overcommit_ratio_defaults_to_4() {
-        let f = write(
-            r#"apiVersion: basis.dev/v1alpha1
-kind: BasisController
-metadata: { name: p }
-spec:
-  listen: "0.0.0.0:7443"
-  dataDir: /var/lib/basis
-  tls: { cert: /a, key: /b, ca: /c }
-"#,
-        );
-        let spec = BasisControllerSpec::load(f.path()).unwrap();
-        assert_eq!(spec.cpu_overcommit_ratio, 4.0);
+        assert_eq!(spec.network.tree_prefix, 20);
+        assert_eq!(spec.network.vip_reserve, 16);
+        assert_eq!(spec.network.vni_range.start, 10_000);
+        assert_eq!(spec.network.vni_range.end, 16_000_000);
+        assert_eq!(spec.network.vni_cooldown_secs, 60);
         assert!(spec.validate().is_ok());
     }
 
     #[test]
-    fn validate_rejects_ratio_below_one() {
-        let mut spec = BasisControllerSpec {
-            listen: "x".to_string(),
-            metrics_listen: "x".to_string(),
-            data_dir: PathBuf::from("/"),
-            tls: TlsConfig {
-                cert: PathBuf::from("/a"),
-                key: PathBuf::from("/b"),
-                ca: PathBuf::from("/c"),
-            },
-            ip_pools: vec![],
-            dns_servers: vec![],
-            cpu_overcommit_ratio: 0.5,
-        };
+    fn rejects_supernet_overflow() {
+        let mut spec_str = base_yaml();
+        spec_str = spec_str.replace("treeSupernet: 10.0.0.0/8", "treeSupernet: 10.0.0.0/24");
+        let f = write(&spec_str);
+        // /24 supernet with default /20 tree prefix is impossible.
+        let spec = BasisControllerSpec::load(f.path()).unwrap();
         assert!(spec.validate().is_err());
-        spec.cpu_overcommit_ratio = f32::NAN;
+    }
+
+    #[test]
+    fn rejects_vni_past_24bit() {
+        let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
+        spec.network.vni_range.end = 1 << 24;
         assert!(spec.validate().is_err());
-        spec.cpu_overcommit_ratio = 1.0;
-        assert!(spec.validate().is_ok());
-    }
-
-    fn valid_pool() -> IpPool {
-        IpPool {
-            name: "p".to_string(),
-            cidr: "10.0.10.0/24".to_string(),
-            gateway: "10.0.10.1".to_string(),
-            vm_range: IpRange {
-                start: "10.0.10.20".to_string(),
-                end: "10.0.10.250".to_string(),
-            },
-            vip_range: IpRange {
-                start: "10.0.10.10".to_string(),
-                end: "10.0.10.19".to_string(),
-            },
-        }
     }
 
     #[test]
-    fn ip_pool_validate_accepts_valid() {
-        assert!(valid_pool().validate().is_ok());
+    fn rejects_edge_gateway_outside_cidr() {
+        let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
+        spec.network.edge_pool.gateway = "10.99.99.99".to_string();
+        assert!(spec.validate().is_err());
     }
 
     #[test]
-    fn ip_pool_validate_rejects_malformed_ip() {
-        let mut p = valid_pool();
-        p.vm_range.start = "not-an-ip".to_string();
-        assert!(p.validate().is_err());
-
-        let mut p = valid_pool();
-        p.gateway = "10.0.10".to_string();
-        assert!(p.validate().is_err());
-    }
-
-    #[test]
-    fn ip_pool_validate_rejects_inverted_range() {
-        let mut p = valid_pool();
-        p.vm_range.start = "10.0.10.250".to_string();
-        p.vm_range.end = "10.0.10.20".to_string();
-        assert!(p.validate().is_err());
-    }
-
-    #[test]
-    fn ip_pool_validate_rejects_overlapping_ranges() {
-        let mut p = valid_pool();
-        // vm range overlaps vip range.
-        p.vm_range.start = "10.0.10.15".to_string();
-        p.vm_range.end = "10.0.10.30".to_string();
-        assert!(p.validate().is_err());
-    }
-
-    #[test]
-    fn spec_validate_rejects_bad_pool() {
-        let mut spec = BasisControllerSpec {
-            listen: "x".to_string(),
-            metrics_listen: "x".to_string(),
-            data_dir: PathBuf::from("/"),
-            tls: TlsConfig {
-                cert: PathBuf::from("/a"),
-                key: PathBuf::from("/b"),
-                ca: PathBuf::from("/c"),
-            },
-            ip_pools: vec![valid_pool()],
-            dns_servers: vec![],
-            cpu_overcommit_ratio: 4.0,
-        };
-        assert!(spec.validate().is_ok());
-        spec.ip_pools[0].gateway = "bogus".to_string();
-        let err = spec.validate().unwrap_err();
-        assert!(err.to_string().contains("ipPools['p']"));
-    }
-
-    #[test]
-    fn rejects_non_controller_kind() {
-        let f = write(
-            r#"apiVersion: basis.dev/v1alpha1
-kind: Host
-metadata: { name: p }
-spec: {}
-"#,
-        );
-        assert!(matches!(
-            BasisControllerSpec::load(f.path()),
-            Err(ResourceError::Kind { .. })
-        ));
+    fn rejects_tree_prefix_too_narrow_for_vip_reserve() {
+        let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
+        spec.network.tree_prefix = 29; // 8 addresses
+        assert!(spec.validate().is_err());
     }
 }
