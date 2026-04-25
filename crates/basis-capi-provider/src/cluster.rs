@@ -26,7 +26,7 @@ use kube::api::Api;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{finalizer, Event};
 use kube::runtime::watcher;
-use kube::{Client, ResourceExt};
+use kube::ResourceExt;
 use serde_json::json;
 use tracing::{error, info, warn};
 
@@ -34,7 +34,7 @@ use crate::client_cache::CacheError;
 use crate::conditions;
 use basis_client::ClusterRequest;
 
-use crate::crds::{BasisCluster, ParentClusterRef};
+use crate::crds::BasisCluster;
 use crate::reconciler::{
     merge_spec, merge_status, namespace_of, record_failure_status, ProviderContext, ReconcileError,
 };
@@ -61,9 +61,6 @@ pub enum ClusterError {
 
     #[error("resolving credentials: {0}")]
     Credentials(#[from] CacheError),
-
-    #[error("parent cluster '{0}' has no basisClusterId yet — retrying")]
-    ParentNotReady(String),
 }
 
 impl ReconcileError for ClusterError {
@@ -75,7 +72,6 @@ impl ReconcileError for ClusterError {
             ClusterError::Basis(e) if e.is_transient() => "BasisBackpressure",
             ClusterError::Basis(_) => "BasisRpcError",
             ClusterError::Credentials(_) => "BasisCredentialsInvalid",
-            ClusterError::ParentNotReady(_) => "ParentNotReady",
         }
     }
 
@@ -86,38 +82,11 @@ impl ReconcileError for ClusterError {
 
     fn is_transient(&self) -> bool {
         matches!(self, ClusterError::Basis(e) if e.is_transient())
-            || matches!(self, ClusterError::ParentNotReady(_))
     }
 }
 
-/// Resolve a parent `BasisCluster` reference to the parent's
-/// basis-side cluster id. Returns `None` when no parent is configured
-/// (the cluster is a tree root). Errors with `ParentNotReady` if the
-/// referenced parent exists but hasn't finished its own create yet —
-/// the error policy requeues quickly on that.
-async fn resolve_parent_id(
-    client: &Client,
-    own_namespace: &str,
-    parent: Option<&ParentClusterRef>,
-) -> Result<Option<String>, ClusterError> {
-    let Some(parent) = parent else { return Ok(None) };
-    let ns = parent.namespace.as_deref().unwrap_or(own_namespace);
-    let api: Api<BasisCluster> = Api::namespaced(client.clone(), ns);
-    let pcr = api.get(&parent.name).await?;
-    let id = pcr
-        .status
-        .as_ref()
-        .and_then(|s| s.basis_cluster_id.clone())
-        .ok_or_else(|| ClusterError::ParentNotReady(pcr.name_any()))?;
-    Ok(Some(id))
-}
-
-pub async fn run(
-    client: Client,
-    clients: Arc<crate::client_cache::BasisClientCache>,
-) -> anyhow::Result<()> {
-    let api: Api<BasisCluster> = Api::all(client.clone());
-    let ctx = Arc::new(ProviderContext { client, clients });
+pub async fn run(ctx: Arc<ProviderContext>) -> anyhow::Result<()> {
+    let api: Api<BasisCluster> = Api::all(ctx.client.clone());
 
     Controller::new(api, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
@@ -170,13 +139,14 @@ async fn apply(
         .get(&cluster.spec.credentials_ref, &namespace)
         .await?;
 
-    // Resolve the parent's basis-side cluster id (if any). The referenced
-    // `BasisCluster` must have finished its own create first —
-    // `ClusterNotReady` surfaces through the error policy and requeues
-    // quickly.
-    let parent_cluster_id =
-        resolve_parent_id(&ctx.client, &namespace, cluster.spec.parent_cluster_ref.as_ref())
-            .await?;
+    // Parent comes from the provider's deploy-time config, not the CR.
+    // See `ProviderContext.parent_cluster_id`. Empty means this
+    // provider is running in the root cell.
+    let parent_cluster_id = if ctx.parent_cluster_id.is_empty() {
+        None
+    } else {
+        Some(ctx.parent_cluster_id.clone())
+    };
 
     // Server-side `CreateCluster` materialises (or joins) a tree,
     // allocates a VIP, and is idempotent by name: retrying returns the
@@ -189,7 +159,8 @@ async fn apply(
     let created = basis
         .create_cluster(ClusterRequest {
             name: name.clone(),
-            parent_cluster_id: parent_cluster_id.clone(),
+            parent_cluster_id,
+            apiserver_vip_pool: cluster.spec.apiserver_vip_pool.clone(),
         })
         .await?;
 

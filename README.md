@@ -129,8 +129,16 @@ the gRPC path with real TLS certs:
 cargo test --workspace
 ```
 
-Regenerate CRD YAMLs after editing `crates/basis-capi-provider/src/crds.rs`:
+Regenerate the CAPI provider bundle after editing
+`crates/basis-capi-provider/src/crds.rs`:
 
 ```sh
-cargo run -p basis-capi-provider -- --print-crds > deploy/crds/basis-crds.yaml
+scripts/generate-capi-components.sh              # refresh basis copy
+scripts/generate-capi-components.sh --sync-lattice  # and update lattice's snapshot
 ```
+
+`deploy/capi/infrastructure-components.yaml` is the single source of
+truth — Namespace, CRDs, RBAC, Deployment in one file. A snapshot test
+(`tests/components_snapshot.rs` in `basis-capi-provider`) fails in CI
+if the committed file drifts from the live CRD types, so forgetting to
+run the script is caught at `cargo test`.

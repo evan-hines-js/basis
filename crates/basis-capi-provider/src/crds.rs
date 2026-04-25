@@ -13,10 +13,12 @@ pub const API_VERSION: &str = "v1alpha1";
 
 /// Identifies a cluster that maps 1:1 to a Basis-side cluster.
 ///
-/// User input is the `credentialsRef` (how to reach the basis
-/// controller) plus an optional `parentClusterRef` that nests this
-/// cluster inside a parent's tree / trust domain. Omitting
-/// `parentClusterRef` creates a new tree root.
+/// User input is just `credentialsRef` (how to reach the basis
+/// controller). The tree this cluster joins is *not* encoded here —
+/// it's implied by the basis-capi-provider instance doing the
+/// reconcile: every cluster the provider creates becomes a child of
+/// the cluster the provider itself runs in. See
+/// `ProviderContext.parent_cluster_id`.
 ///
 /// `controlPlaneEndpoint`, `treeId`, and `vni` are populated by the
 /// reconciler after basis allocates them — per CAPI convention, the
@@ -31,7 +33,11 @@ pub const API_VERSION: &str = "v1alpha1";
     plural = "basisclusters",
     namespaced,
     status = "BasisClusterStatus",
-    shortname = "bc"
+    shortname = "bc",
+    category = "cluster-api",
+    printcolumn = r#"{"name":"Cluster", "type":"string", "jsonPath":".metadata.labels['cluster\\.x-k8s\\.io/cluster-name']"}"#,
+    printcolumn = r#"{"name":"Ready",   "type":"string", "jsonPath":".status.ready"}"#,
+    printcolumn = r#"{"name":"Endpoint","type":"string", "jsonPath":".spec.controlPlaneEndpoint.host"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BasisClusterSpec {
@@ -39,29 +45,22 @@ pub struct BasisClusterSpec {
     /// basis-controller connection material.
     pub credentials_ref: CredentialsRef,
 
-    /// Optional reference to the parent `BasisCluster`. When set, this
-    /// cluster joins the referenced cluster's tree (trust domain);
-    /// when unset, this cluster is a tree root and the controller
-    /// allocates a fresh tree (VNI + CIDR) for it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_cluster_ref: Option<ParentClusterRef>,
+    /// Pool the apiserver VIP is carved from. Empty / unset selects
+    /// the cluster's own tree `vip_range` (nested clusters; the VIP
+    /// stays inside the overlay, external access goes through a
+    /// parent-cell auth proxy). Any non-empty name resolves to a
+    /// pool in the basis controller's config; the host carrying the
+    /// VIP-claiming VM advertises the /32 via the cell's BGP
+    /// reflector with itself as next-hop, so VMs are single-homed
+    /// on the tree NIC.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apiserver_vip_pool: String,
 
     /// Populated by the reconciler after `Basis.CreateCluster` returns.
     /// Never set by the user — if present on first apply, the
     /// reconciler will overwrite it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane_endpoint: Option<ControlPlaneEndpoint>,
-}
-
-/// Kubernetes-style reference to another `BasisCluster` that acts as
-/// this cluster's parent in the tree. Namespace is optional — when
-/// omitted, defaults to this `BasisCluster`'s own namespace.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ParentClusterRef {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
 }
 
 /// Kubernetes-style object reference for a Secret. Namespace is
@@ -128,7 +127,11 @@ pub struct InitializationStatus {
     plural = "basismachines",
     namespaced,
     status = "BasisMachineStatus",
-    shortname = "bm"
+    shortname = "bm",
+    category = "cluster-api",
+    printcolumn = r#"{"name":"Cluster", "type":"string", "jsonPath":".metadata.labels['cluster\\.x-k8s\\.io/cluster-name']"}"#,
+    printcolumn = r#"{"name":"Ready",   "type":"string", "jsonPath":".status.ready"}"#,
+    printcolumn = r#"{"name":"ProviderID", "type":"string", "jsonPath":".spec.providerID"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BasisMachineSpec {
@@ -146,11 +149,6 @@ pub struct BasisMachineSpec {
     /// the N'th entry becomes `/dev/vd{c,d,...}` in the guest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_disk_gibs: Vec<u32>,
-    /// When true, Basis attaches a second NIC to the uplink bridge —
-    /// making this node the cluster's north/south boundary for Cilium
-    /// BGP, LoadBalancer ingress, and pod egress. Default false.
-    #[serde(default)]
-    pub edge: bool,
     /// Set by the provider after CreateMachine succeeds. The JSON field
     /// is `providerID` (not `providerId`) to match the CAPI contract.
     #[serde(
@@ -183,9 +181,16 @@ pub struct BasisMachineStatus {
     /// Opaque Basis VM ID used on delete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis_vm_id: Option<String>,
-    /// Addresses assigned to this VM. For non-edge machines this is
-    /// just the tree-side IP; for edge machines it also includes the
-    /// uplink-side IP (as `ExternalIP`).
+    /// Snapshot of the credentials reference that was used to create
+    /// this VM on basis. Persisted on apply so cleanup can issue
+    /// `delete_machine` without needing the owning `BasisCluster` to
+    /// still exist — a BasisMachine with `basis_vm_id = Some` *must*
+    /// also carry these credentials, making tombstone rows on basis
+    /// impossible unless this field is hand-stripped from status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_ref: Option<CredentialsRef>,
+    /// Tree-side IP assigned to this VM, exposed as the node's
+    /// `InternalIP`.
     #[serde(default)]
     pub addresses: Vec<MachineAddress>,
     #[serde(default)]
@@ -237,7 +242,8 @@ pub struct CapiBootstrap {
     kind = "BasisMachineTemplate",
     plural = "basismachinetemplates",
     namespaced,
-    shortname = "bmt"
+    shortname = "bmt",
+    category = "cluster-api"
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BasisMachineTemplateSpec {

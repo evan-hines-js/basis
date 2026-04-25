@@ -10,16 +10,16 @@ spec:
     cert: {{ basis_tls_dir }}/controller.crt
     key: {{ basis_tls_dir }}/controller.key
     ca: {{ basis_tls_dir }}/ca.crt
-  ipPools:
-    - name: {{ basis_ip_pool.name }}
-      cidr: {{ basis_ip_pool.cidr }}
-      gateway: {{ basis_ip_pool.gateway }}
-      vmRange:
-        start: {{ basis_ip_pool.vm_range_start }}
-        end: {{ basis_ip_pool.vm_range_end }}
-      vipRange:
-        start: {{ basis_ip_pool.vip_range_start }}
-        end: {{ basis_ip_pool.vip_range_end }}
+  network:
+    treeSupernet: {{ basis_network.tree_supernet }}
+    pools:
+{% for pool in basis_network.pools %}
+      - name: {{ pool.name }}
+        cidr: {{ pool.cidr }}
+        gateway: {{ pool.gateway }}
+        rangeStart: {{ pool.range_start }}
+        rangeEnd: {{ pool.range_end }}
+{% endfor %}
 {% if basis_dns_servers is defined %}
   dnsServers:
 {% for dns in basis_dns_servers %}

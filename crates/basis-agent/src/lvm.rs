@@ -488,7 +488,10 @@ pub async fn create_data_disk_lv(vm_id: &str, index: u32, size_gib: u64) -> Resu
     let lv_path = data_disk_lv_path(vm_id, index);
 
     if lv_attr(&lv_name).await?.is_some() {
-        warn!(vm_id, index, "data disk LV already exists; recreating clean");
+        warn!(
+            vm_id,
+            index, "data disk LV already exists; recreating clean"
+        );
         lvremove(&lv_name).await?;
     }
 

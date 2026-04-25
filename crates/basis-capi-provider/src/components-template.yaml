@@ -1,0 +1,120 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+    control-plane: controller-manager
+  name: capi-basis-system
+# __BASIS_CRDS_HERE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+  name: basis-capi-provider
+  namespace: capi-basis-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+  name: basis-capi-provider-manager
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - clusters
+  - clusters/status
+  - machines
+  - machines/status
+  - machinesets
+  - machinedeployments
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - basisclusters
+  - basisclusters/status
+  - basismachines
+  - basismachines/status
+  - basismachinetemplates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+  name: basis-capi-provider-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: basis-capi-provider-manager
+subjects:
+- kind: ServiceAccount
+  name: basis-capi-provider
+  namespace: capi-basis-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/name: basis-capi-provider
+    app.kubernetes.io/version: v__BASIS_VERSION__
+    cluster.x-k8s.io/provider: infrastructure-basis
+    control-plane: controller-manager
+  name: basis-capi-provider-controller-manager
+  namespace: capi-basis-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/provider: infrastructure-basis
+      control-plane: controller-manager
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/provider: infrastructure-basis
+        control-plane: controller-manager
+    spec:
+      # Every BasisCluster carries its own credentialsRef (keys:
+      # serverUrl, cert, key, ca). The reconciler resolves a
+      # BasisClient per-cluster from that Secret.
+      containers:
+      - image: ghcr.io/evan-hines-js/basis-capi-provider:v__BASIS_VERSION__
+        imagePullPolicy: IfNotPresent
+        name: manager
+        ports:
+        - containerPort: 9443
+          name: health
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+      serviceAccountName: basis-capi-provider
+      terminationGracePeriodSeconds: 10

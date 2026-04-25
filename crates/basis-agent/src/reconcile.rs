@@ -4,7 +4,6 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt};
 use tracing::{error, info, warn};
 
-use basis_common::json::parse_owned_json;
 use basis_proto::{CreateVmCommand, ExtraDisk};
 
 use crate::config::HostSpec;
@@ -12,7 +11,7 @@ use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
 use crate::lvm;
 use crate::metrics;
-use crate::network::{edge_tap_name, primary_tap_name, NetworkManager};
+use crate::network::{primary_tap_name, NetworkManager};
 use crate::vm::{BootArtifacts, VmManager};
 
 /// Max number of VMs the agent restarts in parallel after a node reboot.
@@ -113,10 +112,10 @@ impl GarbageCollectable for LvCollector {
     }
 }
 
-/// TAP devices (primary or edge) whose name doesn't map back to any
-/// known vm_id. Tap names are a hash of vm_id so we can't reverse one;
-/// the caller passes the expected name set computed from known vm_ids
-/// via `primary_tap_name` + `edge_tap_name`.
+/// TAP devices whose name doesn't map back to any known vm_id. Tap
+/// names are a hash of vm_id so we can't reverse one; the caller
+/// passes the expected name set computed from known vm_ids via
+/// `primary_tap_name`.
 struct TapCollector<'a> {
     net_mgr: &'a NetworkManager,
 }
@@ -259,13 +258,11 @@ pub async fn sweep_orphans(
     let lvs = LvCollector;
     let lv_reclaimed = collect(&lvs, known_ids, ORPHAN_LV_BATCH).await;
 
-    // Expected TAP names = both primary and edge for every known vm_id.
-    // list_agent_taps returns both kinds; anything not in this set is
-    // an orphan.
-    let mut expected_taps: HashSet<String> = HashSet::with_capacity(known_ids.len() * 2);
+    // Expected TAP names = primary for every known vm_id. Anything
+    // else returned by list_agent_taps is an orphan.
+    let mut expected_taps: HashSet<String> = HashSet::with_capacity(known_ids.len());
     for id in known_ids {
         expected_taps.insert(primary_tap_name(id));
-        expected_taps.insert(edge_tap_name(id));
     }
     let taps = TapCollector { net_mgr };
     let tap_reclaimed = collect(&taps, &expected_taps, usize::MAX).await;
@@ -320,8 +317,7 @@ async fn restart_vm(
         });
     }
 
-    let extra_disk_gibs: Vec<u32> =
-        parse_owned_json(&vm_record.extra_disk_gibs, "local_vms.extra_disk_gibs");
+    let extra_disk_gibs = vm_record.extra_disks();
     let mut data_disk_paths = Vec::with_capacity(extra_disk_gibs.len());
     for index in 0..extra_disk_gibs.len() {
         let path = lvm::data_disk_lv_path(&vm_record.vm_id, index as u32);
@@ -362,19 +358,8 @@ async fn restart_vm(
         .attach_vm_primary(&vm_record.vm_id, vni)
         .await
         .map_err(|e| RestartError::Other(e.into()))?;
-    let edge_tap = if vm_record.edge_ip.is_some() {
-        Some(
-            net_mgr
-                .attach_vm_edge(&vm_record.vm_id)
-                .await
-                .map_err(|e| RestartError::Other(e.into()))?,
-        )
-    } else {
-        None
-    };
 
-    let gpu_addrs: Vec<String> =
-        parse_owned_json(&vm_record.gpu_pci_addresses, "local_vms.gpu_pci_addresses");
+    let gpu_addrs = vm_record.gpus();
     let mut vfio_devices = Vec::new();
     for addr in &gpu_addrs {
         match gpu::bind_vfio(addr).await {
@@ -421,9 +406,6 @@ async fn restart_vm(
             .map(|&size_gib| ExtraDisk { size_gib })
             .collect(),
         vni,
-        edge_ip: vm_record.edge_ip.clone().unwrap_or_default(),
-        edge_gateway: String::new(),
-        edge_prefix_len: 0,
     };
 
     vm_mgr
@@ -437,7 +419,6 @@ async fn restart_vm(
                 extra_disks: &data_disk_paths,
             },
             &primary_tap,
-            edge_tap.as_deref(),
             &vfio_devices,
         )
         .await

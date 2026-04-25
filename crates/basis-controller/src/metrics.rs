@@ -349,34 +349,17 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
     metrics.vms.reset();
     metrics.vm_age_in_state_seconds.reset();
 
-    // Per-host accumulators derived from the VM rows. Mirror of what the
-    // scheduler does — availability isn't stored, it's computed from
-    // totals minus current VM allocations.
-    #[derive(Default, Clone, Copy)]
-    struct HostUsage {
-        cpu: i64,
-        mem: i64,
-        disk: i64,
-        gpus: i64,
-    }
-    let mut usage_by_host: HashMap<&str, HostUsage> = HashMap::new();
-    for vm in &vms {
-        let u = usage_by_host.entry(vm.host_id.as_str()).or_default();
-        u.cpu += vm.cpu;
-        u.mem += vm.memory_mib;
-        u.disk += vm.disk_gib;
-        let devs: Vec<GpuInfo> = parse_owned_json(&vm.gpu_assignments, "vms.gpu_assignments");
-        u.gpus += devs.len() as i64;
-    }
+    // One query, derived from the same view the scheduler sees — keeps
+    // dashboards honest about "assigned vs total" even when the metrics
+    // poller and scheduler race each other by a few ms.
+    let usage_by_host = db.host_usage_snapshot().await?;
+    let empty_usage = crate::db::HostUsage::default();
 
     // Per-host gauges. All use `hostname` as the label value so Grafana
     // displays human-readable names instead of UUIDs.
     for host in &hosts {
         let h = host.hostname.as_str();
-        let usage = usage_by_host
-            .get(host.id.as_str())
-            .copied()
-            .unwrap_or_default();
+        let usage = usage_by_host.get(&host.id).unwrap_or(&empty_usage);
 
         metrics
             .host_cpu_total
@@ -385,7 +368,7 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
         metrics
             .host_cpu_assigned
             .with_label_values(&[h])
-            .set(usage.cpu);
+            .set(usage.used_cpu);
         metrics
             .host_memory_mib_total
             .with_label_values(&[h])
@@ -393,7 +376,7 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
         metrics
             .host_memory_mib_assigned
             .with_label_values(&[h])
-            .set(usage.mem);
+            .set(usage.used_memory_mib);
         metrics
             .host_disk_gib_total
             .with_label_values(&[h])
@@ -401,7 +384,7 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
         metrics
             .host_disk_gib_assigned
             .with_label_values(&[h])
-            .set(usage.disk);
+            .set(usage.used_disk_gib);
 
         let inventory: Vec<GpuInfo> = parse_owned_json(&host.gpu_inventory, "hosts.gpu_inventory");
         metrics
@@ -411,7 +394,7 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
         metrics
             .host_gpus_assigned
             .with_label_values(&[h])
-            .set(usage.gpus);
+            .set(usage.assigned_pci.len() as i64);
 
         metrics
             .host_last_heartbeat_age_seconds
@@ -530,7 +513,7 @@ async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRespon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EdgePool, NetworkConfig, VniRange};
+    use crate::config::{NetworkConfig, Pool, VniRange};
     use crate::db::{ClusterRow, HostRow, VmRow};
 
     fn make_host(id: &str, hostname: &str, total_cpu: i64, healthy: bool) -> HostRow {
@@ -554,12 +537,11 @@ mod tests {
             cluster_id: cluster_id.to_string(),
             host_id: host_id.to_string(),
             ip_address: "10.0.10.10".to_string(),
-            edge_ip: None,
             state,
             cpu: 4,
             memory_mib: 8192,
             disk_gib: 100,
-            gpu_assignments: "[]".to_string(),
+            extra_disk_total_gib: 0,
             extra_disk_gibs: "[]".to_string(),
             image: "ubuntu:22.04".to_string(),
             error_message: String::new(),
@@ -572,15 +554,19 @@ mod tests {
         NetworkConfig {
             tree_supernet: "10.0.0.0/8".to_string(),
             tree_prefix: 20,
+            bridge_reserve: 32,
             vip_reserve: 16,
-            vni_range: VniRange { start: 10_000, end: 10_010 },
-            vni_cooldown_secs: 60,
-            edge_pool: EdgePool {
+            vni_range: VniRange {
+                start: 10_000,
+                end: 10_010,
+            },
+            pools: vec![Pool {
+                name: "cell-internal".to_string(),
                 cidr: "192.168.100.0/24".to_string(),
                 gateway: "192.168.100.1".to_string(),
                 range_start: "192.168.100.20".to_string(),
                 range_end: "192.168.100.30".to_string(),
-            },
+            }],
         }
     }
 
@@ -589,22 +575,27 @@ mod tests {
     /// populate a cluster must materialize a tree first; this helper
     /// keeps that boilerplate in one place.
     async fn seed_cluster(db: &Db, id: &str) -> ClusterRow {
-        let tree = db.allocate_tree(&net_config(), 0).await.unwrap();
+        let tree = db.allocate_tree(&net_config()).await.unwrap();
         let row = ClusterRow {
             id: id.to_string(),
             name: format!("cluster-{id}"),
             tree_id: tree.id,
             parent_cluster_id: None,
-            control_plane_endpoint: tree.gateway_ip,
+            control_plane_endpoint: "unused-endpoint".to_string(),
+            apiserver_pool: String::new(),
             created_at: basis_common::time::now_rfc3339(),
         };
         db.insert_cluster(&row).await.unwrap();
         row
     }
 
+    async fn test_db() -> Db {
+        Db::open(":memory:".as_ref(), 1.0).await.unwrap()
+    }
+
     #[tokio::test]
     async fn refresh_populates_gauges() {
-        let db = Db::open(":memory:".as_ref()).await.unwrap();
+        let db = test_db().await;
 
         db.upsert_host(&make_host("h1", "node-a", 32, true))
             .await
@@ -613,8 +604,12 @@ mod tests {
             .await
             .unwrap();
         seed_cluster(&db, "c1").await;
-        db.insert_vm(&make_vm("v1", "h1", "c1", 2)).await.unwrap(); // RUNNING
-        db.insert_vm(&make_vm("v2", "h1", "c1", 1)).await.unwrap(); // CREATING
+        db.insert_vm(&make_vm("v1", "h1", "c1", 2), &[])
+            .await
+            .unwrap(); // RUNNING
+        db.insert_vm(&make_vm("v2", "h1", "c1", 1), &[])
+            .await
+            .unwrap(); // CREATING
 
         let metrics = Metrics::new(1.0).unwrap();
         refresh(&metrics, &db).await.unwrap();
@@ -642,9 +637,9 @@ mod tests {
     /// `total` and hid overcommit entirely.
     #[tokio::test]
     async fn refresh_exposes_cpu_overcommit_unclamped() {
-        let db = Db::open(":memory:".as_ref()).await.unwrap();
         // 16-core host with 3 × 16-core VMs scheduled — 48 assigned on a
         // 16-core host = 3× overcommit. A 4.0 overcommit ratio permits it.
+        let db = Db::open(":memory:".as_ref(), 4.0).await.unwrap();
         db.upsert_host(&make_host("h1", "node-a", 16, true))
             .await
             .unwrap();
@@ -652,7 +647,7 @@ mod tests {
         for n in 0..3 {
             let mut vm = make_vm(&format!("v{n}"), "h1", "c1", 2);
             vm.cpu = 16;
-            db.insert_vm(&vm).await.unwrap();
+            db.insert_vm(&vm, &[]).await.unwrap();
         }
 
         let metrics = Metrics::new(4.0).unwrap();
@@ -674,12 +669,14 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_drops_labels_for_deleted_vms() {
-        let db = Db::open(":memory:".as_ref()).await.unwrap();
+        let db = test_db().await;
         db.upsert_host(&make_host("h1", "node-a", 32, true))
             .await
             .unwrap();
         seed_cluster(&db, "c1").await;
-        db.insert_vm(&make_vm("v1", "h1", "c1", 2)).await.unwrap();
+        db.insert_vm(&make_vm("v1", "h1", "c1", 2), &[])
+            .await
+            .unwrap();
 
         let metrics = Metrics::new(1.0).unwrap();
         refresh(&metrics, &db).await.unwrap();

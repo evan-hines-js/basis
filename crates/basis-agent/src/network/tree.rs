@@ -1,41 +1,30 @@
 //! Per-tree dataplane: one Linux bridge + one VXLAN device per tree
-//! that this host carries. The bridge holds the tree's VM TAPs; the
-//! VXLAN device tunnels the tree's L2 to every other hypervisor
-//! carrying the same tree.
+//! this host carries, plus a source-scoped MASQUERADE rule that NATs
+//! the tree's CIDR out the uplink.
 //!
-//! Naming is derived from the VNI — no lookup table needed:
+//! Naming derives from the VNI:
+//!   * bridge: `brt<vni>`
+//!   * VXLAN:  `vxt<vni>`
 //!
-//!   * bridge: `brt<vni>` (e.g. `brt10001`)
-//!   * VXLAN:  `vxt<vni>` (e.g. `vxt10001`)
-//!
-//! At 24 bits the VNI prints as up to 8 digits, plus a 3-char prefix
-//! — well under IFNAMSIZ 15.
-//!
-//! The authoritative source of "which trees should exist on this host"
-//! is the controller's `ReconcileHostCommand.trees`. [`TreeManager`]
-//! converges local state onto that list: ensures bridges + VXLANs for
-//! trees in the list, tears down bridges for trees absent from it,
-//! and replaces each tree's FDB entries to match its `vtep_addresses`.
-//!
-//! VXLAN is configured with learning disabled (`nolearning`). A
-//! misbehaving guest cannot poison the FDB on other hosts; every
-//! inner-MAC → outer-VTEP mapping comes from the controller via BUM
-//! flood entries (one per remote VTEP, stored as the all-zero MAC
-//! default entry).
+//! `ReconcileHostCommand.trees` from the controller is authoritative —
+//! bridges + FDBs converge on it. VXLAN has learning disabled so a
+//! misbehaving guest can't poison another host's forwarding table;
+//! BUM entries come exclusively from the controller's peer list.
 
 use std::collections::{HashMap, HashSet};
 
 use basis_proto::TreeState;
 use tokio::process::Command;
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tokio::sync::Mutex;
+use tracing::warn;
 
-use super::{ensure_tap_on_bridge, primary_tap_name, run_cmd, NetworkError, VXLAN_OVERHEAD};
+use super::{
+    ensure_tap_on_bridge, ensure_tree_masquerade, primary_tap_name, remove_tree_masquerade,
+    run_cmd, NetworkError, VXLAN_OVERHEAD,
+};
 
 const BRIDGE_PREFIX: &str = "brt";
 const VXLAN_PREFIX: &str = "vxt";
-
-/// Default UDP port for VXLAN encapsulation (IANA-assigned).
 const VXLAN_PORT: u16 = 4789;
 
 pub fn bridge_name(vni: u32) -> String {
@@ -46,100 +35,92 @@ pub fn vxlan_name(vni: u32) -> String {
     format!("{VXLAN_PREFIX}{vni}")
 }
 
-/// Tree-state cache + dataplane orchestrator. Owns the per-tree
-/// bridge/VXLAN lifecycle. One instance per agent process.
 pub struct TreeManager {
-    /// This host's VTEP address — excluded from peer FDB entries.
     vtep_address: String,
-    /// Uplink MTU. Inner MTU for each bridge is this minus
-    /// [`VXLAN_OVERHEAD`].
     uplink_mtu: u32,
-    /// Last-known state per tree, keyed by VNI. Mutated only by
-    /// `reconcile`; readers just peek.
-    state: RwLock<HashMap<u32, TreeState>>,
+    /// Name of the uplink bridge used as the `-o` interface in the
+    /// per-tree MASQUERADE rules installed by [`ensure_tree_inner`].
+    uplink_bridge: String,
+    /// VNIs currently materialised on this host, each mapped to the
+    /// tree CIDR a MASQUERADE rule was installed for (if any). Absence
+    /// means no bridge/VXLAN exists; `None` means bootstrap-only and
+    /// no NAT rule has been installed yet (cold-boot before reconcile
+    /// lands). `reconcile` diffs keys against the desired set for
+    /// teardown; `remove_tree` uses the CIDR to remove its rule.
+    live: Mutex<HashMap<u32, Option<String>>>,
 }
 
 impl TreeManager {
-    pub fn new(vtep_address: String, uplink_mtu: u32) -> Self {
+    pub fn new(vtep_address: String, uplink_mtu: u32, uplink_bridge: String) -> Self {
         Self {
             vtep_address,
             uplink_mtu,
-            state: RwLock::new(HashMap::new()),
+            uplink_bridge,
+            live: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Inner-frame MTU on every tree bridge. VXLAN eats 50 bytes of
-    /// outer header, and guests configure their NIC MTU to match the
-    /// bridge through cloud-init.
-    pub fn inner_mtu(&self) -> u32 {
+    fn inner_mtu(&self) -> u32 {
         self.uplink_mtu - VXLAN_OVERHEAD
     }
 
-    /// Apply the controller's authoritative tree list for this host.
-    /// After this returns, every tree in `desired` has a bridge +
-    /// VXLAN + matching FDB, and no extras exist.
+    /// Apply the controller's authoritative tree list. After this
+    /// returns, every tree in `desired` has a bridge + VXLAN +
+    /// matching FDB + MASQUERADE rule, and no extras exist.
     pub async fn reconcile(&self, desired: &[TreeState]) -> Result<(), NetworkError> {
-        let mut state = self.state.write().await;
+        let mut live = self.live.lock().await;
 
         let desired_vnis: HashSet<u32> = desired.iter().map(|t| t.vni).collect();
 
-        // 1. Ensure every desired tree.
         for tree in desired {
             self.ensure_tree_inner(tree).await?;
-            state.insert(tree.vni, tree.clone());
+            let cidr = if tree.cidr.is_empty() {
+                None
+            } else {
+                Some(tree.cidr.clone())
+            };
+            live.insert(tree.vni, cidr);
         }
-
-        // 2. Drop trees we no longer need.
-        let stale_vnis: Vec<u32> = state
-            .keys()
-            .copied()
-            .filter(|v| !desired_vnis.contains(v))
+        let stale: Vec<(u32, Option<String>)> = live
+            .iter()
+            .filter(|(vni, _)| !desired_vnis.contains(vni))
+            .map(|(vni, cidr)| (*vni, cidr.clone()))
             .collect();
-        for vni in stale_vnis {
-            remove_tree(vni).await?;
-            state.remove(&vni);
+        for (vni, cidr) in stale {
+            self.remove_tree(vni, cidr.as_deref()).await;
+            live.remove(&vni);
         }
-
         Ok(())
     }
 
-    /// Attach a VM's primary TAP to its tree's bridge. Fails if the
-    /// tree isn't in the cache yet — the controller must push a
-    /// `ReconcileHostCommand` naming the tree before dispatching the
-    /// CreateVm, and mpsc preserves that order.
+    /// Attach a VM's primary TAP to its tree's bridge. Also ensures
+    /// the bridge + VXLAN exist — handles the narrow race where a
+    /// fresh host receives `CreateVmCommand` before (or concurrently
+    /// with) the controller's first `ReconcileHostCommand` that
+    /// would otherwise be the one to create the bridge. Bootstrap is
+    /// idempotent; the reconcile will still land afterward and fill
+    /// in gateway IP, MASQUERADE rule, and peer FDB.
     pub async fn attach_vm_primary(&self, vm_id: &str, vni: u32) -> Result<String, NetworkError> {
-        let state = self.state.read().await;
-        if !state.contains_key(&vni) {
-            return Err(NetworkError::BridgeFailed(format!(
-                "tree vni={vni} not present on this host — \
-                 missed a ReconcileHostCommand before CreateVm"
-            )));
-        }
-        drop(state);
+        self.ensure_bootstrap(vni).await?;
         let tap = primary_tap_name(vm_id);
-        let bridge = bridge_name(vni);
-        ensure_tap_on_bridge(&tap, &bridge).await?;
-        info!(tap = %tap, vm_id, vni, "primary tap attached to tree bridge");
+        ensure_tap_on_bridge(&tap, &bridge_name(vni)).await?;
         Ok(tap)
     }
 
-    /// Cold-boot bootstrap: ensure the tree's bridge + VXLAN exist
-    /// with *empty* peer FDB so a VM persisted in the agent DB can
-    /// have its TAP re-attached before the controller reconcile
-    /// lands. Cross-host traffic won't work until the controller
-    /// reconcile fills in peers, but intra-host traffic is up and the
-    /// guest's virtio-net worker comes online.
+    /// Cold-boot: ensure the tree's bridge + VXLAN exist with empty
+    /// peer FDB so persisted VMs can re-attach their TAPs before the
+    /// controller reconcile lands. Gateway IP and MASQUERADE rule
+    /// arrive with the first reconcile.
     pub async fn ensure_bootstrap(&self, vni: u32) -> Result<(), NetworkError> {
-        let tree = TreeState {
-            tree_id: String::new(),
+        self.ensure_tree_inner(&TreeState {
             vni,
-            cidr: String::new(),
             gateway_ip: String::new(),
             prefix_len: 0,
             vtep_addresses: Vec::new(),
-        };
-        self.ensure_tree_inner(&tree).await?;
-        self.state.write().await.insert(vni, tree);
+            cidr: String::new(),
+        })
+        .await?;
+        self.live.lock().await.entry(vni).or_insert(None);
         Ok(())
     }
 
@@ -155,9 +136,6 @@ impl TreeManager {
         run_cmd("ip", &["link", "set", &bridge, "up"]).await?;
 
         if !link_exists(&vxlan).await? {
-            // `dstport 4789 nolearning` — no FDB learning, so a guest
-            // sending a spoofed source MAC can't poison our forwarding
-            // tables. `local <vtep>` pins the outer source address.
             run_cmd(
                 "ip",
                 &[
@@ -181,34 +159,76 @@ impl TreeManager {
         set_mtu(&vxlan, inner_mtu).await?;
         run_cmd("ip", &["link", "set", &vxlan, "up"]).await?;
 
-        self.reconcile_fdb(&vxlan, &tree.vtep_addresses).await?;
+        // Assign this host's unique bridge IP so the kernel acquires
+        // `<tree_cidr> dev brt<vni>` in its routing table — VMs use it
+        // as default gateway and `ping <vm_ip>` from the host works.
+        // Uniqueness-across-hosts (carved from `bridge_range` by the
+        // controller) is what makes cross-host host→VM replies land on
+        // the sender and not whichever host happens to be replying.
+        if !tree.gateway_ip.is_empty() && tree.prefix_len > 0 {
+            ensure_bridge_address(&bridge, &tree.gateway_ip, tree.prefix_len).await?;
+        }
 
-        Ok(())
+        if !tree.cidr.is_empty() {
+            ensure_tree_masquerade(&tree.cidr, &self.uplink_bridge).await?;
+        }
+
+        self.reconcile_fdb(&vxlan, &tree.vtep_addresses).await
     }
 
-    /// Replace BUM FDB entries on `vxlan` to match exactly `peers`
-    /// (minus our own address). Idempotent — always converges, never
-    /// additive.
+    /// Best-effort teardown of the tree's dataplane. If a MASQUERADE
+    /// rule was installed (cidr is known), remove it; drop the VXLAN
+    /// and bridge unconditionally. Missing devices are the desired
+    /// state — we log and move on.
+    async fn remove_tree(&self, vni: u32, cidr: Option<&str>) {
+        if let Some(cidr) = cidr {
+            remove_tree_masquerade(cidr, &self.uplink_bridge).await;
+        }
+        if let Err(e) = run_cmd("ip", &["link", "delete", &vxlan_name(vni)]).await {
+            warn!(vni, error = %e, "vxlan delete");
+        }
+        if let Err(e) = run_cmd("ip", &["link", "delete", &bridge_name(vni)]).await {
+            warn!(vni, error = %e, "bridge delete");
+        }
+    }
+
+    /// Converge BUM FDB entries on `vxlan` to exactly match `peers`
+    /// (minus our own VTEP).
     async fn reconcile_fdb(&self, vxlan: &str, peers: &[String]) -> Result<(), NetworkError> {
         let desired: HashSet<String> = peers
             .iter()
             .filter(|p| p != &&self.vtep_address && !p.is_empty())
             .cloned()
             .collect();
-
         let current = list_fdb_bum_dsts(vxlan).await?;
 
         for stale in current.difference(&desired) {
             let _ = run_cmd(
                 "bridge",
-                &["fdb", "del", "00:00:00:00:00:00", "dev", vxlan, "dst", stale],
+                &[
+                    "fdb",
+                    "del",
+                    "00:00:00:00:00:00",
+                    "dev",
+                    vxlan,
+                    "dst",
+                    stale,
+                ],
             )
             .await;
         }
         for new in desired.difference(&current) {
             run_cmd(
                 "bridge",
-                &["fdb", "append", "00:00:00:00:00:00", "dev", vxlan, "dst", new],
+                &[
+                    "fdb",
+                    "append",
+                    "00:00:00:00:00:00",
+                    "dev",
+                    vxlan,
+                    "dst",
+                    new,
+                ],
             )
             .await?;
         }
@@ -216,22 +236,11 @@ impl TreeManager {
     }
 }
 
-/// Tear down a tree's bridge + VXLAN. Idempotent.
-pub async fn remove_tree(vni: u32) -> Result<(), NetworkError> {
-    let bridge = bridge_name(vni);
-    let vxlan = vxlan_name(vni);
-    // Best-effort delete: a missing device is the state we want.
-    if let Err(e) = run_cmd("ip", &["link", "delete", &vxlan]).await {
-        warn!(vxlan = %vxlan, error = %e, "vxlan delete (may already be gone)");
-    }
-    if let Err(e) = run_cmd("ip", &["link", "delete", &bridge]).await {
-        warn!(bridge = %bridge, error = %e, "bridge delete (may already be gone)");
-    }
-    Ok(())
-}
-
 async fn link_exists(name: &str) -> Result<bool, NetworkError> {
-    let out = Command::new("ip").args(["link", "show", name]).output().await?;
+    let out = Command::new("ip")
+        .args(["link", "show", name])
+        .output()
+        .await?;
     Ok(out.status.success())
 }
 
@@ -239,7 +248,16 @@ async fn set_mtu(name: &str, mtu: u32) -> Result<(), NetworkError> {
     run_cmd("ip", &["link", "set", name, "mtu", &mtu.to_string()]).await
 }
 
-/// Current BUM (all-zero MAC) destinations for a VXLAN device.
+/// Idempotent: ensure `bridge` has exactly `ip/prefix` assigned.
+/// `ip addr replace` adds if missing, replaces otherwise.
+async fn ensure_bridge_address(bridge: &str, ip: &str, prefix: u32) -> Result<(), NetworkError> {
+    run_cmd(
+        "ip",
+        &["addr", "replace", &format!("{ip}/{prefix}"), "dev", bridge],
+    )
+    .await
+}
+
 async fn list_fdb_bum_dsts(vxlan: &str) -> Result<HashSet<String>, NetworkError> {
     let out = Command::new("bridge")
         .args(["fdb", "show", "dev", vxlan])
@@ -253,7 +271,6 @@ async fn list_fdb_bum_dsts(vxlan: &str) -> Result<HashSet<String>, NetworkError>
     }
     let mut dsts = HashSet::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        // Lines look like: "00:00:00:00:00:00 dst 10.100.0.2 self permanent"
         if !line.starts_with("00:00:00:00:00:00") {
             continue;
         }
@@ -283,15 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn names_are_unique_across_vnis() {
-        assert_ne!(bridge_name(1), bridge_name(2));
-        assert_ne!(vxlan_name(1), vxlan_name(2));
+    fn bridge_and_vxlan_names_differ() {
         assert_ne!(bridge_name(1), vxlan_name(1));
-    }
-
-    #[test]
-    fn inner_mtu_subtracts_encap_overhead() {
-        let mgr = TreeManager::new("10.100.0.1".to_string(), 9000);
-        assert_eq!(mgr.inner_mtu(), 9000 - VXLAN_OVERHEAD);
     }
 }

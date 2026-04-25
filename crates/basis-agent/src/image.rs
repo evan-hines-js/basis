@@ -27,6 +27,7 @@ use futures::TryStreamExt;
 use oci_client::client::ClientConfig;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -64,6 +65,22 @@ pub enum ImageError {
 
     #[error("image manifest missing required layer with media type '{0}'")]
     MissingLayer(&'static str),
+
+    #[error(
+        "digest mismatch on layer '{media_type}': manifest said {expected}, \
+         pulled bytes hashed to {actual}"
+    )]
+    DigestMismatch {
+        media_type: &'static str,
+        expected: String,
+        actual: String,
+    },
+
+    #[error(
+        "unsupported digest algorithm '{0}' — basis only verifies sha256 \
+         (the OCI default). Either republish with sha256 or extend `verify_digest`"
+    )]
+    UnsupportedDigest(String),
 
     #[error("cloud-init ISO creation failed: {0}")]
     CloudInitFailed(String),
@@ -117,23 +134,20 @@ pub struct CachedImage {
     pub initrd: PathBuf,
 }
 
-/// Guest-side primary-NIC configuration. The primary NIC carries the
-/// default route and DNS; it's the tree's VXLAN-attached interface.
+/// Guest-side primary-NIC configuration (the tree-side NIC).
+///
+/// `mac` matches what `vm::primary_mac(vm_id)` returns and what
+/// the basis-agent passed on cloud-hypervisor's `--net mac=` arg.
+/// netplan binds this stanza to the NIC carrying that MAC, so the
+/// guest's kernel-assigned interface name (`ens3` / `ens4` / etc) is
+/// irrelevant — cloud-hypervisor's PCI slot ordering can shift
+/// without breaking network config.
 pub struct GuestNetwork<'a> {
+    pub mac: &'a str,
     pub ip_address: &'a str,
     pub gateway: &'a str,
     pub prefix_len: u32,
     pub dns_servers: &'a [String],
-}
-
-/// Optional edge-NIC configuration. When present, a second interface
-/// (`ens4`) is configured with the supplied IP but no default route —
-/// its purpose is Cilium BGP / LB ingress / egress gateway, not general
-/// egress. The guest's routing on top of this is the CNI's job.
-pub struct GuestEdgeNetwork<'a> {
-    pub ip_address: &'a str,
-    pub gateway: &'a str,
-    pub prefix_len: u32,
 }
 
 /// Name of the ISO-9660 producer resolved at startup. `mkisofs` and
@@ -342,11 +356,16 @@ impl ImageManager {
                 .ok_or(ImageError::MissingLayer(media_type))?;
 
             info!(media_type = %media_type, dest = %dest.display(), size = layer.size, "pulling layer");
-            // Stream to a `.partial` side file, then atomically rename so
-            // a failed pull never leaves a truncated cache entry that a
-            // later run mistakes for valid.
+            // Stream to a `.partial` side file, hashing as we go, then
+            // check the manifest digest before atomically moving the
+            // bytes into place. Not a security boundary — HTTPS covers
+            // the wire and OCI's content-addressed blob store covers
+            // the registry — this is an integrity check that catches
+            // truncated streams, silent I/O corruption, and oci-client
+            // bugs before the bytes become a visible cache entry.
             let tmp = dest.with_extension("partial");
             let mut out = tokio::fs::File::create(&tmp).await?;
+            let mut hasher = Sha256::new();
             let mut stream = tokio::time::timeout(
                 OCI_MANIFEST_TIMEOUT,
                 client.pull_blob_stream(&reference, layer),
@@ -373,11 +392,21 @@ impl ImageManager {
                         return Err(ImageError::PullFailed(format!("reading blob: {e}")));
                     }
                     Ok(Ok(None)) => break,
-                    Ok(Ok(Some(chunk))) => out.write_all(&chunk).await?,
+                    Ok(Ok(Some(chunk))) => {
+                        hasher.update(&chunk);
+                        out.write_all(&chunk).await?;
+                    }
                 }
             }
             out.flush().await?;
             drop(out);
+
+            if let Err(e) = verify_digest(media_type, &layer.digest, hasher.finalize().as_slice()) {
+                // Don't leave a tainted `.partial` around to seed a
+                // later pull's fast path.
+                tokio::fs::remove_file(&tmp).await.ok();
+                return Err(e);
+            }
 
             if *media_type == MEDIA_TYPE_QCOW2 {
                 // Ubuntu's cloud image ships qcow2 with compressed clusters.
@@ -411,7 +440,6 @@ impl ImageManager {
         hostname: &str,
         userdata: &[u8],
         primary: &GuestNetwork<'_>,
-        edge: Option<&GuestEdgeNetwork<'_>>,
     ) -> Result<PathBuf, ImageError> {
         let cidata_dir = vm_dir.join("cidata");
         std::fs::create_dir_all(&cidata_dir)?;
@@ -422,7 +450,10 @@ impl ImageManager {
             format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n"),
         )?;
 
-        std::fs::write(cidata_dir.join("network-config"), network_config(primary, edge))?;
+        std::fs::write(
+            cidata_dir.join("network-config"),
+            network_config(primary),
+        )?;
 
         let iso_path = vm_dir.join("cidata.iso");
         // Use the tool resolved at startup (see `validate_tools`). No
@@ -459,46 +490,20 @@ impl ImageManager {
     }
 }
 
-/// Render the cloud-init netplan v2 network-config. `ens3` is the
-/// primary (tree) NIC carrying the default route and DNS; `ens4` is
-/// the optional edge NIC with an address but no default route. Pure
-/// string building so it's testable in isolation.
-fn network_config(primary: &GuestNetwork<'_>, edge: Option<&GuestEdgeNetwork<'_>>) -> String {
-    let dns_entries: String = primary
-        .dns_servers
-        .iter()
-        .map(|s| format!("          - {s}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut out = format!(
-        r#"network:
-  version: 2
-  ethernets:
-    ens3:
-      addresses:
-        - {ip}/{prefix}
-      gateway4: {gw}
-      nameservers:
-        addresses:
-{dns_entries}
-"#,
-        ip = primary.ip_address,
-        prefix = primary.prefix_len,
-        gw = primary.gateway,
+/// Render the cloud-init netplan v2 network-config. The single
+/// ethernet stanza uses `match: { macaddress: ... }` rather than a
+/// literal kernel name (`ens3` / etc) — cloud-hypervisor's PCI slot
+/// assignment shifts whenever the device list changes (extra disks,
+/// VFIO devices) and a literal name would silently apply to nothing.
+fn network_config(primary: &GuestNetwork<'_>) -> String {
+    let mut s = format!(
+        "network:\n  version: 2\n  ethernets:\n    primary:\n      match:\n        macaddress: {}\n      addresses:\n        - {}/{}\n      gateway4: {}\n      nameservers:\n        addresses:\n",
+        primary.mac, primary.ip_address, primary.prefix_len, primary.gateway,
     );
-    if let Some(e) = edge {
-        // No `gateway4` on the edge NIC: the tree's default route wins,
-        // and the CNI programs whatever routing it needs per-pod.
-        out.push_str(&format!(
-            r#"    ens4:
-      addresses:
-        - {ip}/{prefix}
-"#,
-            ip = e.ip_address,
-            prefix = e.prefix_len,
-        ));
+    for d in primary.dns_servers {
+        s.push_str(&format!("          - {d}\n"));
     }
-    out
+    s
 }
 
 /// Convert an image reference to a safe filename stem for the cache.
@@ -554,6 +559,54 @@ async fn decompress_qcow2_in_place(src: &Path, dst: &Path) -> Result<(), ImageEr
     Ok(())
 }
 
+/// Compare the SHA256 of the bytes we just streamed against the digest
+/// the manifest promised. Integrity check only — it catches oci-client
+/// bugs, truncated streams, and silent I/O corruption between the
+/// registry handing us bytes and our write landing on disk. It is
+/// *not* a defense against a compromised registry: an attacker with
+/// write access to the registry controls both the manifest and the
+/// blob, so any hash mismatch on the wire already went through them.
+/// Trusting the registry is the job of image signing (cosign / notary
+/// / sigstore), which basis does not implement today.
+///
+/// OCI digests are `"<alg>:<hex>"`. We only handle `sha256` — the
+/// one mandated by the OCI image spec. Unknown algorithms surface as
+/// `UnsupportedDigest` so a caller can't silently accept a manifest
+/// whose integrity we can't check.
+fn verify_digest(
+    media_type: &'static str,
+    expected: &str,
+    actual: &[u8],
+) -> Result<(), ImageError> {
+    let (alg, hex_expected) = expected
+        .split_once(':')
+        .ok_or_else(|| ImageError::UnsupportedDigest(expected.to_string()))?;
+    if alg != "sha256" {
+        return Err(ImageError::UnsupportedDigest(alg.to_string()));
+    }
+    let hex_actual = hex_lower(actual);
+    // Case-insensitive: some registries emit upper-case hex. A plain
+    // `eq_ignore_ascii_case` keeps us from rejecting those.
+    if !hex_expected.eq_ignore_ascii_case(&hex_actual) {
+        return Err(ImageError::DigestMismatch {
+            media_type,
+            expected: expected.to_string(),
+            actual: format!("sha256:{hex_actual}"),
+        });
+    }
+    Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,41 +629,72 @@ mod tests {
     }
 
     #[test]
-    fn network_config_primary_only() {
+    fn network_config_binds_by_mac() {
         let primary = GuestNetwork {
+            mac: "52:54:00:aa:bb:cc",
             ip_address: "10.1.0.20",
             gateway: "10.1.0.1",
             prefix_len: 20,
             dns_servers: &["8.8.8.8".to_string()],
         };
-        let s = network_config(&primary, None);
-        assert!(s.contains("ens3:"), "{s}");
+        let s = network_config(&primary);
+        assert!(
+            s.contains("macaddress: 52:54:00:aa:bb:cc"),
+            "primary NIC must bind by MAC, never by `ensN` — that name shifts with PCI slot ordering: {s}"
+        );
         assert!(s.contains("10.1.0.20/20"), "{s}");
         assert!(s.contains("gateway4: 10.1.0.1"), "{s}");
-        assert!(!s.contains("ens4:"), "{s}");
+        assert!(s.contains("8.8.8.8"), "{s}");
+        // Catch a regression to the broken hardcoded interface name.
+        assert!(!s.contains("ens3:"), "{s}");
+    }
+
+    /// SHA256 of the empty string. Lets us exercise `verify_digest`
+    /// without carrying a fixture file.
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn verify_digest_accepts_matching_sha256() {
+        let hash = Sha256::digest(b"");
+        assert!(verify_digest(MEDIA_TYPE_QCOW2, &format!("sha256:{EMPTY_SHA256}"), &hash,).is_ok());
     }
 
     #[test]
-    fn network_config_primary_plus_edge() {
-        let primary = GuestNetwork {
-            ip_address: "10.1.0.20",
-            gateway: "10.1.0.1",
-            prefix_len: 20,
-            dns_servers: &["8.8.8.8".to_string()],
-        };
-        let edge = GuestEdgeNetwork {
-            ip_address: "192.168.100.5",
-            gateway: "192.168.100.1",
-            prefix_len: 24,
-        };
-        let s = network_config(&primary, Some(&edge));
-        assert!(s.contains("ens3:"), "{s}");
-        assert!(s.contains("ens4:"), "{s}");
-        assert!(s.contains("192.168.100.5/24"), "{s}");
-        // Edge NIC must NOT carry a default gateway.
+    fn verify_digest_rejects_mismatched_bytes() {
+        let hash = Sha256::digest(b"not empty");
+        let err =
+            verify_digest(MEDIA_TYPE_QCOW2, &format!("sha256:{EMPTY_SHA256}"), &hash).unwrap_err();
         assert!(
-            !s.split("ens4:").nth(1).unwrap_or("").contains("gateway4"),
-            "edge NIC section should not have gateway4 — {s}"
+            matches!(err, ImageError::DigestMismatch { .. }),
+            "expected DigestMismatch, got {err:?}"
         );
+    }
+
+    /// Accept upper-case hex (some registries do this). Rejecting
+    /// these would break pulls against well-behaved registries.
+    #[test]
+    fn verify_digest_is_case_insensitive() {
+        let hash = Sha256::digest(b"");
+        let upper = format!("sha256:{}", EMPTY_SHA256.to_ascii_uppercase());
+        assert!(verify_digest(MEDIA_TYPE_QCOW2, &upper, &hash).is_ok());
+    }
+
+    /// Don't silently skip unknown algorithms — that would let an
+    /// attacker downgrade integrity by republishing under sha1.
+    #[test]
+    fn verify_digest_rejects_non_sha256_algorithms() {
+        let hash = Sha256::digest(b"");
+        let err = verify_digest(MEDIA_TYPE_QCOW2, "sha512:deadbeef", &hash).unwrap_err();
+        assert!(
+            matches!(err, ImageError::UnsupportedDigest(ref a) if a == "sha512"),
+            "expected UnsupportedDigest(\"sha512\"), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_digest_rejects_malformed_digest_string() {
+        let hash = Sha256::digest(b"");
+        let err = verify_digest(MEDIA_TYPE_QCOW2, "no-colon-here", &hash).unwrap_err();
+        assert!(matches!(err, ImageError::UnsupportedDigest(_)));
     }
 }

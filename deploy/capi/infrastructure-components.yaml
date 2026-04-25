@@ -1,0 +1,582 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+    control-plane: controller-manager
+  name: capi-basis-system
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+    cluster.x-k8s.io/v1beta1: v1alpha1
+    cluster.x-k8s.io/v1beta2: v1alpha1
+  name: basisclusters.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: BasisCluster
+    plural: basisclusters
+    shortNames:
+    - bc
+    singular: basiscluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.labels['cluster\.x-k8s\.io/cluster-name']
+      name: Cluster
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: string
+    - jsonPath: .spec.controlPlaneEndpoint.host
+      name: Endpoint
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BasisClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Identifies a cluster that maps 1:1 to a Basis-side cluster.
+
+              User input is just `credentialsRef` (how to reach the basis
+              controller). The tree this cluster joins is *not* encoded here —
+              it's implied by the basis-capi-provider instance doing the
+              reconcile: every cluster the provider creates becomes a child of
+              the cluster the provider itself runs in. See
+              `ProviderContext.parent_cluster_id`.
+
+              `controlPlaneEndpoint`, `treeId`, and `vni` are populated by the
+              reconciler after basis allocates them — per CAPI convention, the
+              infrastructure provider is authoritative for the endpoint and
+              CAPI core propagates it onto `Cluster.spec.controlPlaneEndpoint`
+              for downstream consumers.
+            properties:
+              apiserverVipPool:
+                description: |-
+                  Pool the apiserver VIP is carved from. Empty / unset selects
+                  the cluster's own tree `vip_range` (nested clusters; the VIP
+                  stays inside the overlay, external access goes through a
+                  parent-cell auth proxy). Any non-empty name resolves to a
+                  pool in the basis controller's config; the host carrying the
+                  VIP-claiming VM advertises the /32 via the cell's BGP
+                  reflector with itself as next-hop, so VMs are single-homed
+                  on the tree NIC.
+                type: string
+              controlPlaneEndpoint:
+                description: |-
+                  Populated by the reconciler after `Basis.CreateCluster` returns.
+                  Never set by the user — if present on first apply, the
+                  reconciler will overwrite it.
+                nullable: true
+                properties:
+                  host:
+                    type: string
+                  port:
+                    format: uint16
+                    maximum: 65535.0
+                    minimum: 0.0
+                    type: integer
+                required:
+                - host
+                - port
+                type: object
+              credentialsRef:
+                description: |-
+                  Reference to the Kubernetes Secret holding this cluster's
+                  basis-controller connection material.
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    nullable: true
+                    type: string
+                required:
+                - name
+                type: object
+            required:
+            - credentialsRef
+            type: object
+          status:
+            nullable: true
+            properties:
+              basisClusterId:
+                description: |-
+                  Opaque cluster ID returned by `Basis.CreateCluster`. Written once
+                  and used on delete.
+                nullable: true
+                type: string
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        `metadata.generation` at the time this condition was set. Consumers
+                        use this to tell whether the condition reflects the current spec.
+                        CAPI v1beta2 conditions carry this field.
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - status
+                  - type
+                  type: object
+                type: array
+              failureMessage:
+                nullable: true
+                type: string
+              initialization:
+                nullable: true
+                properties:
+                  provisioned:
+                    type: boolean
+                required:
+                - provisioned
+                type: object
+              ready:
+                default: false
+                type: boolean
+              treeId:
+                description: |-
+                  Tree (trust domain) this cluster belongs to. Observability-only
+                  on the K8s side — consumers that care (Lattice) read it here
+                  to sibling-check across the fleet.
+                nullable: true
+                type: string
+              vni:
+                description: VXLAN Network Identifier of the tree. Same purpose as `treeId`.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: BasisCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+    cluster.x-k8s.io/v1beta1: v1alpha1
+    cluster.x-k8s.io/v1beta2: v1alpha1
+  name: basismachinetemplates.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: BasisMachineTemplate
+    plural: basismachinetemplates
+    shortNames:
+    - bmt
+    singular: basismachinetemplate
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BasisMachineTemplateSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              A template from which CAPI's MachineDeployment stamps out identical
+              BasisMachines.
+            properties:
+              template:
+                properties:
+                  spec:
+                    description: A single VM the Basis provider should create on behalf of CAPI.
+                    properties:
+                      cpu:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      diskGib:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      extraDiskGibs:
+                        description: |-
+                          Raw data disks (GiB each) to attach alongside the rootfs. Basis
+                          hands them to the guest unformatted so a Kubernetes storage
+                          operator (Rook/Ceph) can claim and manage them. Order is stable;
+                          the N'th entry becomes `/dev/vd{c,d,...}` in the guest.
+                        items:
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        type: array
+                      gpuConstraints:
+                        nullable: true
+                        properties:
+                          minGroupSize:
+                            default: 0
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                        type: object
+                      gpus:
+                        default: 0
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      image:
+                        type: string
+                      memoryMib:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      providerID:
+                        description: |-
+                          Set by the provider after CreateMachine succeeds. The JSON field
+                          is `providerID` (not `providerId`) to match the CAPI contract.
+                        nullable: true
+                        type: string
+                    required:
+                    - cpu
+                    - diskGib
+                    - image
+                    - memoryMib
+                    type: object
+                required:
+                - spec
+                type: object
+            required:
+            - template
+            type: object
+        required:
+        - spec
+        title: BasisMachineTemplate
+        type: object
+    served: true
+    storage: true
+    subresources: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+    cluster.x-k8s.io/v1beta1: v1alpha1
+    cluster.x-k8s.io/v1beta2: v1alpha1
+  name: basismachines.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: BasisMachine
+    plural: basismachines
+    shortNames:
+    - bm
+    singular: basismachine
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.labels['cluster\.x-k8s\.io/cluster-name']
+      name: Cluster
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: string
+    - jsonPath: .spec.providerID
+      name: ProviderID
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BasisMachineSpec via `CustomResource`
+        properties:
+          spec:
+            description: A single VM the Basis provider should create on behalf of CAPI.
+            properties:
+              cpu:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              diskGib:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              extraDiskGibs:
+                description: |-
+                  Raw data disks (GiB each) to attach alongside the rootfs. Basis
+                  hands them to the guest unformatted so a Kubernetes storage
+                  operator (Rook/Ceph) can claim and manage them. Order is stable;
+                  the N'th entry becomes `/dev/vd{c,d,...}` in the guest.
+                items:
+                  format: uint32
+                  minimum: 0.0
+                  type: integer
+                type: array
+              gpuConstraints:
+                nullable: true
+                properties:
+                  minGroupSize:
+                    default: 0
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                type: object
+              gpus:
+                default: 0
+                format: uint32
+                minimum: 0.0
+                type: integer
+              image:
+                type: string
+              memoryMib:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              providerID:
+                description: |-
+                  Set by the provider after CreateMachine succeeds. The JSON field
+                  is `providerID` (not `providerId`) to match the CAPI contract.
+                nullable: true
+                type: string
+            required:
+            - cpu
+            - diskGib
+            - image
+            - memoryMib
+            type: object
+          status:
+            nullable: true
+            properties:
+              addresses:
+                default: []
+                description: |-
+                  Tree-side IP assigned to this VM, exposed as the node's
+                  `InternalIP`.
+                items:
+                  properties:
+                    address:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - address
+                  - type
+                  type: object
+                type: array
+              basisVmId:
+                description: Opaque Basis VM ID used on delete.
+                nullable: true
+                type: string
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        `metadata.generation` at the time this condition was set. Consumers
+                        use this to tell whether the condition reflects the current spec.
+                        CAPI v1beta2 conditions carry this field.
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - status
+                  - type
+                  type: object
+                type: array
+              credentialsRef:
+                description: |-
+                  Snapshot of the credentials reference that was used to create
+                  this VM on basis. Persisted on apply so cleanup can issue
+                  `delete_machine` without needing the owning `BasisCluster` to
+                  still exist — a BasisMachine with `basis_vm_id = Some` *must*
+                  also carry these credentials, making tombstone rows on basis
+                  impossible unless this field is hand-stripped from status.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    nullable: true
+                    type: string
+                required:
+                - name
+                type: object
+              failureMessage:
+                nullable: true
+                type: string
+              initialization:
+                nullable: true
+                properties:
+                  provisioned:
+                    type: boolean
+                required:
+                - provisioned
+                type: object
+              providerID:
+                description: Mirrors `spec.providerID`.
+                nullable: true
+                type: string
+              ready:
+                default: false
+                type: boolean
+            type: object
+        required:
+        - spec
+        title: BasisMachine
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+  name: basis-capi-provider
+  namespace: capi-basis-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+  name: basis-capi-provider-manager
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - clusters
+  - clusters/status
+  - machines
+  - machines/status
+  - machinesets
+  - machinedeployments
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - basisclusters
+  - basisclusters/status
+  - basismachines
+  - basismachines/status
+  - basismachinetemplates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-basis
+  name: basis-capi-provider-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: basis-capi-provider-manager
+subjects:
+- kind: ServiceAccount
+  name: basis-capi-provider
+  namespace: capi-basis-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/name: basis-capi-provider
+    app.kubernetes.io/version: v0.1.0
+    cluster.x-k8s.io/provider: infrastructure-basis
+    control-plane: controller-manager
+  name: basis-capi-provider-controller-manager
+  namespace: capi-basis-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/provider: infrastructure-basis
+      control-plane: controller-manager
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/provider: infrastructure-basis
+        control-plane: controller-manager
+    spec:
+      # Every BasisCluster carries its own credentialsRef (keys:
+      # serverUrl, cert, key, ca). The reconciler resolves a
+      # BasisClient per-cluster from that Secret.
+      containers:
+      - image: ghcr.io/evan-hines-js/basis-capi-provider:v0.1.0
+        imagePullPolicy: IfNotPresent
+        name: manager
+        ports:
+        - containerPort: 9443
+          name: health
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+      serviceAccountName: basis-capi-provider
+      terminationGracePeriodSeconds: 10

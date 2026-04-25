@@ -26,6 +26,14 @@ pub struct ClusterSpec {
     /// tree root and gets a fresh VNI + CIDR.
     #[serde(default, rename = "parentCluster")]
     pub parent_cluster: Option<String>,
+
+    /// Named pool the apiserver VIP is carved from. Empty / unset →
+    /// the cluster's own tree vip_range (nested cluster, kube-vip
+    /// on `ens3`, external access via parent-cell proxy). A pool
+    /// name resolves to a LAN pool in the controller's config; CP
+    /// VMs must then be `edge: true`.
+    #[serde(default, rename = "apiserverVipPool")]
+    pub apiserver_vip_pool: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,10 +67,6 @@ pub struct MachineSpec {
     /// storage operator (Rook/Ceph) can claim them.
     #[serde(default, rename = "extraDiskGibs")]
     pub extra_disk_gibs: Vec<u32>,
-    /// When true, Basis attaches a second NIC to the uplink for this
-    /// machine — used for Cilium BGP / edge ingress.
-    #[serde(default)]
-    pub edge: bool,
 }
 
 impl MachineSpec {
@@ -96,7 +100,6 @@ impl MachineSpec {
             gpus: self.gpus,
             min_gpu_group_size: self.min_gpu_group_size,
             extra_disk_gibs: self.extra_disk_gibs.clone(),
-            edge: self.edge,
         })
     }
 }

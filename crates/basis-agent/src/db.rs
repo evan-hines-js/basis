@@ -61,7 +61,6 @@ impl AgentDb {
                 extra_disk_gibs TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL,
                 vni INTEGER NOT NULL DEFAULT 0,
-                edge_ip TEXT,
                 created_at TEXT NOT NULL
             )",
         )
@@ -108,8 +107,8 @@ impl AgentDb {
     pub async fn insert_vm(&self, vm: &LocalVmRow) -> Result<(), AgentDbError> {
         sqlx::query(
             "INSERT INTO local_vms (vm_id, name, unit_name, ip_address, cpu, memory_mib, disk_gib,
-                gpu_pci_addresses, image, vni, edge_ip, created_at, extra_disk_gibs)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                gpu_pci_addresses, image, vni, created_at, extra_disk_gibs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&vm.vm_id)
         .bind(&vm.name)
@@ -121,7 +120,6 @@ impl AgentDb {
         .bind(&vm.gpu_pci_addresses)
         .bind(&vm.image)
         .bind(vm.vni)
-        .bind(&vm.edge_ip)
         .bind(&vm.created_at)
         .bind(&vm.extra_disk_gibs)
         .execute(&self.pool)
@@ -194,15 +192,25 @@ pub struct LocalVmRow {
     /// attaches to. Persisted so a post-reboot restart knows which
     /// `brt<vni>` bridge to re-attach the TAP to.
     pub vni: i64,
-    /// Present iff the VM has an edge TAP on the uplink bridge. Stored
-    /// so cloud-init can re-render a two-NIC config on rebuild — in
-    /// practice the cidata ISO survives reboots, but the field also
-    /// drives the post-reboot `attach_vm_edge` step.
-    pub edge_ip: Option<String>,
     pub created_at: String,
     /// JSON-encoded `Vec<u32>` of extra data-disk sizes in GiB, in the
     /// same order the guest enumerates them as `/dev/vdc`, `/dev/vdd`, …
     pub extra_disk_gibs: String,
+}
+
+impl LocalVmRow {
+    /// Parsed PCI addresses of every GPU assigned to this VM. One place
+    /// for the `Vec<String>` decode so a schema tweak can't drift
+    /// between `handlers.rs` and `reconcile.rs`.
+    pub fn gpus(&self) -> Vec<String> {
+        basis_common::json::parse_owned_json(&self.gpu_pci_addresses, "local_vms.gpu_pci_addresses")
+    }
+
+    /// Parsed per-extra-disk sizes, in the same order the guest sees
+    /// them on the virtio bus.
+    pub fn extra_disks(&self) -> Vec<u32> {
+        basis_common::json::parse_owned_json(&self.extra_disk_gibs, "local_vms.extra_disk_gibs")
+    }
 }
 
 #[cfg(test)]
@@ -225,7 +233,6 @@ mod tests {
             gpu_pci_addresses: "[]".to_string(),
             image: "test-image:latest".to_string(),
             vni: 10_000,
-            edge_ip: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             extra_disk_gibs: "[]".to_string(),
         }

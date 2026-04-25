@@ -8,7 +8,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use basis_common::json::parse_owned_json;
 use basis_common::time::now_rfc3339;
 use basis_proto::{
     agent_message, AgentMessage, CreateVmCommand, MachineState, ReportVmStateRequest,
@@ -19,10 +18,11 @@ use tracing::{info, warn};
 
 use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
-use crate::image::{GuestEdgeNetwork, GuestNetwork, ImageManager};
+use crate::image::{GuestNetwork, ImageManager};
 use crate::lvm;
 use crate::metrics::Metrics;
 use crate::network::NetworkManager;
+use crate::vm;
 use crate::vm::{unit_name_for_vm, BootArtifacts, VmManager};
 
 /// Prepare disk, network, GPU passthrough, and spawn cloud-hypervisor.
@@ -97,18 +97,12 @@ async fn create_vm_inner(
                 .expect("serializing Vec<u32> to JSON is infallible"),
             image: cmd.image.clone(),
             vni: cmd.vni as i64,
-            edge_ip: if cmd.edge_ip.is_empty() {
-                None
-            } else {
-                Some(cmd.edge_ip.clone())
-            },
             created_at: now_rfc3339(),
         })
         .await?;
 
     let started = Instant::now();
-    let rootfs_path =
-        lvm::create_vm_lv(&cmd.vm_id, &base.image_hash, cmd.disk_gib as u64).await?;
+    let rootfs_path = lvm::create_vm_lv(&cmd.vm_id, &base.image_hash, cmd.disk_gib as u64).await?;
     metrics
         .lv_snapshot_seconds
         .observe(started.elapsed().as_secs_f64());
@@ -116,23 +110,18 @@ async fn create_vm_inner(
     let started = Instant::now();
     let mut data_disk_paths = Vec::with_capacity(cmd.extra_disks.len());
     for (index, disk) in cmd.extra_disks.iter().enumerate() {
-        let path =
-            lvm::create_data_disk_lv(&cmd.vm_id, index as u32, disk.size_gib as u64).await?;
+        let path = lvm::create_data_disk_lv(&cmd.vm_id, index as u32, disk.size_gib as u64).await?;
         data_disk_paths.push(path);
     }
     metrics
         .data_disk_create_seconds
         .observe(started.elapsed().as_secs_f64());
 
-    let edge_network = if cmd.edge_ip.is_empty() {
-        None
-    } else {
-        Some(GuestEdgeNetwork {
-            ip_address: &cmd.edge_ip,
-            gateway: &cmd.edge_gateway,
-            prefix_len: cmd.edge_prefix_len,
-        })
-    };
+    // MAC must match what we'll pass on cloud-hypervisor's `--net mac=`
+    // arg below. netplan binds the cloud-init network-config by MAC,
+    // so the guest's kernel-assigned interface name (`ens3` / etc)
+    // being unstable across PCI-slot reorderings is harmless.
+    let primary_mac = vm::primary_mac(&cmd.vm_id);
 
     let started = Instant::now();
     let cloud_init_path = image_mgr
@@ -142,12 +131,12 @@ async fn create_vm_inner(
             &cmd.name,
             &cmd.bootstrap_data,
             &GuestNetwork {
+                mac: &primary_mac,
                 ip_address: &cmd.ip_address,
                 gateway: &cmd.gateway,
                 prefix_len: cmd.prefix_len,
                 dns_servers: &cmd.dns_servers,
             },
-            edge_network.as_ref(),
         )
         .await?;
     metrics
@@ -156,11 +145,6 @@ async fn create_vm_inner(
 
     let started = Instant::now();
     let primary_tap = net_mgr.attach_vm_primary(&cmd.vm_id, cmd.vni).await?;
-    let edge_tap = if cmd.edge_ip.is_empty() {
-        None
-    } else {
-        Some(net_mgr.attach_vm_edge(&cmd.vm_id).await?)
-    };
     metrics
         .tap_create_seconds
         .observe(started.elapsed().as_secs_f64());
@@ -186,7 +170,6 @@ async fn create_vm_inner(
                 extra_disks: &data_disk_paths,
             },
             &primary_tap,
-            edge_tap.as_deref(),
             &vfio_devices,
         )
         .await?;
@@ -214,10 +197,8 @@ pub async fn delete_vm(
     }
 
     if let Some(record) = record {
-        let addrs: Vec<String> =
-            parse_owned_json(&record.gpu_pci_addresses, "local_vms.gpu_pci_addresses");
-        for addr in &addrs {
-            if let Err(e) = gpu::unbind_vfio(addr).await {
+        for addr in record.gpus() {
+            if let Err(e) = gpu::unbind_vfio(&addr).await {
                 warn!(vm_id, pci = %addr, error = %e, "failed to unbind GPU");
             }
         }
@@ -300,14 +281,25 @@ fn younger_than(created_at: &str, now: std::time::SystemTime, grace: Duration) -
         .unwrap_or(false)
 }
 
-/// Send a single VM state report to the controller.
+/// Error returned when the agent→controller channel has been closed.
+/// Callers in one-shot contexts (post-create/delete reporting) should
+/// log + move on; callers in a periodic loop should treat this as the
+/// signal to exit their loop — the session owning that channel is
+/// gone and a new session will have spawned fresh loops.
+#[derive(Debug, thiserror::Error)]
+#[error("controller stream is closed")]
+pub struct ChannelClosed;
+
+/// Send a single VM state report to the controller. Propagates
+/// [`ChannelClosed`] so periodic reporters can exit cleanly on
+/// session teardown instead of spamming the log on every tick.
 pub async fn send_vm_state(
     sender: &mpsc::Sender<AgentMessage>,
     vm_id: String,
     state: MachineState,
     error_message: String,
     transient: bool,
-) {
+) -> Result<(), ChannelClosed> {
     let msg = AgentMessage {
         payload: Some(agent_message::Payload::VmState(ReportVmStateRequest {
             vm_id,
@@ -316,12 +308,12 @@ pub async fn send_vm_state(
             transient,
         })),
     };
-    if let Err(e) = sender.send(msg).await {
-        warn!(error = %e, "dropped VM state report; controller stream is closed");
-    }
+    sender.send(msg).await.map_err(|_| ChannelClosed)
 }
 
 /// Report the state of every locally-known VM to the controller.
+/// Stops on the first [`ChannelClosed`] — the session is gone so
+/// the remaining sends would fail too.
 pub async fn report_local_vm_states(
     agent_db: &AgentDb,
     vm_mgr: &Arc<VmManager>,
@@ -343,7 +335,7 @@ pub async fn report_local_vm_states(
                 "cloud-hypervisor process exited".to_string(),
             )
         };
-        send_vm_state(sender, vm.vm_id, state, err, false).await;
+        send_vm_state(sender, vm.vm_id, state, err, false).await?;
     }
     Ok(())
 }
@@ -366,7 +358,6 @@ mod tests {
             extra_disk_gibs: "[]".to_string(),
             image: "img".to_string(),
             vni: 10_000,
-            edge_ip: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }
     }
@@ -390,7 +381,7 @@ mod tests {
             std::env::temp_dir().join("basis-test-reconcile"),
         ));
         let uplink = UplinkBridge::new("test-br".to_string(), "lo".to_string(), 9000);
-        let trees = TreeManager::new("127.0.0.1".to_string(), 9000);
+        let trees = TreeManager::new("127.0.0.1".to_string(), 9000, "test-br".to_string());
         (vm_mgr, NetworkManager::new(uplink, trees))
     }
 

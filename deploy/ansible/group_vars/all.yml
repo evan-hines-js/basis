@@ -73,22 +73,39 @@ basis_pki_dir: "{{ playbook_dir }}/pki"
 basis_ca_validity_days: 3650
 basis_leaf_validity_days: 365
 
-# Default IP pool. Must be a range OUTSIDE your router's DHCP pool —
-# basis hands out static IPs via cloud-init, so a DHCP collision shows
-# up as a broken VM with no good diagnostic.
+# Tree networking. Every cluster's VMs live on a per-tree VXLAN that
+# carves its own CIDR out of `tree_supernet` — an overlay space that
+# does NOT need to match the physical LAN (the VXLAN outer IP is the
+# host's uplink address, the inner is tree-space).
 #
-# `vm_range` is where the controller auto-picks IPs for VMs. `vip_range`
-# is a disjoint sub-range reserved for control-plane VIPs (one per
-# cluster). They have to be disjoint so a busy cluster's VM allocation
-# can never race a pending CreateCluster for a sibling's VIP.
-basis_ip_pool:
-  name: default
-  cidr: 10.0.0.0/24
-  gateway: 10.0.0.1
-  vm_range_start: 10.0.0.150
-  vm_range_end: 10.0.0.205
-  vip_range_start: 10.0.0.100
-  vip_range_end: 10.0.0.149
+# `pools` are uplink-routable LAN ranges. A cluster's
+# `apiserverVipPool` names one of these to put its VIP on the LAN
+# (and source IPs for its edge-NIC VMs). An empty pool name keeps
+# the cluster's VIP inside the tree overlay (nested cluster).
+#
+# Pool CIDRs must be pairwise disjoint. The two-pool model assumes
+# distinct LAN segments (typically separate VLANs / IP subnets):
+#   * cell-internal — workload clusters' apiserver VIPs and LB blocks.
+#     Stays inside the cell; not advertised externally.
+#   * cell-public   — root/management cluster's apiserver VIP and any
+#     externally-reachable VIPs. Reachable from operator laptops,
+#     bootstrap kind clusters, and the customer upstream.
+#
+# Override these per environment in host/group vars to match your
+# actual LAN segmentation.
+basis_network:
+  tree_supernet: 10.100.0.0/16
+  pools:
+    - name: cell-internal
+      cidr: 10.255.0.0/24
+      gateway: 10.255.0.1
+      range_start: 10.255.0.200
+      range_end: 10.255.0.250
+    - name: cell-public
+      cidr: 10.0.0.0/24
+      gateway: 10.0.0.1
+      range_start: 10.0.0.200
+      range_end: 10.0.0.205
 
 # Credentials for private OCI registries basis-agent pulls VM images
 # from. Override in host/group vars or vault when deploying against

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Load test: spawn N parallel smoke.sh workers forever, each with a
 # unique cluster/machine name so they don't collide on controller
-# state. Every worker loops `smoke.sh --quick --parallel-safe
-# --suffix=ltNNN`. Ctrl-C stops the workers.
+# state. Every worker loops `smoke.sh --quick --suffix=ltNNN`.
+# Ctrl-C stops the workers.
 #
 # Usage:
 #   scripts/load-testing.sh                    # 100 workers
@@ -93,7 +93,7 @@ worker() {
 
     while :; do
         runs=$((runs + 1))
-        if "$SMOKE" --quick --parallel-safe "--suffix=$suffix" \
+        if "$SMOKE" --quick "--suffix=$suffix" \
                 >"$current" 2>&1; then
             :
         else

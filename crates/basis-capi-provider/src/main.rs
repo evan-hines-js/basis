@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 use axum::{routing::get, Router};
 use basis_capi_provider::client_cache::BasisClientCache;
-use basis_capi_provider::crds::{BasisCluster, BasisMachine, BasisMachineTemplate};
+use basis_capi_provider::components;
+use basis_capi_provider::reconciler::ProviderContext;
 use basis_capi_provider::{cluster, machine, startup};
 use clap::Parser;
-use kube::{Client, CustomResourceExt};
+use kube::Client;
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -29,22 +30,35 @@ const HEALTH_ADDR: &str = "0.0.0.0:9443";
     about = "CAPI infrastructure provider for Basis"
 )]
 struct Cli {
-    /// Print every CRD this binary manages as a multi-document YAML stream,
-    /// then exit. Pipe to `kubectl apply -f -` to install them.
+    /// Emit the full clusterctl-style `infrastructure-components.yaml`
+    /// for this provider and exit. The output — Namespace, CRDs,
+    /// ServiceAccount, RBAC, Deployment — is the single source of
+    /// truth for Lattice's `test-providers/infrastructure-basis/`
+    /// snapshot. Regenerate on every CRD change via
+    /// `scripts/generate-capi-components.sh`.
     #[arg(long)]
-    print_crds: bool,
+    print_components: bool,
+
+    /// Basis-side cluster id of the cluster this provider is running
+    /// in. Set at deploy time — Lattice's installer plumbs the
+    /// hosting cluster's `basisClusterId` in. Every `BasisCluster`
+    /// this provider creates becomes a child of this id in basis's
+    /// tree (trust domain). Leave unset only on the provider running
+    /// in the root cell, where there is no parent.
+    #[arg(long, env = "BASIS_PARENT_CLUSTER_ID", default_value = "")]
+    parent_cluster_id: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if cli.print_crds {
-        return print_crds();
+    if cli.print_components {
+        return print_components();
     }
-    run().await
+    run(cli).await
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(cli: Cli) -> anyhow::Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
@@ -62,7 +76,14 @@ async fn run() -> anyhow::Result<()> {
         }))
         .init();
 
-    info!("starting basis-capi-provider");
+    info!(
+        parent_cluster_id = %if cli.parent_cluster_id.is_empty() {
+            "<root>".to_string()
+        } else {
+            cli.parent_cluster_id.clone()
+        },
+        "starting basis-capi-provider"
+    );
 
     let kube = Client::try_default().await?;
 
@@ -73,9 +94,14 @@ async fn run() -> anyhow::Result<()> {
     startup::wait_for_crds(&kube).await?;
 
     let clients = Arc::new(BasisClientCache::new(kube.clone()));
+    let ctx = Arc::new(ProviderContext {
+        client: kube.clone(),
+        clients: clients.clone(),
+        parent_cluster_id: cli.parent_cluster_id,
+    });
 
-    let cluster_task = tokio::spawn(cluster::run(kube.clone(), clients.clone()));
-    let machine_task = tokio::spawn(machine::run(kube.clone(), clients.clone()));
+    let cluster_task = tokio::spawn(cluster::run(ctx.clone()));
+    let machine_task = tokio::spawn(machine::run(ctx.clone()));
     let health_task = tokio::spawn(serve_health());
 
     tokio::try_join!(
@@ -96,19 +122,8 @@ async fn serve_health() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_crds() -> anyhow::Result<()> {
-    // One multi-doc YAML stream so the whole output can be piped to
-    // `kubectl apply -f -`. Order matters only for readability.
-    print_crd::<BasisCluster>()?;
-    print_crd::<BasisMachineTemplate>()?;
-    print_crd::<BasisMachine>()?;
-    Ok(())
-}
-
-fn print_crd<T: CustomResourceExt>() -> anyhow::Result<()> {
-    let yaml = serde_yaml_ng::to_string(&T::crd())?;
-    println!("---");
-    print!("{yaml}");
+fn print_components() -> anyhow::Result<()> {
+    print!("{}", components::render()?);
     Ok(())
 }
 

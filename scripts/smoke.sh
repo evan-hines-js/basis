@@ -17,15 +17,16 @@
 #   --keep           Don't tear down on success (Section 1 only).
 #   --quick          Skip Section 1 (real VM boot) and run only the
 #                    controller-level sections. Useful during iteration.
-#   --parallel-safe  Skip sections that assert sequential-allocator
-#                    ordering (3, 6, the IP-reuse half of 8). Required
-#                    when multiple copies of this script share one
-#                    controller — see scripts/load-testing.sh.
 #   --suffix=<name>  Namespace every resource name with "-<name>" and
 #                    generate per-suffix copies of cluster.yaml and
 #                    machine-debug.yaml in the tmpdir. Lets many copies
 #                    of this script run against the same controller
 #                    without colliding on names.
+#
+# Every assertion below holds under concurrent runs against a shared
+# controller — invariants that depend on a globally-known free address
+# (e.g. "this specific IP is the lowest free") belong in the controller's
+# integration tests, not here.
 #
 # Env:
 #   SMOKE_SKIP_BUILD=1  Skip `cargo build`. For callers that already
@@ -36,8 +37,12 @@
 #   - A Basis controller reachable at $BASIS_ENDPOINT
 #   - A Basis agent connected to that controller on some host
 #   - The four env vars below set to valid cert paths
-#   - Section 1: machine fixture's IP reachable from this host
-#     (bridge layer-2 or routable)
+#   - Section 1: edge IP reachable from this host (LAN-routable)
+#   - Section 1's tree-only egress check runs only when this host also
+#     has a route to tree CIDRs (i.e. when you're on the hypervisor).
+#   - `sshpass` installed (Section 1 SSHes into the guest to verify it
+#     can curl ghcr.io — the whole point of basis is hosting k8s
+#     workers that pull node images, so "VM comes up" isn't enough)
 
 set -euo pipefail
 
@@ -45,16 +50,16 @@ set -euo pipefail
 : "${BASIS_TLS_CA:?BASIS_TLS_CA not set (path to ca.crt)}"
 : "${BASIS_TLS_CERT:?BASIS_TLS_CERT not set (path to capi-provider.crt)}"
 : "${BASIS_TLS_KEY:?BASIS_TLS_KEY not set (path to capi-provider.key)}"
+command -v sshpass >/dev/null \
+    || { echo "smoke needs sshpass for guest egress checks: apt install sshpass" >&2; exit 2; }
 
 KEEP=0
 QUICK=0
-PARALLEL_SAFE=0
 SUFFIX=""
 for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=1;;
         --quick) QUICK=1;;
-        --parallel-safe) PARALLEL_SAFE=1;;
         --suffix=*) SUFFIX="${arg#--suffix=}";;
         *) echo "unknown arg: $arg" >&2; exit 2;;
     esac
@@ -75,6 +80,39 @@ cd "$REPO_ROOT"
 step() { echo; echo "==> $*"; }
 pass() { echo "  ok: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# Run one command inside the guest. Password auth via the `basis`
+# password cloud-init sets in bootstrap-debug.yaml. StrictHostKeyChecking
+# off because the host key is fresh per VM.
+ssh_guest() {
+    local ip="$1"; shift
+    sshpass -p basis ssh -q \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 \
+        "ubuntu@$ip" "$@"
+}
+
+# Poll `ssh` until the guest's sshd accepts commands, up to
+# BOOT_DEADLINE_SECONDS. Returns 0 on success, 1 on timeout.
+wait_for_ssh() {
+    local ip="$1"
+    local deadline=$((SECONDS + BOOT_DEADLINE_SECONDS))
+    until ssh_guest "$ip" 'true' 2>/dev/null; do
+        (( SECONDS < deadline )) || return 1
+        sleep 2
+    done
+}
+
+# Inside the guest, fetch ghcr.io/v2/ and return the HTTP status.
+# Prints "000" on network failure. A 2xx/3xx/4xx/5xx return means the
+# guest can actually reach the internet — ghcr.io/v2/ answers 401
+# without auth, which is still proof-of-connectivity.
+guest_curl_ghcr() {
+    local ip="$1"
+    ssh_guest "$ip" 'curl -sSL -m 15 -o /dev/null -w "%{http_code}" https://ghcr.io/v2/ 2>/dev/null || echo 000' \
+        2>/dev/null | tr -d '[:space:]'
+}
 
 # `mktemp` varies across BSD/GNU; use a portable template.
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/basis-smoke.XXXXXX")"
@@ -101,8 +139,7 @@ apiVersion: basis.dev/v1
 kind: Cluster
 metadata:
   name: $CLUSTER_NAME
-spec:
-  ipPool: default
+spec: {}
 YAML
     cat >"$MACHINE_FIXTURE" <<YAML
 apiVersion: basis.dev/v1
@@ -117,6 +154,7 @@ spec:
   image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
   bootstrapDataFile: $FIXTURES/bootstrap-debug.yaml
   gpus: 0
+  edge: true
 YAML
 else
     CLUSTER_FIXTURE="$FIXTURES/cluster.yaml"
@@ -172,7 +210,11 @@ if [[ "$QUICK" == 0 ]]; then
     echo "$APPLY_OUT"
     VM_LINE=$(echo "$APPLY_OUT" | grep '^machine' | head -1)
     VM_ID=$(parse_field "$VM_LINE" id)
-    VM_IP=$(parse_field "$VM_LINE" ip)
+    # Prefer the edge IP for the reachability probe — it's on the
+    # physical LAN so it's routable from the operator's laptop, not
+    # just the hypervisor. Tree IPs are overlay-only.
+    VM_IP=$(parse_field "$VM_LINE" edge_ip)
+    [[ -n "$VM_IP" ]] || VM_IP=$(parse_field "$VM_LINE" ip)
     [[ -n "$VM_ID" ]] || fail "could not parse vm id from apply output"
     [[ -n "$VM_IP" ]] || fail "could not parse vm ip from apply output"
 
@@ -199,6 +241,95 @@ if [[ "$QUICK" == 0 ]]; then
         sleep 2
     done
     pass "reachable after ${SECONDS}s"
+
+    # "Pingable" is necessary but not sufficient — the real bar is
+    # "can pull its k8s node image," which means DNS, a default
+    # route, and reachability to ghcr.io from inside the guest.
+    # Testing that end-to-end path is the whole point of basis:
+    # anything less and Lattice's workers won't join their cluster.
+    step "[1/8] Wait for guest sshd + verify external egress from edge NIC"
+    wait_for_ssh "$VM_IP" || fail "guest sshd on $VM_IP not reachable within ${BOOT_DEADLINE_SECONDS}s"
+    status=$(guest_curl_ghcr "$VM_IP")
+    [[ "$status" =~ ^[1-5][0-9]{2}$ ]] \
+        || fail "guest at $VM_IP cannot reach https://ghcr.io/v2/ (status=$status) — edge NIC egress broken"
+    pass "edge VM reached ghcr.io (HTTP $status)"
+
+    # Tree-only VMs — the case k8s workers will actually use — only
+    # have an IP on the overlay. Reaching the internet from there
+    # requires the hypervisor to NAT the tree CIDR out the uplink.
+    # This sub-section runs only when we're sitting ON the hypervisor
+    # (tree IPs are in the local routing table); from a laptop we
+    # skip it, since tree IPs aren't routable from outside the fabric.
+    if ip route get 10.100.0.1 2>/dev/null | grep -q 'dev brt'; then
+        step "[1/8] Tree-only egress (hypervisor only)"
+        TREE_MACHINE_FIXTURE="$TMP_DIR/machine-tree.yaml"
+        TREE_MACHINE_NAME="tree$S"
+        cat >"$TREE_MACHINE_FIXTURE" <<YAML
+apiVersion: basis.dev/v1
+kind: Machine
+metadata:
+  name: $TREE_MACHINE_NAME
+spec:
+  cluster: $CLUSTER_NAME
+  cpu: 2
+  memoryMib: 2048
+  diskGib: 10
+  image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
+  bootstrapDataFile: $FIXTURES/bootstrap-debug.yaml
+  gpus: 0
+YAML
+        TREE_OUT=$(apply_capture "$TREE_MACHINE_FIXTURE")
+        echo "$TREE_OUT"
+        TREE_LINE=$(echo "$TREE_OUT" | grep '^machine' | head -1)
+        TREE_IP=$(parse_field "$TREE_LINE" ip)
+        [[ -n "$TREE_IP" ]] || fail "could not parse tree VM ip"
+
+        deadline=$((SECONDS + BOOT_DEADLINE_SECONDS))
+        until ping -c1 -W1 "$TREE_IP" >/dev/null 2>&1; do
+            (( SECONDS < deadline )) || fail "tree VM never pinged at $TREE_IP"
+            sleep 2
+        done
+
+        wait_for_ssh "$TREE_IP" || fail "tree VM sshd never ready"
+        status=$(guest_curl_ghcr "$TREE_IP")
+        [[ "$status" =~ ^[1-5][0-9]{2}$ ]] \
+            || fail "tree-only VM cannot reach https://ghcr.io/v2/ (status=$status) — hypervisor NAT for tree CIDR broken"
+        pass "tree-only VM reached ghcr.io (HTTP $status) via hypervisor NAT"
+
+        # Per-host bridge IP check. Each hypervisor owns a unique
+        # address in the tree's bridge_range and every VM it hosts
+        # uses that same address as default gateway. The genuine
+        # regression — a cross-host reply hijacked by the responding
+        # host — can only be caught with two hypervisors, but we can
+        # still assert the single-host invariants the fix guarantees:
+        #   (1) the guest's default gateway matches the host's bridge IP
+        #   (2) that IP comes from the tree's bridge_range, so the
+        #       shared-gateway layout is definitively gone.
+        HOST_BRIDGE_IP=$(ip -o route get "$TREE_IP" \
+            | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+        [[ -n "$HOST_BRIDGE_IP" ]] \
+            || fail "could not read host bridge IP via 'ip route get $TREE_IP'"
+        VM_GATEWAY=$(ssh_guest "$TREE_IP" 'ip -4 route show default | awk "{print \$3}"' | tr -d '[:space:]')
+        [[ -n "$VM_GATEWAY" ]] \
+            || fail "could not read default gateway from guest"
+        if [[ "$HOST_BRIDGE_IP" != "$VM_GATEWAY" ]]; then
+            fail "guest default gateway $VM_GATEWAY != host bridge IP $HOST_BRIDGE_IP — per-host gateway wiring broken"
+        fi
+        # bridge_range lives at the bottom of the tree CIDR: with the
+        # default /20 tree and bridge_reserve=32, the first 32 usable
+        # addresses are bridge IPs and VM IPs start above them. The
+        # VM's own address must sit numerically above the gateway.
+        gw_last=${HOST_BRIDGE_IP##*.}
+        vm_last=${TREE_IP##*.}
+        if (( vm_last <= gw_last )); then
+            fail "VM IP $TREE_IP is not above bridge IP $HOST_BRIDGE_IP — bridge_range carve regressed"
+        fi
+        pass "host bridge IP $HOST_BRIDGE_IP matches VM default gateway (per-host gateway wiring OK)"
+
+        "$BIN" delete -f "$TREE_MACHINE_FIXTURE" >/dev/null
+    else
+        echo "  (skipping tree-only egress: no local route to tree CIDR — not on the hypervisor)"
+    fi
 
     if [[ "$KEEP" == 1 ]]; then
         step "VM is up — skipping teardown (--keep)"
@@ -254,39 +385,23 @@ fi
 pass "machine re-apply returned the same id and IP"
 
 ###############################################################################
-# Section 3 — IP release + reuse on delete.
-# Proves: teardown_vm releases the allocation, and the next allocator
-# picks up the freed address (confirming `release_ips` actually fires
-# and the allocator walks from the lowest free address). Covers the
-# class of bug where a failed cleanup leaves an IP permanently leased.
-#
-# Skipped under --parallel-safe: "lowest free address" is the position
-# in a shared, global queue, so concurrent workers can't assert which
-# IP they'll get back.
+# Section 3 — Delete clears the row.
+# Proves: teardown_vm removes the VM from the controller's view. The
+# stronger property — that the IP comes back as the lowest-free
+# address — is asserted in basis-controller's integration tests where
+# we own the allocator's state.
 ###############################################################################
-if [[ "$PARALLEL_SAFE" == 0 ]]; then
-    step "[3/8] IP release on delete"
-    # `$MACHINE_NAME` is still alive from Section 2. Record its IP,
-    # delete, re-apply, and expect the same IP back (it's the lowest
-    # free after release).
-    ORIG_IP="$FIRST_IP"
-    "$BIN" delete -f "$MACHINE_FIXTURE" >/dev/null
-    if "$BIN" get-machines | grep -q "  $MACHINE_NAME "; then
-        fail "$MACHINE_NAME still listed after delete"
-    fi
-
-    REUSE=$(apply_capture "$MACHINE_FIXTURE")
-    REUSE_LINE=$(echo "$REUSE" | grep '^machine' | head -1)
-    REUSE_IP=$(parse_field "$REUSE_LINE" ip)
-    [[ -n "$REUSE_IP" ]] || fail "could not parse reuse IP: $REUSE_LINE"
-
-    if [[ "$REUSE_IP" != "$ORIG_IP" ]]; then
-        fail "IP not reused after delete (original=$ORIG_IP, after-delete=$REUSE_IP) — release_ips may be leaking"
-    fi
-    pass "IP $ORIG_IP released on delete and reassigned to the next machine"
-else
-    step "[3/8] IP release on delete — SKIPPED (--parallel-safe)"
+step "[3/8] Delete clears the row"
+"$BIN" delete -f "$MACHINE_FIXTURE" >/dev/null
+if "$BIN" get-machines | grep -q "  $MACHINE_NAME "; then
+    fail "$MACHINE_NAME still listed after delete"
 fi
+# Re-apply must succeed; if `release_vm_ips` were broken the new
+# allocation would either fail or hand out a duplicate IP, both of
+# which trip downstream sections.
+REUSE=$(apply_capture "$MACHINE_FIXTURE")
+echo "$REUSE" | grep -q '^machine' || fail "machine re-apply after delete did not produce a row"
+pass "machine deleted and re-applied cleanly"
 
 ###############################################################################
 # Section 4 — Cluster cascade delete.
@@ -347,59 +462,40 @@ fi
 pass "bogus cluster ref rejected with no partial state"
 
 ###############################################################################
-# Section 6 — Multi-cluster VIP allocation + release.
-# Proves: CreateCluster allocates distinct VIPs from the pool's VIP
-# sub-range, DeleteCluster releases them, and a subsequent CreateCluster
-# picks up the freed VIP as the lowest-free address. Exercises
-# `allocate_vip` / `release_ips(ClusterVip)` — the cluster analogue of
-# Section 3, which only covered VM IPs.
-#
-# Skipped under --parallel-safe: the reuse half asserts a specific
-# lowest-free address, which doesn't hold when other workers are
-# churning VIPs in the same pool.
+# Section 6 — Multi-cluster VIP uniqueness.
+# Proves: CreateCluster never hands the same VIP to two clusters
+# (would mean the tree vip_range allocator is double-issuing). The
+# stronger "freed VIP is reclaimed as lowest-free" property is
+# asserted in basis-controller's integration tests.
 ###############################################################################
-if [[ "$PARALLEL_SAFE" == 0 ]]; then
-    step "[6/8] Multi-cluster VIP allocation + release"
-    write_cluster_fixture() {
-        local name="$1" path="$2"
-        cat >"$path" <<YAML
+step "[6/8] Multi-cluster VIP uniqueness"
+write_cluster_fixture() {
+    local name="$1" path="$2"
+    cat >"$path" <<YAML
 apiVersion: basis.dev/v1
 kind: Cluster
 metadata:
   name: $name
-spec:
-  ipPool: default
+spec: {}
 YAML
-    }
-    CLUSTER_A="$TMP_DIR/cluster-vip-a.yaml"
-    CLUSTER_B="$TMP_DIR/cluster-vip-b.yaml"
-    CLUSTER_C="$TMP_DIR/cluster-vip-c.yaml"
-    write_cluster_fixture "smoke-vip-a$S" "$CLUSTER_A"
-    write_cluster_fixture "smoke-vip-b$S" "$CLUSTER_B"
-    write_cluster_fixture "smoke-vip-c$S" "$CLUSTER_C"
+}
+CLUSTER_A="$TMP_DIR/cluster-vip-a.yaml"
+CLUSTER_B="$TMP_DIR/cluster-vip-b.yaml"
+write_cluster_fixture "smoke-vip-a$S" "$CLUSTER_A"
+write_cluster_fixture "smoke-vip-b$S" "$CLUSTER_B"
 
-    parse_endpoint() { parse_field "$(echo "$1" | grep '^cluster')" endpoint; }
+parse_endpoint() { parse_field "$(echo "$1" | grep '^cluster')" endpoint; }
 
-    OUT_A=$("$BIN" apply -f "$CLUSTER_A"); VIP_A=$(parse_endpoint "$OUT_A")
-    OUT_B=$("$BIN" apply -f "$CLUSTER_B"); VIP_B=$(parse_endpoint "$OUT_B")
-    [[ -n "$VIP_A" && -n "$VIP_B" ]] || fail "could not parse VIPs"
-    if [[ "$VIP_A" == "$VIP_B" ]]; then
-        fail "two clusters received the same VIP ($VIP_A) — allocator is broken"
-    fi
-    pass "two clusters got distinct VIPs ($VIP_A, $VIP_B)"
-
-    "$BIN" delete -f "$CLUSTER_A" >/dev/null
-    OUT_C=$("$BIN" apply -f "$CLUSTER_C"); VIP_C=$(parse_endpoint "$OUT_C")
-    if [[ "$VIP_C" != "$VIP_A" ]]; then
-        fail "VIP $VIP_A not reused after cluster delete (got $VIP_C instead) — release_ips(ClusterVip) may be leaking"
-    fi
-    pass "VIP $VIP_A released on cluster delete and reassigned"
-
-    "$BIN" delete -f "$CLUSTER_B" >/dev/null
-    "$BIN" delete -f "$CLUSTER_C" >/dev/null
-else
-    step "[6/8] Multi-cluster VIP allocation + release — SKIPPED (--parallel-safe)"
+OUT_A=$("$BIN" apply -f "$CLUSTER_A"); VIP_A=$(parse_endpoint "$OUT_A")
+OUT_B=$("$BIN" apply -f "$CLUSTER_B"); VIP_B=$(parse_endpoint "$OUT_B")
+[[ -n "$VIP_A" && -n "$VIP_B" ]] || fail "could not parse VIPs"
+if [[ "$VIP_A" == "$VIP_B" ]]; then
+    fail "two clusters received the same VIP ($VIP_A) — allocator is double-issuing"
 fi
+pass "two clusters got distinct VIPs ($VIP_A, $VIP_B)"
+
+"$BIN" delete -f "$CLUSTER_A" >/dev/null
+"$BIN" delete -f "$CLUSTER_B" >/dev/null
 
 ###############################################################################
 # Section 7 — Scheduler rejection on impossible resource request.
@@ -441,25 +537,11 @@ pass "oversize request rejected, no row persisted"
 # Section 8 — Bad image ref → clean failure + agent-side rollback.
 # Proves: when the agent fails partway through CreateVm (here: image
 # pull against a nonexistent repo), the controller surfaces a clear
-# error, the VM row is removed, and the IP is released. This is the
-# closest we can get to verifying the recent resource-leak fix
-# (handlers::create_vm rolls back on any inner-step error) without
-# direct host access.
-#
-# Under --parallel-safe we skip the "IP came back" half — with other
-# workers churning IPs, the reclaimed address may be handed to them
-# before we re-probe — and assert only that the failed row was removed.
+# error and the VM row is removed. The IP-reclamation half is
+# asserted in basis-controller's integration tests where we own the
+# allocator's snapshot.
 ###############################################################################
 step "[8/8] Bad image ref → failure with full rollback"
-if [[ "$PARALLEL_SAFE" == 0 ]]; then
-    # Record the IP that would be the next allocation so we can assert
-    # it was released (re-applying a valid machine should get the same
-    # IP).
-    VALID_PROBE=$(apply_capture "$MACHINE_FIXTURE")
-    VALID_IP=$(parse_field "$(echo "$VALID_PROBE" | grep '^machine' | head -1)" ip)
-    [[ -n "$VALID_IP" ]] || fail "could not probe next-free IP"
-    "$BIN" delete -f "$MACHINE_FIXTURE" >/dev/null
-fi
 
 BADIMG="$TMP_DIR/machine-badimg.yaml"
 cat >"$BADIMG" <<YAML
@@ -485,19 +567,7 @@ if "$BIN" get-machines 2>/dev/null | grep -q "  $BADIMG_NAME "; then
     fail "$BADIMG_NAME row persisted after agent-reported failure — cleanup_failed_vm regressed"
 fi
 
-if [[ "$PARALLEL_SAFE" == 0 ]]; then
-    # Re-apply the valid machine. If the IP isn't reclaimed, the IP from
-    # the failed attempt is still held and this one gets a different IP.
-    AFTER=$(apply_capture "$MACHINE_FIXTURE")
-    AFTER_IP=$(parse_field "$(echo "$AFTER" | grep '^machine' | head -1)" ip)
-    if [[ "$AFTER_IP" != "$VALID_IP" ]]; then
-        fail "IP not released after failed create ($VALID_IP expected, got $AFTER_IP) — IP leaked"
-    fi
-    pass "failed create left no row and no leased IP; $MACHINE_NAME re-allocated to $AFTER_IP"
-    "$BIN" delete -f "$MACHINE_FIXTURE" >/dev/null
-else
-    pass "failed create left no row (IP-reuse assertion skipped under --parallel-safe)"
-fi
+pass "failed create left no row"
 
 "$BIN" delete -f "$CLUSTER_FIXTURE" >/dev/null
 

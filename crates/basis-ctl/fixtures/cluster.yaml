@@ -3,4 +3,8 @@ kind: Cluster
 metadata:
   name: debug
 spec:
-  ipPool: default
+  # Picks the LAN pool for this cluster's apiserver VIP and edge-NIC
+  # VMs. Must match a `name` in the controller's `network.pools[]`.
+  # Leave empty for nested clusters whose VIP stays inside the tree
+  # overlay (kube-vip on `ens3`, no LAN exposure).
+  apiserverVipPool: cell-internal

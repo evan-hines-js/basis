@@ -9,14 +9,17 @@
 //!   controllerEndpoint: "https://10.0.0.1:7443"
 //!   dataDir: /var/lib/basis
 //!   network:
-//!     uplinkBridge: basis0       # name of the Linux bridge that masters `uplinkInterface`
-//!     uplinkInterface: eno1       # physical NIC carrying VXLAN + edge NIC traffic
-//!     vtepAddress: 10.100.0.17    # this host's IP for VXLAN outer header
-//!     uplinkMtu: 9000             # physical link MTU; must be ≥ 1550 (jumbo recommended)
+//!     bridge: basis0        # Linux bridge that masters `physicalNic`
+//!     physicalNic: eno1     # physical NIC carrying VXLAN underlay traffic
 //!   tls: { ... }
 //! ```
 //!
 //! `metadata.name` is used as the hostname the agent registers as.
+//!
+//! The agent derives the VXLAN source address and MTU from the
+//! physical NIC at startup — they are not user-configurable fields
+//! because the kernel already knows them and asking the operator to
+//! restate them just invites drift.
 
 use std::path::{Path, PathBuf};
 
@@ -61,22 +64,16 @@ pub struct RegistryCredentials {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkSpec {
-    /// Linux bridge that masters the physical uplink NIC. Edge-flagged
-    /// VMs attach a second TAP here. Tree VMs never touch this bridge
-    /// — they live on per-VNI bridges (`brt<vni>`).
-    pub uplink_bridge: String,
-    /// Physical NIC name, e.g. `eno1`. Becomes a slave of
-    /// `uplink_bridge` and is the egress interface for VXLAN frames.
-    pub uplink_interface: String,
-    /// IP address used as the outer source of VXLAN frames. Almost
-    /// always the uplink NIC's address. Reported to the controller on
-    /// `RegisterHostRequest.vtep_address`.
-    pub vtep_address: String,
-    /// Physical uplink MTU. VXLAN adds 50 bytes of outer header, so
-    /// this must be ≥ 1550 to carry standard 1500-byte inner frames.
-    /// Jumbo frames (9000) are strongly recommended — the tree bridges
-    /// derive their inner MTU from this.
-    pub uplink_mtu: u32,
+    /// Linux bridge that masters the physical NIC. Edge-flagged VMs
+    /// attach a second TAP here. Tree VMs never touch this bridge —
+    /// they live on per-VNI bridges (`brt<vni>`).
+    pub bridge: String,
+    /// Physical NIC name (e.g. `eno1`). Becomes a slave of `bridge`
+    /// and is the egress interface for VXLAN frames. Its MTU and
+    /// primary IPv4 address are read at startup and used as the tree
+    /// bridges' MTU source and the VXLAN outer source address
+    /// respectively — no separate config fields for those.
+    pub physical_nic: String,
 }
 
 impl HostSpec {
@@ -116,10 +113,8 @@ spec:
   controllerEndpoint: "https://10.0.0.1:7443"
   dataDir: /var/lib/basis
   network:
-    uplinkBridge: basis0
-    uplinkInterface: eno1
-    vtepAddress: 10.100.0.17
-    uplinkMtu: 9000
+    bridge: basis0
+    physicalNic: eno1
   tls:
     cert: /etc/basis/tls/agent.crt
     key: /etc/basis/tls/agent.key
@@ -128,10 +123,8 @@ spec:
         );
         let host = load(f.path()).unwrap();
         assert_eq!(host.metadata.name, "node-1");
-        assert_eq!(host.spec.network.uplink_bridge, "basis0");
-        assert_eq!(host.spec.network.uplink_interface, "eno1");
-        assert_eq!(host.spec.network.vtep_address, "10.100.0.17");
-        assert_eq!(host.spec.network.uplink_mtu, 9000);
+        assert_eq!(host.spec.network.bridge, "basis0");
+        assert_eq!(host.spec.network.physical_nic, "eno1");
     }
 
     #[test]

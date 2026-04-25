@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&config.data_dir)?;
 
-    let db = Db::open(&config.db_path()).await?;
+    let db = Db::open(&config.db_path(), config.cpu_overcommit_ratio).await?;
     info!(path = %config.db_path().display(), "database ready");
 
     let shutdown = CancellationToken::new();
@@ -80,15 +80,9 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&config.listen).await?;
     let tls_config = config.tls.server_config()?;
-    basis_controller::server::BasisServer::new(
-        db,
-        metrics,
-        config.dns_servers,
-        config.network,
-        config.cpu_overcommit_ratio,
-    )
-    .serve(listener, tls_config, shutdown)
-    .await?;
+    basis_controller::server::BasisServer::new(db, metrics, config.dns_servers, config.network)
+        .serve(listener, tls_config, shutdown)
+        .await?;
 
     Ok(())
 }

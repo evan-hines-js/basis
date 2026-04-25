@@ -11,22 +11,21 @@ spec:
     cert: /etc/basis/tls/controller.crt
     key: /etc/basis/tls/controller.key
     ca: /etc/basis/tls/ca.crt
-  ipPools:
-    - name: default
-      cidr: 192.168.1.0/24
-      gateway: 192.168.1.1
-      # Both sub-ranges must sit OUTSIDE your router's DHCP range and
-      # must not overlap with each other. The controller auto-picks VM
-      # IPs from `vmRange` and control-plane VIPs from `vipRange`. Size
-      # `vipRange` to the number of clusters you expect to run at once
-      # (one VIP per cluster).
-      vmRange:
-        start: 192.168.1.220
-        end: 192.168.1.250
-      vipRange:
-        start: 192.168.1.210
-        end: 192.168.1.219
-  # CPU overcommit: assigned vCPU is allowed to exceed the host's logical
-  # CPU count by this factor. Memory and disk stay strict. 1.0 = no
-  # overcommit. 4.0 is typical for k8s workload VMs.
+  network:
+    # Overlay space — every tree (trust domain) carves a disjoint
+    # sub-CIDR out of this supernet. Does NOT need to match the
+    # physical LAN; VMs reach it via VXLAN.
+    treeSupernet: 10.100.0.0/16
+    # Named LAN-routable pools. A cluster's `apiserverVipPool` picks
+    # which pool its apiserver VIP comes from (and consequently the
+    # source for its edge-NIC VMs). Empty `apiserverVipPool` keeps
+    # the VIP inside the tree overlay (nested clusters).
+    pools:
+      - name: cell-internal
+        cidr: 192.168.1.0/24
+        gateway: 192.168.1.1
+        rangeStart: 192.168.1.240
+        rangeEnd: 192.168.1.250
+  # CPU overcommit: assigned vCPU is allowed to exceed the host's
+  # logical CPU count by this factor. Memory and disk stay strict.
   cpuOvercommitRatio: 4.0

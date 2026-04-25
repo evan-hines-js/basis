@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use basis_common::gpu::GpuInfo;
 use basis_common::json::parse_owned_json;
-use basis_proto::{CreateMachineRequest, GpuDevice};
+use basis_proto::CreateMachineRequest;
 
-use crate::db::{HostRow, VmRow};
+use crate::db::{HostRow, HostUsage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
@@ -41,135 +41,99 @@ impl From<&CreateMachineRequest> for ScheduleRequest {
     }
 }
 
-/// Derived per-host capacity, computed from the host's totals minus the
-/// VMs currently assigned to it.
+/// Free capacity on a host after subtracting current usage. `cpu` is
+/// scaled by `cpu_overcommit_ratio`; memory and disk are strict
+/// because oversubscribing either ends in OOM-kills or ENOSPC — much
+/// worse failure modes than CPU time-slicing.
 #[derive(Debug, Clone, Copy)]
-struct HostCapacity {
-    available_cpu: u32,
-    available_memory_mib: u32,
-    available_disk_gib: u32,
+struct Available {
+    cpu: u32,
+    memory_mib: u32,
+    disk_gib: u32,
 }
 
-impl HostCapacity {
-    /// `cpu_overcommit_ratio` scales `host.total_cpu` before subtracting
-    /// currently-assigned vCPU — 1.0 is strict, >1.0 permits packing more
-    /// vCPU on the host than it has logical CPUs. Memory and disk are
-    /// always strict: oversubscribing them leads to OOM-kills or ENOSPC,
-    /// which are much worse failure modes than time-slicing.
-    fn compute(host: &HostRow, vms: &[VmRow], cpu_overcommit_ratio: f32) -> Self {
-        let used_cpu: i64 = vms.iter().map(|v| v.cpu).sum();
-        let used_mem: i64 = vms.iter().map(|v| v.memory_mib).sum();
-        let used_disk: i64 = vms.iter().map(|v| v.total_disk_gib()).sum();
-
-        // Promote to f64 for the multiply so we don't lose precision on
-        // large host cpu counts when the ratio has a fractional part.
+impl Available {
+    fn from(host: &HostRow, usage: &HostUsage, cpu_overcommit_ratio: f32) -> Self {
+        // Promote to f64 so large core counts with fractional ratios
+        // don't lose precision in the multiply.
         let effective_cpu = (host.total_cpu as f64 * cpu_overcommit_ratio as f64) as i64;
-
         Self {
-            available_cpu: effective_cpu.saturating_sub(used_cpu).max(0) as u32,
-            available_memory_mib: host.total_memory_mib.saturating_sub(used_mem).max(0) as u32,
-            available_disk_gib: host.total_disk_gib.saturating_sub(used_disk).max(0) as u32,
+            cpu: effective_cpu.saturating_sub(usage.used_cpu).max(0) as u32,
+            memory_mib: host
+                .total_memory_mib
+                .saturating_sub(usage.used_memory_mib)
+                .max(0) as u32,
+            disk_gib: host
+                .total_disk_gib
+                .saturating_sub(usage.used_disk_gib)
+                .max(0) as u32,
         }
+    }
+
+    fn fits(&self, req: &ScheduleRequest) -> bool {
+        self.cpu >= req.cpu && self.memory_mib >= req.memory_mib && self.disk_gib >= req.disk_gib
+    }
+
+    fn remaining_after(&self, req: &ScheduleRequest) -> u64 {
+        self.cpu.saturating_sub(req.cpu) as u64
+            + self.memory_mib.saturating_sub(req.memory_mib) as u64
     }
 }
 
-/// Pick the best host for a VM request and return the GPUs selected on that host.
-///
-/// `vms_by_host` must map every healthy host's id to the VMs currently
-/// assigned to it — the controller is the authoritative source of
-/// capacity, and derives availability here rather than trusting agent
-/// heartbeats.
+/// Pick the best host for a VM request and return the GPUs selected
+/// on that host. The controller is the authoritative source of
+/// capacity: `usage_by_host` comes from `Db::host_usage_snapshot`
+/// and drives both the fit check and the already-claimed-GPU filter.
 pub fn schedule(
     hosts: &[HostRow],
-    vms_by_host: &HashMap<String, Vec<VmRow>>,
+    usage_by_host: &HashMap<String, HostUsage>,
     req: &ScheduleRequest,
     cpu_overcommit_ratio: f32,
-) -> Result<(String, Vec<GpuDevice>), SchedulerError> {
-    let mut candidates: Vec<(&HostRow, i32, Vec<GpuInfo>, HostCapacity)> = Vec::new();
+) -> Result<(String, Vec<GpuInfo>), SchedulerError> {
+    let empty = HostUsage::default();
+    let mut candidates: Vec<(&HostRow, i32, Vec<GpuInfo>, Available)> = Vec::new();
 
-    let empty: Vec<VmRow> = Vec::new();
-    for host in hosts {
-        if !host.healthy {
-            continue;
-        }
-
-        let vms = vms_by_host.get(&host.id).unwrap_or(&empty);
-        let cap = HostCapacity::compute(host, vms, cpu_overcommit_ratio);
-
-        if cap.available_cpu < req.cpu
-            || cap.available_memory_mib < req.memory_mib
-            || cap.available_disk_gib < req.disk_gib
-        {
+    for host in hosts.iter().filter(|h| h.healthy) {
+        let usage = usage_by_host.get(&host.id).unwrap_or(&empty);
+        let avail = Available::from(host, usage, cpu_overcommit_ratio);
+        if !avail.fits(req) {
             continue;
         }
 
         let inventory: Vec<GpuInfo> = parse_owned_json(&host.gpu_inventory, "hosts.gpu_inventory");
-
-        let assigned_pci: Vec<String> = vms
-            .iter()
-            .flat_map(|vm| {
-                let devs: Vec<GpuInfo> =
-                    parse_owned_json(&vm.gpu_assignments, "vms.gpu_assignments");
-                devs.into_iter().map(|g| g.pci_address)
-            })
-            .collect();
-
-        let available_gpus: Vec<GpuInfo> = inventory
+        let free_gpus: Vec<GpuInfo> = inventory
             .into_iter()
-            .filter(|g| !assigned_pci.contains(&g.pci_address))
+            .filter(|g| !usage.assigned_pci.contains(&g.pci_address))
             .collect();
 
-        if req.gpus > 0 {
-            if (available_gpus.len() as u32) < req.gpus {
-                continue;
-            }
-
-            let (score, selected) =
-                gpu_topology_score(&available_gpus, req.gpus, req.min_group_size);
+        let (score, selected) = if req.gpus > 0 {
+            let (score, selected) = gpu_topology_score(&free_gpus, req.gpus, req.min_group_size);
             if selected.is_empty() {
                 continue;
             }
-
-            candidates.push((host, score, selected, cap));
+            (score, selected)
         } else {
-            candidates.push((host, 0, Vec::new(), cap));
-        }
+            (0, Vec::new())
+        };
+
+        candidates.push((host, score, selected, avail));
     }
 
-    if candidates.is_empty() {
-        return Err(SchedulerError::NoCapacity(format!(
-            "cpu={}, mem={}MiB, disk={}GiB, gpus={}",
-            req.cpu, req.memory_mib, req.disk_gib, req.gpus
-        )));
-    }
-
-    // Sort: highest GPU topology score first, then best-fit bin-packing (least remaining capacity)
-    candidates.sort_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| {
-            let rem_a = remaining_after_place(a.3, req);
-            let rem_b = remaining_after_place(b.3, req);
-            rem_a.cmp(&rem_b)
+    let (host, _score, selected, _) = candidates
+        .into_iter()
+        // Highest GPU-topology score first, then best-fit bin-packing.
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.3.remaining_after(req).cmp(&a.3.remaining_after(req)))
         })
-    });
+        .ok_or_else(|| {
+            SchedulerError::NoCapacity(format!(
+                "cpu={}, mem={}MiB, disk={}GiB, gpus={}",
+                req.cpu, req.memory_mib, req.disk_gib, req.gpus
+            ))
+        })?;
 
-    let (host, _score, selected_gpus, _) = &candidates[0];
-    let gpu_devices: Vec<GpuDevice> = selected_gpus
-        .iter()
-        .map(|g| GpuDevice {
-            pci_address: g.pci_address.clone(),
-            model: g.model.clone(),
-            iommu_group: g.iommu_group.clone(),
-            nvlink_group: g.nvlink_group,
-        })
-        .collect();
-
-    Ok((host.id.clone(), gpu_devices))
-}
-
-fn remaining_after_place(cap: HostCapacity, req: &ScheduleRequest) -> u64 {
-    let cpu_rem = cap.available_cpu.saturating_sub(req.cpu) as u64;
-    let mem_rem = cap.available_memory_mib.saturating_sub(req.memory_mib) as u64;
-    cpu_rem + mem_rem
+    Ok((host.id.clone(), selected))
 }
 
 /// Score GPU topology and return the selected GPUs.
@@ -267,40 +231,22 @@ mod tests {
         }
     }
 
-    /// Build a VM that consumes `(cpu, mem, disk)` with the given PCI
-    /// addresses already bound to it. Only the fields the scheduler reads
-    /// are populated. `disk` is the rootfs size; use [`vm_on_with_extras`]
-    /// if the test needs to add extra data disks.
-    fn vm_on(host_id: &str, cpu: i64, mem: i64, disk: i64, gpus: &[GpuInfo]) -> VmRow {
-        vm_on_with_extras(host_id, cpu, mem, disk, &[], gpus)
+    /// Summarize one host's consumed capacity — the shape
+    /// `Db::host_usage_snapshot` hands to `schedule`. `disk` here is
+    /// the total footprint (rootfs + extras); there's no separate
+    /// "extras" knob because the scheduler only ever looks at the sum.
+    fn usage(cpu: i64, mem: i64, disk: i64, gpus: &[GpuInfo]) -> HostUsage {
+        HostUsage {
+            used_cpu: cpu,
+            used_memory_mib: mem,
+            used_disk_gib: disk,
+            assigned_pci: gpus.iter().map(|g| g.pci_address.clone()).collect(),
+        }
     }
 
-    fn vm_on_with_extras(
-        host_id: &str,
-        cpu: i64,
-        mem: i64,
-        disk: i64,
-        extra_disk_gibs: &[u32],
-        gpus: &[GpuInfo],
-    ) -> VmRow {
-        VmRow {
-            id: format!("vm-{host_id}"),
-            name: "test".to_string(),
-            cluster_id: "c1".to_string(),
-            host_id: host_id.to_string(),
-            ip_address: "10.0.0.1".to_string(),
-            edge_ip: None,
-            state: 2,
-            cpu,
-            memory_mib: mem,
-            disk_gib: disk,
-            gpu_assignments: serde_json::to_string(gpus).unwrap(),
-            extra_disk_gibs: serde_json::to_string(extra_disk_gibs).unwrap(),
-            image: String::new(),
-            error_message: String::new(),
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-            updated_at: "2025-01-01T00:00:00Z".to_string(),
-        }
+    /// Handy shorthand so test bodies read like "empty fleet".
+    fn empty() -> HashMap<String, HostUsage> {
+        HashMap::new()
     }
 
     #[test]
@@ -309,8 +255,7 @@ mod tests {
             make_host("h1", 8, 16384, 500, &[]),
             make_host("h2", 4, 8192, 200, &[]),
         ];
-        let vms = HashMap::new();
-        let (host_id, gpus) = schedule(&hosts, &vms, &basic_req(0, 0), STRICT).unwrap();
+        let (host_id, gpus) = schedule(&hosts, &empty(), &basic_req(0, 0), STRICT).unwrap();
         // h2 is a tighter fit (best-fit bin-packing prefers closest to full)
         assert_eq!(host_id, "h2");
         assert!(gpus.is_empty());
@@ -319,7 +264,6 @@ mod tests {
     #[test]
     fn test_schedule_no_capacity() {
         let hosts = vec![make_host("h1", 2, 4096, 50, &[])];
-        let vms = HashMap::new();
         let req = ScheduleRequest {
             cpu: 8,
             memory_mib: 16384,
@@ -327,15 +271,14 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-        assert!(schedule(&hosts, &vms, &req, STRICT).is_err());
+        assert!(schedule(&hosts, &empty(), &req, STRICT).is_err());
     }
 
     #[test]
     fn test_schedule_with_gpus() {
         let gpus = vec![gpu("0000:41:00.0", 1), gpu("0000:42:00.0", 1)];
         let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
-        let vms = HashMap::new();
-        let (host_id, selected) = schedule(&hosts, &vms, &basic_req(2, 2), STRICT).unwrap();
+        let (host_id, selected) = schedule(&hosts, &empty(), &basic_req(2, 2), STRICT).unwrap();
         assert_eq!(host_id, "h1");
         assert_eq!(selected.len(), 2);
     }
@@ -347,9 +290,7 @@ mod tests {
             make_host("h2", 16, 65536, 1000, &[]),
         ];
         hosts[0].healthy = false;
-
-        let vms = HashMap::new();
-        let (host_id, _) = schedule(&hosts, &vms, &basic_req(0, 0), STRICT).unwrap();
+        let (host_id, _) = schedule(&hosts, &empty(), &basic_req(0, 0), STRICT).unwrap();
         assert_eq!(host_id, "h2");
     }
 
@@ -357,15 +298,11 @@ mod tests {
     fn test_schedule_all_unhealthy_returns_error() {
         let mut hosts = vec![make_host("h1", 16, 65536, 1000, &[])];
         hosts[0].healthy = false;
-
-        let vms = HashMap::new();
-        assert!(schedule(&hosts, &vms, &basic_req(0, 0), STRICT).is_err());
+        assert!(schedule(&hosts, &empty(), &basic_req(0, 0), STRICT).is_err());
     }
 
     #[test]
     fn test_schedule_empty_hosts_returns_error() {
-        let hosts = vec![];
-        let vms = HashMap::new();
         let req = ScheduleRequest {
             cpu: 1,
             memory_mib: 1024,
@@ -373,7 +310,7 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-        assert!(schedule(&hosts, &vms, &req, STRICT).is_err());
+        assert!(schedule(&[], &empty(), &req, STRICT).is_err());
     }
 
     #[test]
@@ -383,8 +320,7 @@ mod tests {
             make_host("medium", 16, 32768, 500, &[]),
             make_host("small", 8, 16384, 200, &[]),
         ];
-        let vms = HashMap::new();
-        let (host_id, _) = schedule(&hosts, &vms, &basic_req(0, 0), STRICT).unwrap();
+        let (host_id, _) = schedule(&hosts, &empty(), &basic_req(0, 0), STRICT).unwrap();
         assert_eq!(host_id, "small");
     }
 
@@ -394,27 +330,23 @@ mod tests {
             make_host("h1", 16, 65536, 50, &[]),
             make_host("h2", 16, 65536, 200, &[]),
         ];
-        let vms = HashMap::new();
-        let (host_id, _) = schedule(&hosts, &vms, &basic_req(0, 0), STRICT).unwrap();
+        let (host_id, _) = schedule(&hosts, &empty(), &basic_req(0, 0), STRICT).unwrap();
         assert_eq!(host_id, "h2");
     }
 
-    /// A VM already occupying a host charges *total* disk — rootfs
-    /// plus every extra data disk — against the host's free capacity.
-    /// Without this, a ceph-heavy VM with 1 TiB of extras looks like
-    /// its 100 GiB rootfs to the scheduler and the next placement
-    /// silently oversubscribes the thin pool into ENOSPC.
+    /// A VM already on a host charges *total* disk — rootfs plus every
+    /// extra data disk — against free capacity. Without this, a
+    /// ceph-heavy VM with 1 TiB of extras looks like its 100 GiB rootfs
+    /// to the scheduler and the next placement silently oversubscribes
+    /// the thin pool into ENOSPC. The `HostUsage` rollup coming out
+    /// of `Db::host_usage_snapshot` already sums extras for us.
     #[test]
     fn test_schedule_charges_extra_disks_against_host() {
-        // 500 GiB host, one VM already on it consuming 100 GiB rootfs
-        // + 300 GiB across two extras. Remaining: 100 GiB. A 150 GiB
-        // rootfs request must be rejected.
+        // 500 GiB host, 400 GiB already in use (100 rootfs + 300 extras).
+        // A 150 GiB request must be rejected.
         let hosts = vec![make_host("h1", 64, 262144, 500, &[])];
-        let mut vms_by_host = HashMap::new();
-        vms_by_host.insert(
-            "h1".to_string(),
-            vec![vm_on_with_extras("h1", 4, 8192, 100, &[100, 200], &[])],
-        );
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h1".to_string(), usage(4, 8192, 400, &[]));
         let req = ScheduleRequest {
             cpu: 4,
             memory_mib: 8192,
@@ -422,7 +354,7 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-        assert!(schedule(&hosts, &vms_by_host, &req, STRICT).is_err());
+        assert!(schedule(&hosts, &usage_by_host, &req, STRICT).is_err());
     }
 
     /// A request's extra disks count against the host just like the
@@ -444,7 +376,6 @@ mod tests {
                 basis_proto::ExtraDisk { size_gib: 400 },
                 basis_proto::ExtraDisk { size_gib: 100 },
             ],
-            edge: false,
         };
         let sched_req: ScheduleRequest = (&req).into();
         assert_eq!(sched_req.disk_gib, 600);
@@ -454,8 +385,7 @@ mod tests {
     fn test_schedule_gpu_not_enough_available() {
         let gpus = vec![gpu("0000:41:00.0", 1)];
         let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
-        let vms = HashMap::new();
-        assert!(schedule(&hosts, &vms, &basic_req(2, 0), STRICT).is_err());
+        assert!(schedule(&hosts, &empty(), &basic_req(2, 0), STRICT).is_err());
     }
 
     #[test]
@@ -469,8 +399,7 @@ mod tests {
             gpu("0000:82:00.0", 2),
         ];
         let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
-        let vms = HashMap::new();
-        let (_, selected) = schedule(&hosts, &vms, &basic_req(2, 0), STRICT).unwrap();
+        let (_, selected) = schedule(&hosts, &empty(), &basic_req(2, 0), STRICT).unwrap();
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].nvlink_group, selected[1].nvlink_group);
     }
@@ -486,8 +415,7 @@ mod tests {
             gpu("0000:82:00.0", 2),
         ];
         let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
-        let vms = HashMap::new();
-        assert!(schedule(&hosts, &vms, &basic_req(4, 4), STRICT).is_err());
+        assert!(schedule(&hosts, &empty(), &basic_req(4, 4), STRICT).is_err());
     }
 
     #[test]
@@ -501,8 +429,7 @@ mod tests {
             gpu("0000:82:00.0", 0),
         ];
         let hosts = vec![make_host("h1", 32, 131072, 2000, &gpus)];
-        let vms = HashMap::new();
-        assert!(schedule(&hosts, &vms, &basic_req(2, 2), STRICT).is_err());
+        assert!(schedule(&hosts, &empty(), &basic_req(2, 2), STRICT).is_err());
     }
 
     #[test]
@@ -511,17 +438,18 @@ mod tests {
         let hosts = vec![make_host("h1", 16, 65536, 1000, &all_gpus)];
 
         // One VM on h1 already holds 0000:41:00.0.
-        let mut vms = HashMap::new();
-        vms.insert(
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert(
             "h1".to_string(),
-            vec![vm_on("h1", 2, 2048, 10, &[gpu("0000:41:00.0", 1)])],
+            usage(2, 2048, 10, &[gpu("0000:41:00.0", 1)]),
         );
 
         // 2 GPUs requested, only 1 free — should fail
-        assert!(schedule(&hosts, &vms, &basic_req(2, 0), STRICT).is_err());
+        assert!(schedule(&hosts, &usage_by_host, &basic_req(2, 0), STRICT).is_err());
 
         // 1 GPU request should pick the free one
-        let (host_id, selected) = schedule(&hosts, &vms, &basic_req(1, 0), STRICT).unwrap();
+        let (host_id, selected) =
+            schedule(&hosts, &usage_by_host, &basic_req(1, 0), STRICT).unwrap();
         assert_eq!(host_id, "h1");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].pci_address, "0000:42:00.0");
@@ -531,9 +459,9 @@ mod tests {
     fn test_schedule_subtracts_vm_allocations_from_capacity() {
         // h1 has 16 vCPU, a 14-vCPU VM is on it. A request for 4 vCPU must fail.
         let hosts = vec![make_host("h1", 16, 65536, 1000, &[])];
-        let mut vms = HashMap::new();
-        vms.insert("h1".to_string(), vec![vm_on("h1", 14, 8192, 50, &[])]);
-        assert!(schedule(&hosts, &vms, &basic_req(0, 0), STRICT).is_err()); // basic_req needs 4 cpu
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h1".to_string(), usage(14, 8192, 50, &[]));
+        assert!(schedule(&hosts, &usage_by_host, &basic_req(0, 0), STRICT).is_err());
     }
 
     #[test]
@@ -547,8 +475,7 @@ mod tests {
             make_host("spread", 16, 65536, 1000, &gpus_spread),
             make_host("together", 16, 65536, 1000, &gpus_together),
         ];
-        let vms = HashMap::new();
-        let (host_id, selected) = schedule(&hosts, &vms, &basic_req(2, 0), STRICT).unwrap();
+        let (host_id, selected) = schedule(&hosts, &empty(), &basic_req(2, 0), STRICT).unwrap();
         assert_eq!(host_id, "together");
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].nvlink_group, selected[1].nvlink_group);
@@ -559,8 +486,8 @@ mod tests {
         // 16-CPU host, one 16-vCPU VM already assigned. A second 16-vCPU
         // request fails at 1.0 but succeeds at 2.0.
         let hosts = vec![make_host("h1", 16, 65536, 1000, &[])];
-        let mut vms = HashMap::new();
-        vms.insert("h1".to_string(), vec![vm_on("h1", 16, 8192, 50, &[])]);
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h1".to_string(), usage(16, 8192, 50, &[]));
         let req = ScheduleRequest {
             cpu: 16,
             memory_mib: 8192,
@@ -568,8 +495,8 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-        assert!(schedule(&hosts, &vms, &req, 1.0).is_err());
-        let (host_id, _) = schedule(&hosts, &vms, &req, 2.0).unwrap();
+        assert!(schedule(&hosts, &usage_by_host, &req, 1.0).is_err());
+        let (host_id, _) = schedule(&hosts, &usage_by_host, &req, 2.0).unwrap();
         assert_eq!(host_id, "h1");
     }
 
@@ -578,8 +505,8 @@ mod tests {
         // A host whose memory is exactly consumed must refuse another VM
         // even at a very generous CPU overcommit ratio — memory is strict.
         let hosts = vec![make_host("h1", 16, 8192, 1000, &[])];
-        let mut vms = HashMap::new();
-        vms.insert("h1".to_string(), vec![vm_on("h1", 2, 8192, 10, &[])]);
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h1".to_string(), usage(2, 8192, 10, &[]));
         let req = ScheduleRequest {
             cpu: 2,
             memory_mib: 1024,
@@ -587,23 +514,20 @@ mod tests {
             gpus: 0,
             min_group_size: 0,
         };
-        assert!(schedule(&hosts, &vms, &req, 8.0).is_err());
+        assert!(schedule(&hosts, &usage_by_host, &req, 8.0).is_err());
 
         // Same shape but disk over-subscribed: also refused regardless of CPU ratio.
         let hosts = vec![make_host("h2", 16, 65536, 50, &[])];
-        let mut vms = HashMap::new();
-        vms.insert("h2".to_string(), vec![vm_on("h2", 2, 2048, 50, &[])]);
-        assert!(schedule(&hosts, &vms, &req, 8.0).is_err());
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h2".to_string(), usage(2, 2048, 50, &[]));
+        assert!(schedule(&hosts, &usage_by_host, &req, 8.0).is_err());
     }
 
     #[test]
     fn test_overcommit_ratio_one_preserves_strict_behavior() {
-        // Same shape as test_schedule_subtracts_vm_allocations_from_capacity,
-        // pinned at 1.0 to prove overcommit off is identical to old behavior.
         let hosts = vec![make_host("h1", 16, 65536, 1000, &[])];
-        let mut vms = HashMap::new();
-        vms.insert("h1".to_string(), vec![vm_on("h1", 14, 8192, 50, &[])]);
-        // basic_req wants 4 vCPU; 16 - 14 = 2 available → must fail.
-        assert!(schedule(&hosts, &vms, &basic_req(0, 0), 1.0).is_err());
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h1".to_string(), usage(14, 8192, 50, &[]));
+        assert!(schedule(&hosts, &usage_by_host, &basic_req(0, 0), 1.0).is_err());
     }
 }

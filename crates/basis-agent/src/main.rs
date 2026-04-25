@@ -11,7 +11,7 @@ use basis_agent::host_info::HostResources;
 use basis_agent::image::ImageManager;
 use basis_agent::lvm;
 use basis_agent::metrics::{self, Metrics};
-use basis_agent::network::{NetworkManager, TreeManager, UplinkBridge};
+use basis_agent::network::{probe_uplink, NetworkManager, TreeManager, UplinkBridge};
 use basis_agent::reconcile;
 use basis_agent::vm::VmManager;
 use basis_common::gpu::GpuInfo;
@@ -64,6 +64,10 @@ struct AgentRuntime {
     metrics: Arc<Metrics>,
     host_resources: HostResources,
     gpus: Vec<GpuInfo>,
+    /// Probed once at startup and reported on every RegisterHost so
+    /// the controller can add this host to the VTEP peer list of any
+    /// tree it hosts.
+    vtep_address: String,
     reconnect_signal: CancellationToken,
 }
 
@@ -104,6 +108,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Loops that outlive individual sessions — host-local state the
+    // controller isn't involved in. Spawning these inside `run_session`
+    // would leak one extra copy each time the controller stream
+    // reconnects.
+    spawn_pool_capacity_loop();
+    spawn_orphan_sweep_loop(runtime.clone());
+
     loop {
         let (endpoint, reconnect) = {
             let rt = runtime.read().await;
@@ -129,12 +140,32 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     std::fs::create_dir_all(spec.images_dir())?;
     std::fs::create_dir_all(spec.vms_dir())?;
 
-    let uplink = UplinkBridge::new(
-        spec.network.uplink_bridge.clone(),
-        spec.network.uplink_interface.clone(),
-        spec.network.uplink_mtu,
+    // Read the uplink's MTU and primary IPv4 straight out of the
+    // kernel rather than re-declaring them in host.yaml. The IP
+    // lives on the bridge when the NIC is enslaved (standard netplan
+    // setup), so we probe the bridge — that's authoritative whether
+    // the IP is on the bridge or, less commonly, still on the NIC
+    // (in which case the operator's netplan hasn't actually attached
+    // the NIC to the bridge yet and `validate_uplink` will catch it
+    // separately).
+    let probe = probe_uplink(&spec.network.bridge).await?;
+    info!(
+        bridge = %spec.network.bridge,
+        mtu = probe.mtu,
+        vtep = %probe.vtep_address,
+        "probed uplink"
     );
-    let trees = TreeManager::new(spec.network.vtep_address.clone(), spec.network.uplink_mtu);
+
+    let uplink = UplinkBridge::new(
+        spec.network.bridge.clone(),
+        spec.network.physical_nic.clone(),
+        probe.mtu,
+    );
+    let trees = TreeManager::new(
+        probe.vtep_address.clone(),
+        probe.mtu,
+        spec.network.bridge.clone(),
+    );
     let net_mgr = NetworkManager::new(uplink, trees);
 
     // Preflight everything in parallel. `try_join!` short-circuits on
@@ -208,7 +239,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         memory_mib = host_resources.total_memory_mib,
         disk_gib = host_resources.total_disk_gib,
         gpus = gpus.len(),
-        vtep = %spec.network.vtep_address,
+        vtep = %probe.vtep_address,
         "discovered host resources"
     );
 
@@ -225,6 +256,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         metrics,
         host_resources,
         gpus,
+        vtep_address: probe.vtep_address,
         reconnect_signal: CancellationToken::new(),
     })
 }
@@ -328,10 +360,13 @@ async fn run_session(
         handlers::report_local_vm_states(&rt.agent_db, &rt.vm_mgr, &msg_tx).await?;
     }
 
+    // Session-scoped loops: tied to `msg_tx`, exit naturally when the
+    // channel closes on session teardown (heartbeat and periodic
+    // reconciler both break on `ChannelClosed`). Agent-lifetime loops
+    // (pool capacity, orphan sweep) are spawned once from `run` —
+    // spawning them here would leak one per reconnect.
     spawn_heartbeat_loop(msg_tx.clone(), host_id.clone());
-    spawn_pool_capacity_loop();
     spawn_periodic_reconciler(msg_tx.clone(), runtime.clone());
-    spawn_orphan_sweep_loop(runtime.clone());
 
     process_inbound(&mut inbound, runtime, msg_tx, reconnect).await
 }
@@ -359,7 +394,7 @@ async fn send_register(
                 total_memory_mib: rt.host_resources.total_memory_mib,
                 total_disk_gib: rt.host_resources.total_disk_gib,
                 gpus: gpu_devices,
-                vtep_address: rt.spec.network.vtep_address.clone(),
+                vtep_address: rt.vtep_address.clone(),
             })),
         })
         .await?;
@@ -488,10 +523,13 @@ fn spawn_periodic_reconciler(
         loop {
             interval.tick().await;
             let rt = runtime.read().await;
-            if let Err(e) =
-                handlers::report_local_vm_states(&rt.agent_db, &rt.vm_mgr, &sender).await
-            {
-                warn!(error = %e, "periodic state report failed");
+            match handlers::report_local_vm_states(&rt.agent_db, &rt.vm_mgr, &sender).await {
+                Ok(()) => {}
+                // Controller stream is gone — session ended. A new
+                // session will have spawned its own reconciler;
+                // we exit so we don't leak across reconnects.
+                Err(e) if e.is::<handlers::ChannelClosed>() => break,
+                Err(e) => warn!(error = %e, "periodic state report failed"),
             }
         }
     });
@@ -527,22 +565,38 @@ async fn process_inbound(
                             disk_gib = create.disk_gib,
                             gpus = create.gpu_pci_addresses.len(),
                             vni = create.vni,
-                            edge = !create.edge_ip.is_empty(),
                             "received CreateVm"
                         );
-                        spawn_create(create, rt_snapshot, sender.clone());
+                        spawn_create(*create, rt_snapshot, sender.clone());
                     }
                     Some(controller_command::Command::DeleteVm(delete)) => {
                         info!(vm_id = %delete.vm_id, "received DeleteVm");
                         spawn_delete(delete, rt_snapshot, sender.clone());
                     }
                     Some(controller_command::Command::ReconcileHost(reconcile_cmd)) => {
-                        spawn_reconcile(reconcile_cmd, runtime.clone());
+                        spawn_reconcile(*reconcile_cmd, runtime.clone());
                     }
                     None => {}
                 }
             }
         }
+    }
+}
+
+/// If the session ended between dispatching a VM op and the op
+/// finishing, the state report has nowhere to go. The controller's
+/// next reconcile will discover the true state from
+/// `list_vms_on_host` anyway, so a dropped report here is a cosmetic
+/// delay, not a correctness issue.
+async fn send_terminal_vm_state(
+    sender: &mpsc::Sender<AgentMessage>,
+    vm_id: String,
+    state: MachineState,
+    err: String,
+    transient: bool,
+) {
+    if let Err(e) = handlers::send_vm_state(sender, vm_id.clone(), state, err, transient).await {
+        warn!(vm_id, error = %e, "dropped terminal VM state report; session already closed");
     }
 }
 
@@ -575,7 +629,7 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
                 (MachineState::Failed, e.to_string(), transient)
             }
         };
-        handlers::send_vm_state(&sender, cmd.vm_id, state, err, transient).await;
+        send_terminal_vm_state(&sender, cmd.vm_id, state, err, transient).await;
     });
 }
 
@@ -588,14 +642,11 @@ fn spawn_delete(cmd: DeleteVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
                 Ok(()) => (MachineState::Stopped, String::new(), false),
                 Err(e) => (MachineState::Failed, e.to_string(), true),
             };
-        handlers::send_vm_state(&sender, cmd.vm_id, state, err, transient).await;
+        send_terminal_vm_state(&sender, cmd.vm_id, state, err, transient).await;
     });
 }
 
-fn spawn_reconcile(
-    cmd: ReconcileHostCommand,
-    runtime: Arc<tokio::sync::RwLock<AgentRuntime>>,
-) {
+fn spawn_reconcile(cmd: ReconcileHostCommand, runtime: Arc<tokio::sync::RwLock<AgentRuntime>>) {
     tokio::spawn(async move {
         let rt = runtime.read().await;
         if let Err(e) = apply_reconcile(&rt, &cmd, PERIODIC_RECONCILE_GRACE).await {

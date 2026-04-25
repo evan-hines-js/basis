@@ -8,6 +8,7 @@
 pub mod bootstrap;
 pub mod client_cache;
 pub mod cluster;
+pub mod components;
 pub mod conditions;
 pub mod crds;
 pub mod machine;

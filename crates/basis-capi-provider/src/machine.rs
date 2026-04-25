@@ -77,6 +77,19 @@ pub enum MachineError {
     #[error("BasisCluster '{0}' has no basisClusterId yet — retrying")]
     ClusterNotReady(String),
 
+    /// We watched the BasisMachine into existence before CAPI's
+    /// Machine controller finished decorating it (OwnerReference
+    /// stamped, bootstrap-provider `dataSecretName` populated, etc).
+    /// This is the normal pre-CAPI-reconcile state — surfacing it as
+    /// `failureMessage` would propagate up to
+    /// `Machine.status.failureMessage` and let MachineDeployment
+    /// conclude the infra is broken. Treat it as transient: short
+    /// requeue, no status patch. The `&'static str` names which
+    /// field we're waiting on so the warn log + requeue log make
+    /// sense.
+    #[error("waiting for CAPI to populate {0}")]
+    WaitingForCapi(&'static str),
+
     /// Basis reported the VM is in `FAILED` state. Terminal from basis's
     /// point of view — basis does not restart VMs; recovery is replacement
     /// orchestrated by CAPI. Surfacing this as an error routes through
@@ -101,6 +114,7 @@ impl ReconcileError for MachineError {
             MachineError::Credentials(_) => "BasisCredentialsInvalid",
             MachineError::Missing(_) => "Misconfigured",
             MachineError::ClusterNotReady(_) => "ClusterNotReady",
+            MachineError::WaitingForCapi(_) => "WaitingForCAPI",
             MachineError::VmFailed(_) => "VMFailed",
         }
     }
@@ -112,15 +126,12 @@ impl ReconcileError for MachineError {
 
     fn is_transient(&self) -> bool {
         matches!(self, MachineError::Basis(e) if e.is_transient())
+            || matches!(self, MachineError::WaitingForCapi(_))
     }
 }
 
-pub async fn run(
-    client: Client,
-    clients: Arc<crate::client_cache::BasisClientCache>,
-) -> anyhow::Result<()> {
-    let api: Api<BasisMachine> = Api::all(client.clone());
-    let ctx = Arc::new(ProviderContext { client, clients });
+pub async fn run(ctx: Arc<ProviderContext>) -> anyhow::Result<()> {
+    let api: Api<BasisMachine> = Api::all(ctx.client.clone());
 
     Controller::new(api, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
@@ -214,7 +225,6 @@ async fn apply(
                 .as_ref()
                 .map(|c| c.min_group_size),
             extra_disk_gibs: machine.spec.extra_disk_gibs.clone(),
-            edge: machine.spec.edge,
         })
         .await?;
 
@@ -226,7 +236,16 @@ async fn apply(
     // itself fails (e.g. controller unreachable), the next reconcile will
     // find the ghost and either finish patching it or delete it via the
     // CAPI deletion path.
-    if let Err(e) = write_success_status(&api, &name, &created, &machine, generation).await {
+    if let Err(e) = write_success_status(
+        &api,
+        &name,
+        &created,
+        &credentials_ref,
+        &machine,
+        generation,
+    )
+    .await
+    {
         warn!(
             machine = %name,
             vm_id = %created.id,
@@ -268,9 +287,16 @@ async fn observe_vm(
                 id: vm.id.clone(),
                 provider_id: vm.provider_id.clone(),
                 ip_address: vm.ip_address.clone(),
-                edge_ip: vm.edge_ip.clone(),
             };
-            write_success_status(api, name, &created, machine, generation).await?;
+            // Steady-state: credentials_ref is already in status from
+            // the initial commit; re-carry it so `merge_status` doesn't
+            // null it out and strand the cleanup path.
+            let creds = machine
+                .status
+                .as_ref()
+                .and_then(|s| s.credentials_ref.clone())
+                .ok_or(MachineError::Missing("status.credentialsRef"))?;
+            write_success_status(api, name, &created, &creds, machine, generation).await?;
             Ok(Action::requeue(Duration::from_secs(60)))
         }
         MachineState::Failed => {
@@ -309,6 +335,7 @@ async fn write_success_status(
     api: &Api<BasisMachine>,
     name: &str,
     created: &CreatedMachine,
+    credentials_ref: &CredentialsRef,
     machine: &BasisMachine,
     generation: Option<i64>,
 ) -> Result<(), MachineError> {
@@ -322,19 +349,13 @@ async fn write_success_status(
         conditions::ready_true("VMRunning", generation),
     );
 
-    // Primary tree-side IP is the node's InternalIP; edge IP (only
-    // present on edge nodes) is exposed as ExternalIP so CAPI and
-    // downstream consumers see the uplink-side address alongside it.
-    let mut addresses = vec![MachineAddress {
+    // Tree-side IP is the node's InternalIP. Basis VMs are
+    // single-homed; LAN reachability for VIPs is provided by the
+    // host's BGP advertisement, not a per-VM uplink NIC.
+    let addresses = vec![MachineAddress {
         kind: "InternalIP".to_string(),
         address: created.ip_address.clone(),
     }];
-    if !created.edge_ip.is_empty() {
-        addresses.push(MachineAddress {
-            kind: "ExternalIP".to_string(),
-            address: created.edge_ip.clone(),
-        });
-    }
 
     merge_status(
         api,
@@ -345,6 +366,7 @@ async fn write_success_status(
                 "initialization": { "provisioned": true },
                 "providerID": created.provider_id,
                 "basisVmId": created.id,
+                "credentialsRef": credentials_ref,
                 "addresses": addresses,
                 "failureMessage": serde_json::Value::Null,
                 "conditions": conditions,
@@ -367,19 +389,29 @@ async fn cleanup(
     machine: Arc<BasisMachine>,
     ctx: Arc<ProviderContext>,
 ) -> Result<Action, MachineError> {
+    // No basis VM ever got created (apply failed before commit). There
+    // is nothing to tear down — fall through so the finalizer lifts.
     let Some(id) = machine.status.as_ref().and_then(|s| s.basis_vm_id.clone()) else {
         return Ok(Action::await_change());
     };
 
+    // `basis_vm_id` is only written alongside `credentials_ref` in
+    // `write_success_status`, so the invariant is: if we hold the id,
+    // we also hold the credentials needed to delete it. This is what
+    // makes cleanup independent of the owning `BasisCluster` — the
+    // BasisCluster can already be gone (normal cascade, racing
+    // finalizers) and cleanup still finds the basis controller on its
+    // own. Hand-stripping `status.credentialsRef` is the only way to
+    // violate this; we treat that as a hard error rather than a
+    // fallthrough so a missing reference surfaces loudly instead of
+    // silently leaking a row on basis.
+    let credentials_ref = machine
+        .status
+        .as_ref()
+        .and_then(|s| s.credentials_ref.clone())
+        .ok_or(MachineError::Missing("status.credentialsRef"))?;
+
     let namespace = namespace_of(machine.as_ref());
-    let cluster_name = machine
-        .labels()
-        .get(CLUSTER_LABEL)
-        .cloned()
-        .ok_or(MachineError::Missing("cluster-name label"))?;
-    let ClusterRef {
-        credentials_ref, ..
-    } = resolve_cluster_ref(&ctx.client, &namespace, &cluster_name).await?;
     let basis = ctx.clients.get(&credentials_ref, &namespace).await?;
 
     info!(vm_id = %id, "deleting VM in Basis controller");
@@ -391,6 +423,12 @@ async fn cleanup(
 /// `Ready=False` condition + `failureMessage`, and invalidate the
 /// cached `BasisClient` if the failure looks credential-shaped.
 ///
+/// Skipped for transient errors — those represent a normal
+/// intermediate state (e.g. `BootstrapPending` while the bootstrap
+/// provider is still generating the data secret), and writing
+/// `failureMessage` would propagate to the owning `Machine` and
+/// let MachineDeployment conclude the infra is broken.
+///
 /// Best-effort: errors here are logged but never propagated, because
 /// the original error is what we want callers to see.
 async fn on_failure(
@@ -399,6 +437,9 @@ async fn on_failure(
     namespace: &str,
     err: &MachineError,
 ) {
+    if err.is_transient() {
+        return;
+    }
     if err.is_credentials_problem() {
         // Re-resolve the cluster ref; if even that fails, there's nothing
         // sensible to invalidate.
@@ -472,12 +513,19 @@ async fn find_bootstrap_secret(
     let bm_api: Api<BasisMachine> = Api::namespaced(client.clone(), namespace);
     let bm = bm_api.get(basis_machine_name).await?;
 
+    // CAPI's Machine controller stamps the OwnerReference shortly
+    // after MachineDeployment creates this BasisMachine. Watching for
+    // the BasisMachine's creation event fires us *before* that stamp
+    // lands, so a missing owner-ref here is normal pre-CAPI-reconcile
+    // state — treat it as transient instead of stamping `failureMessage`.
     let owner = bm
         .metadata
         .owner_references
         .as_ref()
         .and_then(|refs| refs.iter().find(|r| r.kind == "Machine"))
-        .ok_or(MachineError::Missing("owning Machine OwnerReference"))?;
+        .ok_or(MachineError::WaitingForCapi(
+            "BasisMachine.metadata.ownerReferences[Machine]",
+        ))?;
 
     let machines: Api<CapiMachine> = Api::namespaced(client.clone(), namespace);
     let machine = machines.get(&owner.name).await?;
@@ -485,7 +533,7 @@ async fn find_bootstrap_secret(
         .spec
         .bootstrap
         .data_secret_name
-        .ok_or(MachineError::Missing(
+        .ok_or(MachineError::WaitingForCapi(
             "Machine.spec.bootstrap.dataSecretName",
         ))
 }
@@ -499,6 +547,10 @@ fn error_policy(
     // they don't show up as errors in operator dashboards:
     //   * ClusterNotReady — waiting for the sibling BasisCluster
     //     reconcile to stamp an id; self-resolves.
+    //   * WaitingForCapi — pre-CAPI-reconcile state for fields CAPI
+    //     populates after BasisMachine creation (OwnerReference,
+    //     `Machine.spec.bootstrap.dataSecretName`); self-resolves in
+    //     seconds.
     //   * BasisError.is_transient() — controller-side load shedding
     //     (Unavailable / DeadlineExceeded past the client's retry
     //     budget); self-resolves as the controller drains.

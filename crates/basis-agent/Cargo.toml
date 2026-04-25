@@ -33,6 +33,7 @@ sqlx.workspace = true
 humantime.workspace = true
 
 oci-client.workspace = true
+sha2.workspace = true
 
 prometheus.workspace = true
 axum.workspace = true

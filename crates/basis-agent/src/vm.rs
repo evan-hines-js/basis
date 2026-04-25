@@ -135,7 +135,6 @@ impl VmManager {
         cmd: &CreateVmCommand,
         boot: &BootArtifacts<'_>,
         primary_tap: &str,
-        edge_tap: Option<&str>,
         vfio_devices: &[String],
     ) -> Result<(), VmError> {
         let vm_dir = self.vms_dir.join(&cmd.vm_id);
@@ -150,10 +149,12 @@ impl VmManager {
         // `image.rs`'s module doc.
         //
         // `--net` takes multiple values as space-separated arguments
-        // after a single flag. The guest enumerates NICs in the order
-        // we list them; primary first → `ens3` in the guest, edge
-        // second → `ens4`. The cloud-init network config in
-        // `image::create_cloud_init_iso` relies on that ordering.
+        // after a single flag. The guest's kernel-assigned interface
+        // names (`ens3`, `ens4`, …) come from PCI slot order, which
+        // cloud-hypervisor allocates by device class. The cloud-init
+        // network-config in `image::create_cloud_init_iso` matches by
+        // MAC address (this very string) so the kernel-assigned name
+        // is irrelevant.
         let primary_mac = primary_mac(&cmd.vm_id);
         let mut ch_args = vec![
             format!("--api-socket={}", socket_path.to_string_lossy()),
@@ -169,9 +170,6 @@ impl VmManager {
             "--net".to_string(),
             format!("tap={primary_tap},mac={primary_mac}"),
         ];
-        if let Some(edge) = edge_tap {
-            ch_args.push(format!("tap={edge},mac={}", edge_mac(&cmd.vm_id)));
-        }
         ch_args.extend([
             "--serial=tty".to_string(),
             "--console=off".to_string(),
@@ -472,23 +470,16 @@ fn cloud_init_disk_spec(path: &Path) -> String {
     format!("path={}", path.to_string_lossy())
 }
 
-/// Deterministic MAC for the primary (tree-side) NIC.
-fn primary_mac(vm_id: &str) -> String {
-    deterministic_mac(vm_id, 0x00)
-}
-
-/// Deterministic MAC for the edge (uplink-side) NIC. The second-byte
-/// salt guarantees a distinct MAC from the primary so both NICs coexist
-/// on their respective broadcast domains without collision.
-fn edge_mac(vm_id: &str) -> String {
-    deterministic_mac(vm_id, 0x01)
-}
-
-fn deterministic_mac(vm_id: &str, salt: u8) -> String {
+/// Deterministic MAC for the primary (tree-side) NIC. Public so the
+/// cloud-init builder can match the netplan config to this exact NIC
+/// by MAC — guest interface names (`ens3` / `ens4` / etc) shift
+/// whenever cloud-hypervisor's PCI slot allocation changes (e.g.
+/// adding an `extra_disks` entry rearranges the virtio bus), so name-
+/// based netplan stanzas silently apply to nothing.
+pub fn primary_mac(vm_id: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     vm_id.hash(&mut hasher);
-    salt.hash(&mut hasher);
     let hash = hasher.finish();
     // 52:54:00 is the locally-administered OUI QEMU/KVM uses.
     format!(
@@ -506,24 +497,16 @@ mod tests {
     #[test]
     fn macs_are_deterministic() {
         assert_eq!(primary_mac("vm-123"), primary_mac("vm-123"));
-        assert_eq!(edge_mac("vm-123"), edge_mac("vm-123"));
     }
 
     #[test]
     fn macs_differ_across_vms() {
         assert_ne!(primary_mac("vm-1"), primary_mac("vm-2"));
-        assert_ne!(edge_mac("vm-1"), edge_mac("vm-2"));
-    }
-
-    #[test]
-    fn primary_and_edge_macs_differ_for_same_vm() {
-        assert_ne!(primary_mac("vm-1"), edge_mac("vm-1"));
     }
 
     #[test]
     fn macs_use_qemu_locally_administered_oui() {
         assert!(primary_mac("any").starts_with("52:54:00:"));
-        assert!(edge_mac("any").starts_with("52:54:00:"));
     }
 
     #[test]

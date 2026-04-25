@@ -118,6 +118,7 @@
       - iproute2            # ip(8) for bridge/tap management
       - curl                # cloud-hypervisor HTTP API
       - lvm2                # VM-disk thin pool management
+      - sshpass             # smoke-test SSHes into guests with a baked-in cloud-init password
     state: present
 
 # --- LVM thin pool for VM disks -----------------------------------------

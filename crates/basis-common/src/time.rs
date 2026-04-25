@@ -8,15 +8,6 @@ pub fn now_rfc3339() -> String {
     humantime::format_rfc3339_seconds(SystemTime::now()).to_string()
 }
 
-/// Unix epoch seconds, signed so arithmetic like `now - deleted_at`
-/// can't underflow across the epoch.
-pub fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// RFC 3339 timestamp for `Duration` ago. Used by the health checker to
 /// compute a heartbeat staleness cutoff.
 pub fn rfc3339_ago(duration: Duration) -> String {

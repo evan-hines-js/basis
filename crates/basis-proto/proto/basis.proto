@@ -36,15 +36,23 @@ message CreateClusterRequest {
   // materializes a new tree (allocates a VNI, carves a CIDR) before
   // inserting the cluster row.
   string parent_cluster_id = 2;
+  // Named pool the apiserver VIP is carved from. Empty selects the
+  // cluster's own tree vip_range (nested cluster, VIP stays inside
+  // the overlay, external access goes through a parent-cell auth
+  // proxy). Any non-empty name resolves to a pool in the
+  // controller's `network.pools[]`. Pool /32s are advertised by the
+  // host running the VIP-claiming VM via the cell's BGP reflector;
+  // VMs are single-homed on the tree NIC and don't need to be on
+  // the LAN themselves.
+  string apiserver_vip_pool = 3;
 }
 
 message CreateClusterResponse {
   string cluster_id = 1;
-  // Control-plane endpoint VIP, allocated by the controller from the
-  // tree's `vip_range` sub-range. kube-vip inside the first control-
-  // plane guest claims this address via gratuitous ARP on the tree's
-  // VXLAN. The caller records this on its `InfrastructureCluster` CR
-  // so the rest of CAPI can read it from
+  // Control-plane endpoint VIP, allocated by the controller from
+  // whichever pool the caller named in `apiserver_vip_pool` (or the
+  // tree vip_range when that field is empty). Recorded onto the
+  // caller's `InfrastructureCluster` CR; CAPI core propagates it to
   // `Cluster.spec.controlPlaneEndpoint`.
   string control_plane_endpoint = 2;
   // Tree this cluster belongs to. Root clusters materialize a new
@@ -97,11 +105,6 @@ message CreateMachineRequest {
   // handed to the guest unformatted so an in-cluster storage operator
   // (Rook/Ceph) can claim and manage them directly.
   repeated ExtraDisk extra_disks = 10;
-  // If true, the agent attaches a second NIC to the uplink bridge
-  // (outside the tree's VXLAN) and the controller allocates an IP
-  // from the global `edge_pool`. Used for Cilium BGP / EgressGateway
-  // nodes — the cluster's north/south ingress/egress boundary.
-  bool edge = 11;
 }
 
 message ExtraDisk {
@@ -113,8 +116,6 @@ message CreateMachineResponse {
   string provider_id = 2;
   string ip_address = 3;
   string host = 4;
-  // Non-empty iff the machine was created with `edge: true`.
-  string edge_ip = 5;
 }
 
 message DeleteMachineRequest {
@@ -149,9 +150,6 @@ message Machine {
   repeated MachineGPU gpus = 11;
   string error_message = 12;
   repeated ExtraDisk extra_disks = 13;
-  bool edge = 14;
-  // Set iff `edge = true`.
-  string edge_ip = 15;
 }
 
 message MachineGPU {
@@ -227,17 +225,29 @@ message RegisterHostResponse {
   ReconcileHostCommand initial_state = 2;
 }
 
-// One tree's full dataplane state: VNI, CIDR layout, and VTEP peers.
+// One tree's dataplane state the agent materialises locally.
+// `gateway_ip`/`prefix_len` are assigned to the host's own `brt<vni>`
+// so the host kernel acquires a route to the tree's CIDR via that
+// bridge — without this, a host can't reach VMs on its own tree.
 message TreeState {
-  string tree_id = 1;
-  uint32 vni = 2;
-  string cidr = 3;
-  string gateway_ip = 4;
-  uint32 prefix_len = 5;
+  uint32 vni = 1;
+  // This host's per-tree gateway IP, carved from the tree's
+  // `bridge_range`. Assigned to the local `brt<vni>`; every VM the
+  // host owns in this tree uses it as default gateway. Different
+  // hosts receive different addresses from the same range so
+  // cross-host replies routing through the gateway always land on
+  // the correct hypervisor.
+  string gateway_ip = 2;
+  uint32 prefix_len = 3;
   // VTEP addresses of every hypervisor currently carrying a VM of
-  // this tree. Learning is disabled on the VXLAN device, so this list
-  // is the FDB's BUM destination set.
-  repeated string vtep_addresses = 6;
+  // this tree. Learning is disabled on the VXLAN device, so this
+  // list is the FDB's BUM destination set.
+  repeated string vtep_addresses = 4;
+  // The tree's full CIDR (e.g. "10.0.0.0/20"). Used by the agent
+  // to install a source-scoped MASQUERADE rule so tree packets
+  // egress the uplink with the host's LAN IP — host-originated
+  // traffic is left untouched.
+  string cidr = 5;
 }
 
 // --- Agent registration ---
@@ -291,12 +301,6 @@ message CreateVMCommand {
   // `ReconcileHostCommand` — which precedes this command on the same
   // mpsc stream whenever a new tree shows up on the host.
   uint32 vni = 16;
-  // Non-empty string iff the machine was created with `edge: true`.
-  // The agent creates a second TAP on the uplink bridge with this IP
-  // and plumbs it into cloud-init as `eth1`.
-  string edge_ip = 17;
-  string edge_gateway = 18;
-  uint32 edge_prefix_len = 19;
 }
 
 message DeleteVMCommand {

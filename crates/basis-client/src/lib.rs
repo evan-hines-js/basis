@@ -94,9 +94,6 @@ pub struct CreatedMachine {
     pub id: String,
     pub provider_id: String,
     pub ip_address: String,
-    /// Second-NIC address on the uplink, iff the machine was created
-    /// with `edge: true`. Empty otherwise.
-    pub edge_ip: String,
 }
 
 /// Non-cluster inputs to `create_machine`. Decoupled from any caller's
@@ -115,9 +112,6 @@ pub struct MachineRequest {
     /// size in GiB. Order is stable and becomes the guest virtio-blk
     /// enumeration order after rootfs + cloud-init.
     pub extra_disk_gibs: Vec<u32>,
-    /// When true, request a second NIC on the uplink for this machine
-    /// — makes this a Cilium BGP / edge-ingress node.
-    pub edge: bool,
 }
 
 /// Inputs to `create_cluster`. Roots (new trees) pass
@@ -125,6 +119,14 @@ pub struct MachineRequest {
 pub struct ClusterRequest {
     pub name: String,
     pub parent_cluster_id: Option<String>,
+    /// Pool name the apiserver VIP is carved from. Empty selects the
+    /// cluster's own tree vip_range (nested cluster, kube-vip on
+    /// `ens3`, external access via parent-cell proxy). Any non-empty
+    /// name resolves to a LAN-routable pool declared in the
+    /// controller config; the caller must deploy CP VMs with
+    /// `edge: true`. Edge VMs in the cluster draw their second-NIC
+    /// IP from this same pool.
+    pub apiserver_vip_pool: String,
 }
 
 pub struct BasisClient {
@@ -222,6 +224,7 @@ impl BasisClient {
         let request = CreateClusterRequest {
             name: req.name,
             parent_cluster_id: req.parent_cluster_id.unwrap_or_default(),
+            apiserver_vip_pool: req.apiserver_vip_pool,
         };
         let resp = self
             .call(|mut c| {
@@ -291,7 +294,6 @@ impl BasisClient {
                 .into_iter()
                 .map(|size_gib| ExtraDisk { size_gib })
                 .collect(),
-            edge: req.edge,
         };
         let resp = self
             .call(|mut c| {
@@ -317,7 +319,6 @@ impl BasisClient {
             id: resp.id,
             provider_id: resp.provider_id,
             ip_address: resp.ip_address,
-            edge_ip: resp.edge_ip,
         })
     }
 

@@ -114,6 +114,7 @@ async fn apply(client: &BasisClient, file: &Path) -> Result<()> {
                     .create_cluster(basis_client::ClusterRequest {
                         name: c.metadata.name.clone(),
                         parent_cluster_id,
+                        apiserver_vip_pool: c.spec.apiserver_vip_pool.clone(),
                     })
                     .await?;
                 println!(
@@ -130,18 +131,12 @@ async fn apply(client: &BasisClient, file: &Path) -> Result<()> {
                 let mut req = m.spec.to_request(&m.metadata.name, file)?;
                 req.cluster_id = cluster_id;
                 let created = client.create_machine(req).await?;
-                let edge_suffix = if created.edge_ip.is_empty() {
-                    String::new()
-                } else {
-                    format!("  edge_ip={}", created.edge_ip)
-                };
                 println!(
-                    "machine  {name:30}  id={id}  ip={ip}  provider={pid}{edge}",
+                    "machine  {name:30}  id={id}  ip={ip}  provider={pid}",
                     name = m.metadata.name,
                     id = created.id,
                     ip = created.ip_address,
                     pid = created.provider_id,
-                    edge = edge_suffix,
                 );
             }
         }

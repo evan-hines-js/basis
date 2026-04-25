@@ -84,6 +84,9 @@ x509-parser = "0.18"
 # OCI registry client (basis-agent pulls VM disk images as OCI artifacts)
 oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"] }
 
+# Integrity check for OCI layers (basis-agent verifies manifest digests)
+sha2 = "0.10"
+
 # Test-only: self-signed cert generation
 rcgen = "0.13"
 
