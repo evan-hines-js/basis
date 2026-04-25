@@ -413,6 +413,8 @@ dependencies = [
 name = "basis-common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "basis-proto",
  "humantime",
  "rcgen",
  "serde",
@@ -422,6 +424,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tonic",
+ "tracing",
  "x509-parser",
 ]
 

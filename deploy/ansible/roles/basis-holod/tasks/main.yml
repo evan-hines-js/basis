@@ -1,0 +1,124 @@
+---
+# holod — pure-Rust routing daemon (https://github.com/holo-routing/holo)
+# that basis-controller drives via gRPC for the cell BGP route
+# reflector. holod runs as its own systemd service so its lifecycle
+# is independent of basis: a controller restart must not drop BGP
+# sessions, otherwise every cluster's apiserver VIP flaps for the
+# duration of the bounce.
+#
+# Pinned to a tagged release so the YANG-northbound JSON shape basis
+# pushes stays stable across upgrades. Bumping holo_version requires
+# re-validating basis-controller's bgp module against the new schema.
+
+- name: Build holod on the control node (idempotent across hosts)
+  delegate_to: localhost
+  become: false
+  run_once: true
+  block:
+    - name: Check whether the control node already has the right holod build
+      ansible.builtin.command: "{{ holo_build_dir }}/bin/holod --version"
+      register: _holod_local_version
+      failed_when: false
+      changed_when: false
+      check_mode: false
+
+    - name: cargo install holod into the control-node staging dir
+      # `--root` puts the binary at $root/bin/holod. We pin to a tag
+      # and use --locked so the build is fully reproducible across
+      # control nodes. CARGO_TARGET_DIR keeps build artifacts off
+      # the playbook tree. Requires `libyang-dev` (yang4 binding) +
+      # `cargo` on the control node — both are standard dev deps and
+      # not enforced here so the failure mode points at the missing
+      # package directly.
+      ansible.builtin.command:
+        cmd: >-
+          cargo install --git https://github.com/holo-routing/holo.git
+          --tag {{ holo_version }}
+          --root {{ holo_build_dir }}
+          --bin holod
+          --locked
+          --force
+          holo-daemon
+      environment:
+        CARGO_TARGET_DIR: "{{ holo_build_dir }}/target"
+      when:
+        - _holod_local_version.rc != 0
+          or holo_version not in (_holod_local_version.stdout | default(''))
+
+- name: Install holod runtime deps + nftables (BGP source-IP ACL)
+  ansible.builtin.package:
+    name:
+      # holod links libyang at runtime — the cargo build statically
+      # links the yang4 bindings but the underlying libyang shared
+      # library is a runtime dependency.
+      - libyang2
+      # basis-controller's ACL reconciler shells out to `nft` to
+      # rewrite the BGP source-IP allowlist on every host-set change.
+      - nftables
+    state: present
+
+- name: Ensure holo system user exists
+  ansible.builtin.user:
+    name: holo
+    system: yes
+    home: /var/opt/holo
+    shell: /usr/sbin/nologin
+    create_home: yes
+    state: present
+
+- name: Ensure holo runtime dirs exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /etc/holo, owner: root, group: root, mode: "0755" }
+    - { path: /var/opt/holo, owner: holo, group: holo, mode: "0755" }
+    - { path: /var/log/holo, owner: holo, group: holo, mode: "0755" }
+
+- name: Copy holod binary
+  ansible.builtin.copy:
+    src: "{{ holo_build_dir }}/bin/holod"
+    dest: /usr/local/bin/holod
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart holod
+
+- name: Render holod.toml
+  ansible.builtin.template:
+    src: holod.toml.j2
+    dest: /etc/holo/holod.toml
+    owner: root
+    group: holo
+    mode: "0640"
+  notify: Restart holod
+
+- name: Install holod.service unit
+  ansible.builtin.template:
+    src: holod.service.j2
+    dest: /etc/systemd/system/holod.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart holod
+
+- name: Enable + start holod
+  ansible.builtin.systemd:
+    name: holod
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Wait for holod gRPC to accept connections
+  # holod binds the gRPC plugin a few hundred ms after startup. Block
+  # until it's accepting so basis-controller's first connect attempt
+  # doesn't race the daemon's boot sequence.
+  ansible.builtin.wait_for:
+    host: "{{ holo_grpc_host }}"
+    port: "{{ holo_grpc_port }}"
+    timeout: 30

@@ -450,10 +450,7 @@ impl ImageManager {
             format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n"),
         )?;
 
-        std::fs::write(
-            cidata_dir.join("network-config"),
-            network_config(primary),
-        )?;
+        std::fs::write(cidata_dir.join("network-config"), network_config(primary))?;
 
         let iso_path = vm_dir.join("cidata.iso");
         // Use the tool resolved at startup (see `validate_tools`). No

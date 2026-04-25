@@ -47,7 +47,6 @@ pub enum DbError {
     Malformed(String),
 }
 
-
 #[derive(Debug, Clone)]
 pub struct Db {
     /// Read-only pool. Multiple connections so independent read RPCs +
@@ -751,6 +750,17 @@ impl Db {
             .fetch_one(&self.reader)
             .await?;
         Ok(n)
+    }
+
+    /// Every cluster in the given tree. Used by the reconcile-command
+    /// builder to enumerate per-tree VIPs that hosts should advertise.
+    pub async fn list_clusters_in_tree(&self, tree_id: &str) -> Result<Vec<ClusterRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters WHERE tree_id = ?")
+                .bind(tree_id)
+                .fetch_all(&self.reader)
+                .await?,
+        )
     }
 
     // --- Hosts ---

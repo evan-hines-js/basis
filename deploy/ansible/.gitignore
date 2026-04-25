@@ -2,3 +2,7 @@
 # lives here — never commit it.
 pki/
 inventory.ini
+
+# Control-node staging dir for `cargo install holo-daemon` (basis-holod
+# role). ~10s of MB of build artifacts; rebuilt on demand.
+build/

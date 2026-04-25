@@ -118,6 +118,7 @@ impl TreeManager {
             prefix_len: 0,
             vtep_addresses: Vec::new(),
             cidr: String::new(),
+            cluster_vips: Vec::new(),
         })
         .await?;
         self.live.lock().await.entry(vni).or_insert(None);

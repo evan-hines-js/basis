@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use basis_agent::bgp::{Speaker, SpeakerConfig};
 use basis_agent::config::{self, Host, HostSpec};
 use basis_agent::db::AgentDb;
 use basis_agent::gpu;
@@ -69,6 +70,11 @@ struct AgentRuntime {
     /// tree it hosts.
     vtep_address: String,
     reconnect_signal: CancellationToken,
+    /// Lazily started in `handshake` once the controller's first
+    /// `RegisterAck` provides the cell ASN + reflector address.
+    /// Stays put across reconnects — re-pushing the same config to
+    /// holod on every handshake would be a no-op transaction.
+    bgp_speaker: Option<Speaker>,
 }
 
 #[tokio::main]
@@ -258,6 +264,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         gpus,
         vtep_address: probe.vtep_address,
         reconnect_signal: CancellationToken::new(),
+        bgp_speaker: None,
     })
 }
 
@@ -416,23 +423,58 @@ async fn handshake(
     };
 
     info!(host_id = %ack.host_id, "received registration ack");
-    let rt = runtime.read().await;
-    rt.agent_db.set_host_id(&ack.host_id).await?;
+    let host_id = ack.host_id.clone();
+    let bgp_asn = ack.bgp_asn;
+    let bgp_reflector = ack.bgp_reflector_address.clone();
+    let initial = ack.initial_state;
 
-    // The controller's initial state covers both the authoritative
-    // VM list AND the authoritative tree list. Apply both through
-    // the same path we use for ongoing reconciles.
-    if let Some(initial) = ack.initial_state {
-        apply_reconcile(&rt, &initial, Duration::ZERO).await?;
+    // Apply tree + VM reconcile and persist the host id while we
+    // hold the read guard.
+    {
+        let rt = runtime.read().await;
+        rt.agent_db.set_host_id(&host_id).await?;
+        if let Some(initial) = initial {
+            apply_reconcile(&rt, &initial, Duration::ZERO).await?;
+        }
     }
 
-    Ok(ack.host_id)
+    // Bring up the host BGP speaker against local holod, peering
+    // with the cell reflector. holod runs as its own systemd service
+    // — basis-agent restarts don't drop the session. Idempotent at
+    // holod's level: re-pushing the same config on reconnect is a
+    // no-op transaction.
+    {
+        let mut rt = runtime.write().await;
+        if rt.bgp_speaker.is_none() {
+            let router_id = parse_ipv4(&rt.vtep_address, "vtep_address")?;
+            let reflector = parse_ipv4(&bgp_reflector, "bgp_reflector_address")?;
+            let speaker = Speaker::start(SpeakerConfig {
+                asn: bgp_asn,
+                router_id,
+                reflector_address: reflector,
+                holod_endpoint: rt.spec.holod_endpoint.clone(),
+                instance_name: "basis".to_string(),
+            })
+            .await
+            .context("starting BGP speaker against local holod")?;
+            rt.bgp_speaker = Some(speaker);
+        }
+    }
+
+    Ok(host_id)
+}
+
+fn parse_ipv4(s: &str, field: &str) -> anyhow::Result<std::net::Ipv4Addr> {
+    s.parse()
+        .with_context(|| format!("{field} '{s}' is not a valid IPv4 address"))
 }
 
 /// Apply a `ReconcileHostCommand`: build/tear-down tree bridges to
-/// match the command's `trees`, then delete VMs absent from
-/// `expected_vm_ids`. Single path used by the handshake ack, periodic
-/// pushes, and ad-hoc broadcasts.
+/// match the command's `trees`, delete VMs absent from
+/// `expected_vm_ids`, and refresh the BGP advertised prefix set so
+/// the cell knows which tree CIDRs route through this host. Single
+/// path used by the handshake ack, periodic pushes, and ad-hoc
+/// broadcasts.
 async fn apply_reconcile(
     rt: &AgentRuntime,
     cmd: &ReconcileHostCommand,
@@ -446,7 +488,32 @@ async fn apply_reconcile(
         &rt.agent_db,
         vm_delete_grace,
     )
-    .await
+    .await?;
+    if let Some(speaker) = rt.bgp_speaker.as_ref() {
+        let mut prefixes: Vec<ipnet::Ipv4Net> = Vec::new();
+        for tree in &cmd.trees {
+            match tree.cidr.parse::<ipnet::Ipv4Net>() {
+                Ok(p) => prefixes.push(p),
+                Err(_) => warn!(
+                    cidr = %tree.cidr, vni = tree.vni,
+                    "BGP advertise: tree cidr unparseable, skipping"
+                ),
+            }
+            for vip in &tree.cluster_vips {
+                match vip.parse::<ipnet::Ipv4Net>() {
+                    Ok(p) => prefixes.push(p),
+                    Err(_) => warn!(
+                        vip = %vip, vni = tree.vni,
+                        "BGP advertise: cluster_vip unparseable, skipping"
+                    ),
+                }
+            }
+        }
+        if let Err(e) = speaker.update_routes(&prefixes).await {
+            warn!(error = %e, "BGP advertise: update_routes failed");
+        }
+    }
+    Ok(())
 }
 
 fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>, host_id: String) {

@@ -72,6 +72,10 @@ pub struct BasisControllerSpec {
     /// below 1.0 or non-finite are rejected by [`Self::validate`].
     #[serde(default = "default_cpu_overcommit_ratio")]
     pub cpu_overcommit_ratio: f32,
+    /// Cell BGP route reflector. basis-controller doesn't speak BGP
+    /// itself — `holod` runs as a sibling systemd service on the
+    /// same host and basis pushes config to it via gRPC.
+    pub bgp: BgpConfig,
 }
 
 fn default_metrics_listen() -> String {
@@ -84,6 +88,34 @@ fn default_dns_servers() -> Vec<String> {
 
 fn default_cpu_overcommit_ratio() -> f32 {
     4.0
+}
+
+/// BGP reflector configuration. Mapped 1:1 onto
+/// [`crate::bgp::ReflectorConfig`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BgpConfig {
+    /// Cell ASN (every speaker in the cell uses this — sessions are iBGP).
+    pub asn: u32,
+    /// BGP router-id. Use the controller's underlay LAN IP.
+    pub router_id: String,
+    /// gRPC endpoint of the local holod, e.g. `http://127.0.0.1:50051`.
+    /// Defaults to holod's upstream default; override only if you've
+    /// rebound holod's gRPC plugin.
+    #[serde(default = "default_holod_endpoint")]
+    pub holod_endpoint: String,
+    /// Logical name basis registers the BGP instance under. Surfaces
+    /// in `holod`'s `Get` state for debugging.
+    #[serde(default = "default_bgp_instance_name")]
+    pub instance_name: String,
+}
+
+fn default_holod_endpoint() -> String {
+    "http://127.0.0.1:50051".to_string()
+}
+
+fn default_bgp_instance_name() -> String {
+    "basis".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -186,7 +218,30 @@ impl BasisControllerSpec {
             );
         }
         self.network.validate()?;
+        self.bgp.validate()?;
         Ok(())
+    }
+}
+
+impl BgpConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.asn == 0 {
+            anyhow::bail!("bgp.asn must be non-zero");
+        }
+        let _: Ipv4Addr = self
+            .router_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("bgp.routerId '{}' invalid: {e}", self.router_id))?;
+        if self.instance_name.is_empty() {
+            anyhow::bail!("bgp.instanceName must not be empty");
+        }
+        Ok(())
+    }
+
+    pub fn router_id_ipv4(&self) -> Ipv4Addr {
+        self.router_id
+            .parse()
+            .expect("BgpConfig::validate guarantees router_id parses")
     }
 }
 
@@ -354,6 +409,9 @@ spec:
         gateway: 192.168.100.1
         rangeStart: 192.168.100.20
         rangeEnd: 192.168.100.250
+  bgp:
+    asn: 64500
+    routerId: 10.0.0.1
 "#
         .to_string()
     }

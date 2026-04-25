@@ -1,0 +1,38 @@
+# Managed by ansible (basis-holod role).
+#
+# holod runs as the cell BGP daemon — basis-controller and basis-agent
+# push config via the gRPC northbound. Only the gRPC plugin is enabled;
+# gNMI is off because nothing speaks it in basis today.
+
+user = "holo"
+group = "holo"
+database_path = "/var/opt/holo/holo.db"
+
+[logging.journald]
+enabled = true
+
+[logging.file]
+enabled = false
+
+[logging.stdout]
+enabled = false
+
+[plugins.grpc]
+enabled = true
+# Loopback only — basis-controller / basis-agent connect from the
+# same host. The on-wire BGP listener (tcp/179) is separately ACL'd
+# via nftables.
+address = "{{ holo_grpc_host }}:{{ holo_grpc_port }}"
+
+[plugins.grpc.tls]
+enabled = false
+certificate = ""
+key = ""
+
+[plugins.gnmi]
+enabled = false
+
+[plugins.gnmi.tls]
+enabled = false
+certificate = ""
+key = ""

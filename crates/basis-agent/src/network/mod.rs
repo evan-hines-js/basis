@@ -280,7 +280,6 @@ impl UplinkBridge {
         run_cmd("ip", &["link", "set", &self.bridge_name, "up"]).await?;
         run_cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await
     }
-
 }
 
 /// True iff `name` matches the agent's TAP shape: `bas` followed by

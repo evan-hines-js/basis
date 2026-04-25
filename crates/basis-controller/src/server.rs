@@ -18,7 +18,7 @@ use basis_common::gpu::GpuInfo;
 use basis_common::time::now_rfc3339;
 use basis_common::tls;
 
-use crate::config::{NetworkConfig, Pool};
+use crate::config::{BgpConfig, NetworkConfig, Pool};
 use crate::db::{ClusterRow, Db, DbError, GpuAssignment, TreeRow, VmRow};
 use crate::metrics::Metrics;
 use crate::scheduler::{self, ScheduleRequest, SchedulerError};
@@ -118,6 +118,7 @@ pub struct BasisServer {
     metrics: Arc<Metrics>,
     dns_servers: Arc<Vec<String>>,
     network: Arc<NetworkConfig>,
+    bgp: Arc<BgpConfig>,
     reconcile_interval: std::time::Duration,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_ops: Arc<DashMap<String, PendingVmOp>>,
@@ -142,12 +143,14 @@ impl BasisServer {
         metrics: Arc<Metrics>,
         dns_servers: Vec<String>,
         network: NetworkConfig,
+        bgp: BgpConfig,
     ) -> Self {
         Self {
             db,
             metrics,
             dns_servers: Arc::new(dns_servers),
             network: Arc::new(network),
+            bgp: Arc::new(bgp),
             reconcile_interval: DEFAULT_AGENT_RECONCILE_INTERVAL,
             agents: Arc::new(DashMap::new()),
             pending_ops: Arc::new(DashMap::new()),
@@ -196,6 +199,7 @@ impl BasisServer {
             metrics: self.metrics.clone(),
             dns_servers: self.dns_servers.clone(),
             network: self.network.clone(),
+            bgp: self.bgp.clone(),
             agents: self.agents.clone(),
         });
         let basis_svc = basis_server::BasisServer::new(BasisApiService {
@@ -217,6 +221,7 @@ struct SharedCtx {
     metrics: Arc<Metrics>,
     dns_servers: Arc<Vec<String>>,
     network: Arc<NetworkConfig>,
+    bgp: Arc<BgpConfig>,
     agents: Arc<DashMap<String, ConnectedAgent>>,
 }
 
@@ -245,12 +250,32 @@ impl SharedCtx {
                         tree.id
                     ))
                 })?;
+            // Pool-scoped cluster VIPs need explicit /32 advertisement
+            // by every host carrying the tree (see `TreeState.cluster_vips`
+            // in the proto for the rationale). Tree-scoped VIPs sit
+            // inside `tree.cidr` and are reachable via that one
+            // advertisement, so we filter them out.
+            let tree_net: ipnet::Ipv4Net = tree.cidr.parse().map_err(|e| {
+                DbError::Malformed(format!("tree {} cidr '{}': {e}", tree.id, tree.cidr))
+            })?;
+            let clusters = self.db.list_clusters_in_tree(&tree.id).await?;
+            let cluster_vips = clusters
+                .into_iter()
+                .filter_map(|c| {
+                    let vip: std::net::Ipv4Addr = c.control_plane_endpoint.parse().ok()?;
+                    if tree_net.contains(&vip) {
+                        return None;
+                    }
+                    Some(format!("{vip}/32"))
+                })
+                .collect();
             tree_states.push(TreeState {
                 vni: tree.vni as u32,
                 gateway_ip,
                 prefix_len: tree.prefix_len as u32,
                 vtep_addresses: self.db.list_tree_vteps(&tree.id).await?,
                 cidr: tree.cidr,
+                cluster_vips,
             });
         }
         Ok(ReconcileHostCommand {
@@ -1364,6 +1389,8 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
                     RegisterHostResponse {
                         host_id: host_id.clone(),
                         initial_state: Some(initial_state),
+                        bgp_asn: self.shared.bgp.asn,
+                        bgp_reflector_address: self.shared.bgp.router_id.clone(),
                     },
                 ))),
             })

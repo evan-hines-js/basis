@@ -27,6 +27,17 @@
   roles:
     - basis-prereqs
 
+# holod runs on every host (controller + agents). The cell BGP route
+# reflector lives on the controller; speakers run on every agent.
+# Independent systemd lifecycle from basis so a basis bounce doesn't
+# drop sessions and flap VIPs.
+- name: Install holod on every basis host
+  hosts: basis
+  become: true
+  tags: [holod]
+  roles:
+    - basis-holod
+
 - name: Install and run basis-controller
   hosts: basis_controller
   become: true

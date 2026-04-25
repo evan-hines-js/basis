@@ -9,3 +9,10 @@ pub mod basis {
 pub use basis::v1::*;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Generated client for the holo daemon's gRPC northbound interface.
+/// Exposed so basis-controller can drive `holod`'s YANG running config
+/// via `Commit` requests.
+pub mod holo {
+    tonic::include_proto!("holo");
+}

@@ -29,3 +29,10 @@ spec:
   # CPU overcommit: assigned vCPU is allowed to exceed the host's
   # logical CPU count by this factor. Memory and disk stay strict.
   cpuOvercommitRatio: 4.0
+  # Cell BGP route reflector. basis-controller drives the local
+  # `holod` (installed by ansible) via gRPC; routerId is the
+  # controller's underlay LAN IP that every agent's BGP speaker
+  # peers to.
+  bgp:
+    asn: 64512
+    routerId: 10.0.0.1

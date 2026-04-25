@@ -5,6 +5,8 @@ edition.workspace = true
 description = "Shared utilities for Basis: TLS config, time helpers, shared types"
 
 [dependencies]
+basis-proto.workspace = true
+
 tonic.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -12,6 +14,9 @@ serde_yaml_ng.workspace = true
 thiserror.workspace = true
 humantime.workspace = true
 x509-parser.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use basis_controller::bgp::{Reflector, ReflectorConfig};
 use basis_controller::config::BasisControllerSpec;
 use basis_controller::db::Db;
 use basis_controller::metrics::Metrics;
@@ -50,6 +51,32 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics = Metrics::new(config.cpu_overcommit_ratio)?;
 
+    // Connect to local holod and seed the reflector's running config.
+    // holod is a separate systemd service so its lifecycle survives
+    // basis-controller restarts — VIPs don't flap on bounce.
+    let reflector = std::sync::Arc::new(
+        Reflector::start(ReflectorConfig {
+            asn: config.bgp.asn,
+            router_id: config.bgp.router_id_ipv4(),
+            holod_endpoint: config.bgp.holod_endpoint.clone(),
+            instance_name: config.bgp.instance_name.clone(),
+        })
+        .await?,
+    );
+
+    let bgp_db = db.clone();
+    let bgp_reflector = reflector.clone();
+    let bgp_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        basis_controller::bgp::peer_reconciler(bgp_reflector, bgp_db, bgp_shutdown).await;
+    });
+
+    let acl_db = db.clone();
+    let acl_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        basis_controller::bgp::acl_reconciler(acl_db, acl_shutdown).await;
+    });
+
     let health_db = db.clone();
     let health_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -80,9 +107,15 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&config.listen).await?;
     let tls_config = config.tls.server_config()?;
-    basis_controller::server::BasisServer::new(db, metrics, config.dns_servers, config.network)
-        .serve(listener, tls_config, shutdown)
-        .await?;
+    basis_controller::server::BasisServer::new(
+        db,
+        metrics,
+        config.dns_servers,
+        config.network,
+        config.bgp,
+    )
+    .serve(listener, tls_config, shutdown)
+    .await?;
 
     Ok(())
 }

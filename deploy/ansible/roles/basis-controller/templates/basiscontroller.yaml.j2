@@ -27,3 +27,7 @@ spec:
 {% endfor %}
 {% endif %}
   cpuOvercommitRatio: {{ basis_cpu_overcommit_ratio }}
+  bgp:
+    asn: {{ basis_bgp_asn }}
+    routerId: {{ basis_bgp_router_id }}
+    holodEndpoint: "http://{{ holo_grpc_host }}:{{ holo_grpc_port }}"

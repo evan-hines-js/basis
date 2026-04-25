@@ -223,6 +223,14 @@ message RegisterHostResponse {
   // next tick — sent inline so the agent can converge before
   // accepting CreateVm commands.
   ReconcileHostCommand initial_state = 2;
+  // Cell BGP parameters. Every host runs `holod` and peers iBGP with
+  // the cell route reflector (running as the controller's local
+  // holod) at the cell ASN. The agent uses these to seed its own
+  // local holod's BGP instance.
+  uint32 bgp_asn = 3;
+  // Underlay IP of the controller's BGP listener (tcp/179). Sourced
+  // from `BasisControllerSpec.bgp.routerId` in the controller config.
+  string bgp_reflector_address = 4;
 }
 
 // One tree's dataplane state the agent materialises locally.
@@ -248,6 +256,15 @@ message TreeState {
   // egress the uplink with the host's LAN IP — host-originated
   // traffic is left untouched.
   string cidr = 5;
+  // Pool-scoped cluster VIPs in this tree, as /32 prefixes. The
+  // agent advertises these via BGP (with self as next-hop) so they
+  // route to the tree from upstream; tree-scoped VIPs (inside
+  // `cidr`) are reachable through the tree CIDR advertisement and
+  // are NOT included here. Every host carrying the tree advertises
+  // the same VIP set — kube-vip leader election within the tree
+  // settles which CP VM owns the VIP at any moment, and cross-host
+  // VXLAN forwarding gets traffic to whichever host runs the leader.
+  repeated string cluster_vips = 6;
 }
 
 // --- Agent registration ---

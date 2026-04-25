@@ -4,6 +4,7 @@
 //! here. Anything used by only one crate stays local to that crate.
 
 pub mod gpu;
+pub mod holo;
 pub mod json;
 pub mod resource;
 pub mod time;

@@ -47,10 +47,20 @@ pub struct HostSpec {
     /// Plain-HTTP `host:port` for the Prometheus `/metrics` endpoint.
     #[serde(default = "default_metrics_listen")]
     pub metrics_listen: String,
+
+    /// gRPC endpoint of the local holod (the BGP daemon basis-agent
+    /// drives via the YANG northbound). Defaults to holod's upstream
+    /// default; override only if you've rebound holod's gRPC plugin.
+    #[serde(default = "default_holod_endpoint")]
+    pub holod_endpoint: String,
 }
 
 fn default_metrics_listen() -> String {
     "0.0.0.0:9444".to_string()
+}
+
+fn default_holod_endpoint() -> String {
+    "http://127.0.0.1:50051".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

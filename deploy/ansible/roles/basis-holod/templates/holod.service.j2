@@ -1,0 +1,32 @@
+[Unit]
+Description=Holo Routing Daemon
+Documentation=https://github.com/holo-routing/holo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/holod --config /etc/holo/holod.toml
+Restart=on-failure
+RestartSec=5s
+
+# CAP_NET_BIND_SERVICE so holod can bind tcp/179 without running as
+# root. CAP_NET_RAW for crafting BGP TCP-MD5 / TTL-security options.
+# Stay non-root — holod drops to the `holo` user it created.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+
+# Filesystem hardening. holod only needs its database dir + log dir.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/opt/holo /var/log/holo
+
+# Don't restart in a tight loop on systemic failure (config error,
+# missing libyang, etc.) — surface it to operators by giving up.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
