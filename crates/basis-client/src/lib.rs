@@ -87,6 +87,9 @@ pub struct Cluster {
     pub control_plane_endpoint: String,
     pub tree_id: String,
     pub vni: u32,
+    /// CIDR of the cluster's LoadBalancer Service block (e.g.
+    /// `10.0.0.224/28`). Empty when the cluster requested 0 service IPs.
+    pub service_block_cidr: String,
 }
 
 /// A successful `CreateMachine` result.
@@ -119,14 +122,17 @@ pub struct MachineRequest {
 pub struct ClusterRequest {
     pub name: String,
     pub parent_cluster_id: Option<String>,
-    /// Pool name the apiserver VIP is carved from. Empty selects the
-    /// cluster's own tree vip_range (nested cluster, kube-vip on
-    /// `ens3`, external access via parent-cell proxy). Any non-empty
-    /// name resolves to a LAN-routable pool declared in the
-    /// controller config; the caller must deploy CP VMs with
-    /// `edge: true`. Edge VMs in the cluster draw their second-NIC
-    /// IP from this same pool.
-    pub apiserver_vip_pool: String,
+    /// Named LAN pool both the apiserver VIP and the LoadBalancer
+    /// Service block are carved from. Empty selects the cluster's own
+    /// tree CIDR (nested cluster, no LAN exposure; reachable only
+    /// from sibling clusters in the same tree). Any non-empty name
+    /// must match an entry in the controller's `network.pools[]`.
+    pub external_ip_pool: String,
+    /// Number of LoadBalancer Service IPs this cluster gets, exposed
+    /// to Cilium via a CiliumLoadBalancerIPPool. Must be a power of
+    /// two so the controller can carve an aligned /N out of the pool.
+    /// 0 falls back to the cell-wide default.
+    pub external_service_ips: u32,
 }
 
 pub struct BasisClient {
@@ -224,7 +230,8 @@ impl BasisClient {
         let request = CreateClusterRequest {
             name: req.name,
             parent_cluster_id: req.parent_cluster_id.unwrap_or_default(),
-            apiserver_vip_pool: req.apiserver_vip_pool,
+            external_ip_pool: req.external_ip_pool,
+            external_service_ips: req.external_service_ips,
         };
         let resp = self
             .call(|mut c| {
@@ -237,6 +244,7 @@ impl BasisClient {
             control_plane_endpoint: resp.control_plane_endpoint,
             tree_id: resp.tree_id,
             vni: resp.vni,
+            service_block_cidr: resp.service_block_cidr,
         })
     }
 
@@ -263,6 +271,7 @@ impl BasisClient {
             control_plane_endpoint: resp.control_plane_endpoint,
             tree_id: resp.tree_id,
             vni: resp.vni,
+            service_block_cidr: resp.service_block_cidr,
         })
     }
 

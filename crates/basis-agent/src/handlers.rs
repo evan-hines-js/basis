@@ -136,6 +136,7 @@ async fn create_vm_inner(
                 gateway: &cmd.gateway,
                 prefix_len: cmd.prefix_len,
                 dns_servers: &cmd.dns_servers,
+                mtu: net_mgr.inner_mtu(),
             },
         )
         .await?;

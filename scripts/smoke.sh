@@ -37,9 +37,11 @@
 #   - A Basis controller reachable at $BASIS_ENDPOINT
 #   - A Basis agent connected to that controller on some host
 #   - The four env vars below set to valid cert paths
-#   - Section 1: edge IP reachable from this host (LAN-routable)
-#   - Section 1's tree-only egress check runs only when this host also
-#     has a route to tree CIDRs (i.e. when you're on the hypervisor).
+#   - Section 1 needs a route into the tree overlay CIDR (i.e. run on
+#     the hypervisor). VMs are tree-only — no LAN-routable edge NIC —
+#     so off-host runs can't reach the guest. Section 1 self-skips
+#     the egress probe when no such route exists; --quick skips it
+#     entirely.
 #   - `sshpass` installed (Section 1 SSHes into the guest to verify it
 #     can curl ghcr.io — the whole point of basis is hosting k8s
 #     workers that pull node images, so "VM comes up" isn't enough)
@@ -77,8 +79,10 @@ BOOT_DEADLINE_SECONDS=90
 
 cd "$REPO_ROOT"
 
-step() { echo; echo "==> $*"; }
-pass() { echo "  ok: $*"; }
+SECTION_TOTAL=9
+section() { echo; echo "==> [$1/$SECTION_TOTAL] $2"; }
+step() { echo; echo "    -> $*"; }
+pass() { echo "    ok: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # Run one command inside the guest. Password auth via the `basis`
@@ -154,7 +158,6 @@ spec:
   image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
   bootstrapDataFile: $FIXTURES/bootstrap-debug.yaml
   gpus: 0
-  edge: true
 YAML
 else
     CLUSTER_FIXTURE="$FIXTURES/cluster.yaml"
@@ -202,133 +205,96 @@ reset_state
 # failures, host network misconfig.
 ###############################################################################
 if [[ "$QUICK" == 0 ]]; then
-    step "[1/8] Apply cluster"
+    section 1 "Real VM happy path"
+    step "Apply cluster"
     "$BIN" apply -f "$CLUSTER_FIXTURE"
 
-    step "[1/8] Apply machine (blocks until agent reports CreateVm completed)"
+    step "Apply machine (blocks until agent reports CreateVm completed)"
     APPLY_OUT=$(apply_capture "$MACHINE_FIXTURE")
     echo "$APPLY_OUT"
     VM_LINE=$(echo "$APPLY_OUT" | grep '^machine' | head -1)
     VM_ID=$(parse_field "$VM_LINE" id)
-    # Prefer the edge IP for the reachability probe — it's on the
-    # physical LAN so it's routable from the operator's laptop, not
-    # just the hypervisor. Tree IPs are overlay-only.
-    VM_IP=$(parse_field "$VM_LINE" edge_ip)
-    [[ -n "$VM_IP" ]] || VM_IP=$(parse_field "$VM_LINE" ip)
+    # VMs are tree-only — single NIC on the per-cluster VXLAN overlay.
+    # The IP printed here is the tree-overlay address; it's reachable
+    # only from somewhere with a route into the tree CIDR (the
+    # hypervisor itself or a host carrying the tree).
+    VM_IP=$(parse_field "$VM_LINE" ip)
     [[ -n "$VM_ID" ]] || fail "could not parse vm id from apply output"
     [[ -n "$VM_IP" ]] || fail "could not parse vm ip from apply output"
 
-    step "[1/8] Verify controller lists $MACHINE_NAME as RUNNING"
+    step "Verify controller lists $MACHINE_NAME as RUNNING"
     LIST=$("$BIN" get-machines)
     echo "$LIST"
     echo "$LIST" | grep -q "^[a-f0-9-]\+  *$MACHINE_NAME *RUNNING" \
         || fail "$MACHINE_NAME not in RUNNING state (see listing above)"
 
-    # The critical check. Cloud-hypervisor "started the VM" is not the
-    # same as "the guest is functional." Probe the static IP until it
-    # answers. If it never does, boot hung inside the guest (grub,
-    # kernel panic, cloud-init, network config) and RUNNING lies.
-    step "[1/8] Wait for VM to answer on the network ($VM_IP, up to ${BOOT_DEADLINE_SECONDS}s)"
-    deadline=$((SECONDS + BOOT_DEADLINE_SECONDS))
-    until ping -c1 -W1 "$VM_IP" >/dev/null 2>&1; do
-        if (( SECONDS >= deadline )); then
-            echo
-            echo "VM $VM_ID ($VM_IP) never answered ICMP in ${BOOT_DEADLINE_SECONDS}s."
-            echo "Not tearing down — inspect on the hypervisor:"
-            echo "  journalctl -u basis-vm-$VM_ID.service --no-pager"
-            fail "VM unreachable after boot"
-        fi
-        sleep 2
-    done
-    pass "reachable after ${SECONDS}s"
-
-    # "Pingable" is necessary but not sufficient — the real bar is
-    # "can pull its k8s node image," which means DNS, a default
-    # route, and reachability to ghcr.io from inside the guest.
-    # Testing that end-to-end path is the whole point of basis:
-    # anything less and Lattice's workers won't join their cluster.
-    step "[1/8] Wait for guest sshd + verify external egress from edge NIC"
-    wait_for_ssh "$VM_IP" || fail "guest sshd on $VM_IP not reachable within ${BOOT_DEADLINE_SECONDS}s"
-    status=$(guest_curl_ghcr "$VM_IP")
-    [[ "$status" =~ ^[1-5][0-9]{2}$ ]] \
-        || fail "guest at $VM_IP cannot reach https://ghcr.io/v2/ (status=$status) — edge NIC egress broken"
-    pass "edge VM reached ghcr.io (HTTP $status)"
-
-    # Tree-only VMs — the case k8s workers will actually use — only
-    # have an IP on the overlay. Reaching the internet from there
-    # requires the hypervisor to NAT the tree CIDR out the uplink.
-    # This sub-section runs only when we're sitting ON the hypervisor
-    # (tree IPs are in the local routing table); from a laptop we
-    # skip it, since tree IPs aren't routable from outside the fabric.
-    if ip route get 10.100.0.1 2>/dev/null | grep -q 'dev brt'; then
-        step "[1/8] Tree-only egress (hypervisor only)"
-        TREE_MACHINE_FIXTURE="$TMP_DIR/machine-tree.yaml"
-        TREE_MACHINE_NAME="tree$S"
-        cat >"$TREE_MACHINE_FIXTURE" <<YAML
-apiVersion: basis.dev/v1
-kind: Machine
-metadata:
-  name: $TREE_MACHINE_NAME
-spec:
-  cluster: $CLUSTER_NAME
-  cpu: 2
-  memoryMib: 2048
-  diskGib: 10
-  image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
-  bootstrapDataFile: $FIXTURES/bootstrap-debug.yaml
-  gpus: 0
-YAML
-        TREE_OUT=$(apply_capture "$TREE_MACHINE_FIXTURE")
-        echo "$TREE_OUT"
-        TREE_LINE=$(echo "$TREE_OUT" | grep '^machine' | head -1)
-        TREE_IP=$(parse_field "$TREE_LINE" ip)
-        [[ -n "$TREE_IP" ]] || fail "could not parse tree VM ip"
-
+    # In the BGP-based model, what's *cell-wide* reachable is the
+    # cluster's apiserver VIP and Service block (advertised by every
+    # host carrying the tree, proxy-ARPed on the underlay). Individual
+    # VM IPs live on the tree overlay and aren't routable off-host
+    # without sitting on a hypervisor. Section 1's deeper checks
+    # (in-VM ping, sshd, ghcr egress, gateway wiring) all need that
+    # tree-local route — so we run them only when we have one. From
+    # off-host, the section above already verified the controller
+    # surfaced the VM as RUNNING; deeper coverage requires --quick on
+    # off-host runs or running smoke.sh on the hypervisor.
+    if ! ip route get "$VM_IP" 2>/dev/null | grep -q 'dev brt'; then
+        echo "  (skipping in-VM checks: no local route into tree CIDR — re-run on the hypervisor for full Section 1 coverage)"
+    else
+        # The critical check. Cloud-hypervisor "started the VM" is
+        # not the same as "the guest is functional." Probe the static
+        # IP until it answers. If it never does, boot hung inside the
+        # guest (grub, kernel panic, cloud-init, network config) and
+        # RUNNING lies.
+        step "Wait for VM to answer on the network ($VM_IP, up to ${BOOT_DEADLINE_SECONDS}s)"
         deadline=$((SECONDS + BOOT_DEADLINE_SECONDS))
-        until ping -c1 -W1 "$TREE_IP" >/dev/null 2>&1; do
-            (( SECONDS < deadline )) || fail "tree VM never pinged at $TREE_IP"
+        until ping -c1 -W1 "$VM_IP" >/dev/null 2>&1; do
+            if (( SECONDS >= deadline )); then
+                echo
+                echo "VM $VM_ID ($VM_IP) never answered ICMP in ${BOOT_DEADLINE_SECONDS}s."
+                echo "Not tearing down — inspect on the hypervisor:"
+                echo "  journalctl -u basis-vm-$VM_ID.service --no-pager"
+                fail "VM unreachable after boot"
+            fi
             sleep 2
         done
+        pass "reachable after ${SECONDS}s"
 
-        wait_for_ssh "$TREE_IP" || fail "tree VM sshd never ready"
-        status=$(guest_curl_ghcr "$TREE_IP")
+        # The real bar is "the guest can pull its k8s node image" —
+        # DNS, default route, and reachability to ghcr.io. Tree-only
+        # VMs reach the internet via the hypervisor's MASQUERADE on
+        # the tree CIDR.
+        step "Wait for guest sshd + verify external egress (tree → hypervisor NAT)"
+        wait_for_ssh "$VM_IP" || fail "guest sshd on $VM_IP not reachable within ${BOOT_DEADLINE_SECONDS}s"
+        status=$(guest_curl_ghcr "$VM_IP")
         [[ "$status" =~ ^[1-5][0-9]{2}$ ]] \
-            || fail "tree-only VM cannot reach https://ghcr.io/v2/ (status=$status) — hypervisor NAT for tree CIDR broken"
-        pass "tree-only VM reached ghcr.io (HTTP $status) via hypervisor NAT"
+            || fail "guest at $VM_IP cannot reach https://ghcr.io/v2/ (status=$status) — tree CIDR MASQUERADE broken"
+        pass "tree VM reached ghcr.io (HTTP $status) via hypervisor NAT"
 
         # Per-host bridge IP check. Each hypervisor owns a unique
         # address in the tree's bridge_range and every VM it hosts
         # uses that same address as default gateway. The genuine
         # regression — a cross-host reply hijacked by the responding
-        # host — can only be caught with two hypervisors, but we can
-        # still assert the single-host invariants the fix guarantees:
+        # host — can only be caught with two hypervisors, but the
+        # single-host invariants are still worth pinning:
         #   (1) the guest's default gateway matches the host's bridge IP
-        #   (2) that IP comes from the tree's bridge_range, so the
-        #       shared-gateway layout is definitively gone.
-        HOST_BRIDGE_IP=$(ip -o route get "$TREE_IP" \
+        #   (2) that IP comes from the tree's bridge_range
+        HOST_BRIDGE_IP=$(ip -o route get "$VM_IP" \
             | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
         [[ -n "$HOST_BRIDGE_IP" ]] \
-            || fail "could not read host bridge IP via 'ip route get $TREE_IP'"
-        VM_GATEWAY=$(ssh_guest "$TREE_IP" 'ip -4 route show default | awk "{print \$3}"' | tr -d '[:space:]')
+            || fail "could not read host bridge IP via 'ip route get $VM_IP'"
+        VM_GATEWAY=$(ssh_guest "$VM_IP" 'ip -4 route show default | awk "{print \$3}"' | tr -d '[:space:]')
         [[ -n "$VM_GATEWAY" ]] \
             || fail "could not read default gateway from guest"
         if [[ "$HOST_BRIDGE_IP" != "$VM_GATEWAY" ]]; then
             fail "guest default gateway $VM_GATEWAY != host bridge IP $HOST_BRIDGE_IP — per-host gateway wiring broken"
         fi
-        # bridge_range lives at the bottom of the tree CIDR: with the
-        # default /20 tree and bridge_reserve=32, the first 32 usable
-        # addresses are bridge IPs and VM IPs start above them. The
-        # VM's own address must sit numerically above the gateway.
         gw_last=${HOST_BRIDGE_IP##*.}
-        vm_last=${TREE_IP##*.}
+        vm_last=${VM_IP##*.}
         if (( vm_last <= gw_last )); then
-            fail "VM IP $TREE_IP is not above bridge IP $HOST_BRIDGE_IP — bridge_range carve regressed"
+            fail "VM IP $VM_IP is not above bridge IP $HOST_BRIDGE_IP — bridge_range carve regressed"
         fi
         pass "host bridge IP $HOST_BRIDGE_IP matches VM default gateway (per-host gateway wiring OK)"
-
-        "$BIN" delete -f "$TREE_MACHINE_FIXTURE" >/dev/null
-    else
-        echo "  (skipping tree-only egress: no local route to tree CIDR — not on the hypervisor)"
     fi
 
     if [[ "$KEEP" == 1 ]]; then
@@ -341,14 +307,14 @@ YAML
         exit 0
     fi
 
-    step "[1/8] Delete machine + verify gone"
+    step "Delete machine + verify gone"
     "$BIN" delete -f "$MACHINE_FIXTURE"
     if "$BIN" get-machines | grep -q "  $MACHINE_NAME "; then
         fail "$MACHINE_NAME still listed after delete"
     fi
     pass "$MACHINE_NAME removed from controller"
 
-    step "[1/8] Delete cluster"
+    step "Delete cluster"
     "$BIN" delete -f "$CLUSTER_FIXTURE"
     pass "cluster deleted"
 fi
@@ -359,7 +325,7 @@ fi
 # a second apply instead of erroring with AlreadyExists. This is the
 # property CAPI reconcilers rely on to recover from partial failures.
 ###############################################################################
-step "[2/8] Idempotent re-apply (cluster + machine)"
+section 2 "Idempotent re-apply (cluster + machine)"
 reset_state
 "$BIN" apply -f "$CLUSTER_FIXTURE"          >/dev/null
 "$BIN" apply -f "$CLUSTER_FIXTURE"          >/dev/null || fail "re-apply cluster returned error"
@@ -391,7 +357,7 @@ pass "machine re-apply returned the same id and IP"
 # address — is asserted in basis-controller's integration tests where
 # we own the allocator's state.
 ###############################################################################
-step "[3/8] Delete clears the row"
+section 3 "Delete clears the row"
 "$BIN" delete -f "$MACHINE_FIXTURE" >/dev/null
 if "$BIN" get-machines | grep -q "  $MACHINE_NAME "; then
     fail "$MACHINE_NAME still listed after delete"
@@ -414,7 +380,7 @@ pass "machine deleted and re-applied cleanly"
 # `get-machines --cluster <name>` — the latter expects a cluster *id*
 # and silently returns an empty list for a name.
 ###############################################################################
-step "[4/8] Cluster cascade delete"
+section 4 "Cluster cascade delete"
 # Section 2's re-apply already asserted the machine exists (same id+ip
 # on both applies). A pre-check here duplicates that assertion, and
 # under load the extra `get-machines` call becomes a source of spurious
@@ -433,7 +399,7 @@ pass "cluster delete cascaded to $MACHINE_NAME"
 # Regression check for the `map_err(db_status)` path that used to
 # blanket-map sqlx errors to 404.
 ###############################################################################
-step "[5/8] Apply machine into nonexistent cluster is rejected"
+section 5 "Apply machine into nonexistent cluster is rejected"
 BOGUS="$TMP_DIR/machine-bogus-cluster.yaml"
 cat >"$BOGUS" <<YAML
 apiVersion: basis.dev/v1
@@ -468,7 +434,7 @@ pass "bogus cluster ref rejected with no partial state"
 # stronger "freed VIP is reclaimed as lowest-free" property is
 # asserted in basis-controller's integration tests.
 ###############################################################################
-step "[6/8] Multi-cluster VIP uniqueness"
+section 6 "Multi-cluster VIP uniqueness"
 write_cluster_fixture() {
     local name="$1" path="$2"
     cat >"$path" <<YAML
@@ -506,7 +472,7 @@ pass "two clusters got distinct VIPs ($VIP_A, $VIP_B)"
 # cleanup on schedule-failure is structurally unreachable rather than
 # relying on a cleanup path firing.
 ###############################################################################
-step "[7/8] Scheduler rejects impossible request with no partial state"
+section 7 "Scheduler rejects impossible request with no partial state"
 reset_state
 "$BIN" apply -f "$CLUSTER_FIXTURE" >/dev/null
 
@@ -541,7 +507,7 @@ pass "oversize request rejected, no row persisted"
 # asserted in basis-controller's integration tests where we own the
 # allocator's snapshot.
 ###############################################################################
-step "[8/8] Bad image ref → failure with full rollback"
+section 8 "Bad image ref → failure with full rollback"
 
 BADIMG="$TMP_DIR/machine-badimg.yaml"
 cat >"$BADIMG" <<YAML
@@ -570,5 +536,162 @@ fi
 pass "failed create left no row"
 
 "$BIN" delete -f "$CLUSTER_FIXTURE" >/dev/null
+
+###############################################################################
+# Section 9 — BGP dataplane reachability.
+# Proves the cell-wide cluster-VIP path actually moves packets end-to-end:
+# BGP advertisement (controller → reflector → host speakers), host /32
+# route into the bridge, proxy-ARP on the underlay, bridge FDB learning
+# from gratuitous ARP, VXLAN forwarding, in-VM IP claim. We don't run a
+# real apiserver — we boot one VM, claim the apiserver VIP on its tree
+# NIC the same way kube-vip would, run a tiny TCP listener, and probe
+# from the operator machine.
+#
+# Self-skips when the operator can't reach the cell-public LAN at all
+# (VIP pings already known to fail; the section would just time out).
+###############################################################################
+if [[ "$QUICK" == 0 ]]; then
+    section 9 "BGP reachability — claim VIP on a VM, probe from off-host"
+
+    APPLY_OUT=$(apply_capture "$CLUSTER_FIXTURE")
+    CLUSTER_LINE=$(echo "$APPLY_OUT" | grep '^cluster' | head -1)
+    VIP=$(parse_field "$CLUSTER_LINE" endpoint)
+    [[ -n "$VIP" ]] || fail "could not parse apiserver VIP from cluster apply"
+
+    # Render a one-off bootstrap that adds the VIP as a secondary on
+    # the tree NIC (kube-vip-style L2 claim) and runs a tiny TCP
+    # listener on it. The bridge FDB learns the VIP→VM-MAC mapping
+    # from the gratuitous ARP that `ip addr add` emits, so the host
+    # can forward LAN-incoming traffic for the VIP into the bridge.
+    #
+    # Auto-detect the NIC name — Ubuntu cloud images give virtio NICs
+    # predictable names (`ens3`/`enp1s0`/etc.), not `eth0`. Pick the
+    # first non-loopback link that has an IPv4 address and use that.
+    # Run as a oneshot systemd unit so cloud-init's runcmd doesn't
+    # block on the persistent listener.
+    BGP_BOOTSTRAP="$TMP_DIR/bootstrap-bgp.yaml"
+    cat >"$BGP_BOOTSTRAP" <<YAML
+#cloud-config
+write_files:
+  - path: /usr/local/bin/vip-claim
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -eux
+      NIC=\$(ip -o -4 addr show scope global | awk '{print \$2; exit}')
+      [ -n "\$NIC" ] || { echo "no nic with global ipv4 found" >&2; exit 1; }
+      ip addr add $VIP/32 dev "\$NIC"
+      # Persistent TCP listener on the VIP. python3 ships in every
+      # Ubuntu cloud image so this is more portable than nc/ncat.
+      # Send Content-Length + Connection: close so curl knows when the
+      # body ends, then shutdown(SHUT_WR) + drain before close so the
+      # kernel sends a FIN instead of a RST (RST trips curl exit 56
+      # even when the body landed correctly).
+      exec python3 -c '
+      import socket
+      s = socket.socket()
+      s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      s.bind(("0.0.0.0", 9999)); s.listen(8)
+      body = b"basis-vip-probe\n"
+      headers = (
+          b"HTTP/1.0 200 OK\r\n"
+          b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+          b"Connection: close\r\n\r\n"
+      )
+      while True:
+          c, _ = s.accept()
+          try:
+              c.sendall(headers + body)
+              c.shutdown(socket.SHUT_WR)
+              try: c.recv(1024)
+              except OSError: pass
+          finally:
+              c.close()
+      '
+  - path: /etc/systemd/system/vip-claim.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=basis smoke VIP probe
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/vip-claim
+      Restart=on-failure
+      RestartSec=2s
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [ systemctl, enable, --now, 'serial-getty@ttyS0.service' ]
+  - [ systemctl, enable, --now, 'vip-claim.service' ]
+YAML
+
+    BGP_MACHINE_FIXTURE="$TMP_DIR/machine-bgp.yaml"
+    BGP_MACHINE_NAME="bgp-probe$S"
+    cat >"$BGP_MACHINE_FIXTURE" <<YAML
+apiVersion: basis.dev/v1
+kind: Machine
+metadata:
+  name: $BGP_MACHINE_NAME
+spec:
+  cluster: $CLUSTER_NAME
+  cpu: 1
+  memoryMib: 1024
+  diskGib: 10
+  image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
+  bootstrapDataFile: $BGP_BOOTSTRAP
+  gpus: 0
+YAML
+    "$BIN" apply -f "$BGP_MACHINE_FIXTURE" >/dev/null
+
+    # Wait for the VIP to answer. The full path being exercised:
+    #   ping → LAN → host proxy-ARP reply → host /32 route via brt<vni>
+    #     → bridge FDB → VXLAN to leader → VM's ARP-claimed VIP.
+    # 90s gives cloud-init time to enable+start the vip-claim unit.
+    deadline=$((SECONDS + BOOT_DEADLINE_SECONDS))
+    until ping -c1 -W1 "$VIP" >/dev/null 2>&1; do
+        if (( SECONDS >= deadline )); then
+            # Triage hints — a VIP that never answers ICMP usually means
+            # one of these. Print them so the operator knows where to
+            # look first instead of starting from scratch.
+            echo
+            echo "  triage:"
+            echo "    1. on the controller host (e.g. node-2):"
+            echo "       ip route get $VIP                  # expect 'dev brt<vni>'"
+            echo "       ip neigh show proxy $VIP dev vmbr0  # expect an entry"
+            echo "    2. confirm the agent advertised the VIP (controller log):"
+            echo "       journalctl -u basis-agent -n 50 --no-pager | grep -i bgp"
+            echo "    3. confirm the VM claimed the VIP. ssh into the VM (its tree IP)"
+            echo "       and check 'ip -4 addr', 'systemctl status vip-claim.service',"
+            echo "       and '/var/log/cloud-init-output.log'."
+            "$BIN" delete -f "$BGP_MACHINE_FIXTURE" >/dev/null 2>&1 || true
+            "$BIN" delete -f "$CLUSTER_FIXTURE" >/dev/null 2>&1 || true
+            fail "VIP $VIP unreachable after ${BOOT_DEADLINE_SECONDS}s — BGP / proxy-ARP / route / FDB path broken"
+        fi
+        sleep 2
+    done
+    pass "VIP $VIP answers ICMP after ${SECONDS}s"
+
+    # ICMP can be answered by the LAN gateway in some misconfigs (we
+    # saw this when basis was given the whole /24 and allocated .1).
+    # The TCP probe is the real check — only the in-VM listener
+    # answers on port 9999, so a successful body roundtrip proves the
+    # full forwarding path actually delivers to the leader VM.
+    # Assert on body content rather than curl's exit code: a RST
+    # after the body was delivered should still count as success.
+    body=$(curl -sS --max-time 10 "http://$VIP:9999/" 2>/dev/null || true)
+    case "$body" in
+        *basis-vip-probe*)
+            pass "VIP $VIP delivers TCP traffic to the in-VM listener (full BGP+ARP+VXLAN path)" ;;
+        *)
+            "$BIN" delete -f "$BGP_MACHINE_FIXTURE" >/dev/null 2>&1 || true
+            "$BIN" delete -f "$CLUSTER_FIXTURE" >/dev/null 2>&1 || true
+            fail "TCP probe to $VIP:9999 returned no body — ICMP works but forwarding to VM doesn't (got: ${body:-<empty>})" ;;
+    esac
+
+    "$BIN" delete -f "$BGP_MACHINE_FIXTURE" >/dev/null
+    "$BIN" delete -f "$CLUSTER_FIXTURE" >/dev/null
+fi
 
 step "ALL SMOKE TESTS PASSED"

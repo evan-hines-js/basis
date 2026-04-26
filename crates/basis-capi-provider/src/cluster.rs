@@ -160,7 +160,8 @@ async fn apply(
         .create_cluster(ClusterRequest {
             name: name.clone(),
             parent_cluster_id,
-            apiserver_vip_pool: cluster.spec.apiserver_vip_pool.clone(),
+            external_ip_pool: cluster.spec.external_ip_pool.clone(),
+            external_service_ips: cluster.spec.external_service_ips,
         })
         .await?;
 
@@ -179,7 +180,8 @@ async fn apply(
                 "controlPlaneEndpoint": {
                     "host": created.control_plane_endpoint,
                     "port": KUBE_API_PORT,
-                }
+                },
+                "serviceBlockCidr": created.service_block_cidr,
             }
         }),
     )

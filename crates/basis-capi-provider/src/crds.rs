@@ -45,22 +45,40 @@ pub struct BasisClusterSpec {
     /// basis-controller connection material.
     pub credentials_ref: CredentialsRef,
 
-    /// Pool the apiserver VIP is carved from. Empty / unset selects
-    /// the cluster's own tree `vip_range` (nested clusters; the VIP
-    /// stays inside the overlay, external access goes through a
-    /// parent-cell auth proxy). Any non-empty name resolves to a
-    /// pool in the basis controller's config; the host carrying the
-    /// VIP-claiming VM advertises the /32 via the cell's BGP
-    /// reflector with itself as next-hop, so VMs are single-homed
-    /// on the tree NIC.
+    /// Named LAN pool the cluster's external IPs (apiserver VIP and
+    /// LoadBalancer Service block) are carved from. Empty / unset →
+    /// the cluster's tree CIDR (nested cluster, no LAN exposure;
+    /// reachable only from sibling clusters in the same tree). Any
+    /// non-empty name must match a pool in the basis controller's
+    /// `network.pools[]`; every host carrying the tree advertises
+    /// the allocations via the cell BGP reflector with itself as
+    /// next-hop, plus a proxy-ARP entry on the underlay so LAN
+    /// clients can reach them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub apiserver_vip_pool: String,
+    pub external_ip_pool: String,
+
+    /// Number of LoadBalancer Service IPs Cilium gets configured
+    /// with. Must be a power of two. 0 / unset → cell-wide default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub external_service_ips: u32,
 
     /// Populated by the reconciler after `Basis.CreateCluster` returns.
     /// Never set by the user — if present on first apply, the
     /// reconciler will overwrite it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane_endpoint: Option<ControlPlaneEndpoint>,
+
+    /// Populated by the reconciler with the CIDR of the cluster's
+    /// LoadBalancer Service block (e.g. `10.0.0.224/28`). Lattice
+    /// uses this to write the workload cluster's
+    /// `CiliumLoadBalancerIPPool`. Empty when the cluster requested
+    /// 0 service IPs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub service_block_cidr: String,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Kubernetes-style object reference for a Secret. Namespace is

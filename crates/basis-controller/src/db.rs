@@ -5,6 +5,8 @@ use std::str::FromStr;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
+use basis_common::gpu::GpuInfo;
+
 use crate::config::{NetworkConfig, Pool};
 
 #[derive(Debug, thiserror::Error)]
@@ -167,10 +169,15 @@ impl Db {
         .execute(&self.writer)
         .await?;
 
-        // `apiserver_pool` is the pool name chosen at CreateCluster; an
-        // empty string means the VIP was carved from the tree's
-        // vip_range. CreateMachine reads it on `edge: true` to decide
-        // which pool the edge NIC draws from.
+        // `external_pool` is the pool name chosen at CreateCluster.
+        // Empty means LAN exposure is off — both the apiserver VIP and
+        // the Service block (if any) were carved from the tree's
+        // top-of-CIDR vip_reserve, reachable only from sibling clusters
+        // in the same tree.
+        //
+        // `service_block_cidr` records the LoadBalancer Service block
+        // allocated to this cluster (e.g. `10.0.0.224/28`). Empty means
+        // the cluster requested 0 service IPs.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS clusters (
                 id TEXT PRIMARY KEY,
@@ -178,7 +185,8 @@ impl Db {
                 tree_id TEXT NOT NULL REFERENCES trees(id),
                 parent_cluster_id TEXT REFERENCES clusters(id),
                 control_plane_endpoint TEXT NOT NULL,
-                apiserver_pool TEXT NOT NULL DEFAULT '',
+                external_pool TEXT NOT NULL DEFAULT '',
+                service_block_cidr TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             )",
         )
@@ -601,6 +609,87 @@ impl Db {
             .await
     }
 
+    /// Allocate an aligned `count`-sized block to a cluster from the
+    /// given range, returning its CIDR (e.g. `10.0.0.224/28`). All
+    /// addresses in the block are reserved under `cluster_id` so
+    /// `release_cluster_ips` frees the whole block on cluster delete.
+    ///
+    /// `count` must be a power of two; the allocator fails fast with
+    /// `Malformed` otherwise. `scope` is the same scope key used by
+    /// the per-IP allocators that draw from this range, so apiserver
+    /// VIPs and Service blocks share allocation state and never
+    /// collide.
+    pub async fn allocate_service_block(
+        &self,
+        scope: &str,
+        range: &ParsedRange,
+        cluster_id: &str,
+        count: u32,
+    ) -> Result<String, DbError> {
+        if count == 0 || !count.is_power_of_two() {
+            return Err(DbError::Malformed(format!(
+                "service block count {count} must be a power of two",
+            )));
+        }
+        let prefix_len: u8 = 32 - count.trailing_zeros() as u8;
+
+        let mut tx = self.writer.begin().await?;
+        // Pull the current allocations in one pass so the alignment
+        // search runs in memory — the range's typical width is well
+        // under 256 IPs, and the writer is single-threaded so
+        // serialization with concurrent allocations is automatic.
+        let used: Vec<String> = sqlx::query_scalar(
+            "SELECT ip_address FROM ip_allocations WHERE scope = ?",
+        )
+        .bind(scope)
+        .fetch_all(&mut *tx)
+        .await?;
+        let used: std::collections::HashSet<u32> = used
+            .into_iter()
+            .filter_map(|s| s.parse::<Ipv4Addr>().ok().map(u32::from))
+            .collect();
+
+        let mut start = (range.start + (count - 1)) & !(count - 1); // align up
+        let cidr = loop {
+            let end = match start.checked_add(count - 1) {
+                Some(e) if e <= range.end => e,
+                _ => {
+                    return Err(DbError::Exhausted(format!(
+                        "no aligned /{prefix_len} block free in scope '{scope}' \
+                         range [{}..={}]",
+                        Ipv4Addr::from(range.start),
+                        Ipv4Addr::from(range.end),
+                    )));
+                }
+            };
+            if (start..=end).all(|n| !used.contains(&n)) {
+                for n in start..=end {
+                    let ip = Ipv4Addr::from(n).to_string();
+                    sqlx::query(
+                        "INSERT INTO ip_allocations (ip_address, scope, vm_id, cluster_id)
+                         VALUES (?, ?, NULL, ?)",
+                    )
+                    .bind(&ip)
+                    .bind(scope)
+                    .bind(cluster_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                break format!("{}/{prefix_len}", Ipv4Addr::from(start));
+            }
+            start = match start.checked_add(count) {
+                Some(s) => s,
+                None => {
+                    return Err(DbError::Exhausted(format!(
+                        "no aligned /{prefix_len} block free in scope '{scope}'"
+                    )));
+                }
+            };
+        };
+        tx.commit().await?;
+        Ok(cidr)
+    }
+
     async fn allocate_from_range(
         &self,
         scope: &str,
@@ -680,15 +769,17 @@ impl Db {
 
     pub async fn insert_cluster(&self, cluster: &ClusterRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO clusters (id, name, tree_id, parent_cluster_id, control_plane_endpoint, apiserver_pool, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO clusters (id, name, tree_id, parent_cluster_id, control_plane_endpoint,
+                                   external_pool, service_block_cidr, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&cluster.id)
         .bind(&cluster.name)
         .bind(&cluster.tree_id)
         .bind(&cluster.parent_cluster_id)
         .bind(&cluster.control_plane_endpoint)
-        .bind(&cluster.apiserver_pool)
+        .bind(&cluster.external_pool)
+        .bind(&cluster.service_block_cidr)
         .bind(&cluster.created_at)
         .execute(&self.writer)
         .await
@@ -700,6 +791,7 @@ impl Db {
         })?;
         Ok(())
     }
+
 
     pub async fn get_cluster(&self, id: &str) -> Result<ClusterRow, DbError> {
         sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters WHERE id = ?")
@@ -785,7 +877,10 @@ impl Db {
         .bind(host.total_cpu)
         .bind(host.total_memory_mib)
         .bind(host.total_disk_gib)
-        .bind(&host.gpu_inventory)
+        .bind(
+            serde_json::to_string(&host.gpu_inventory)
+                .expect("serializing Vec<GpuInfo> to JSON is infallible"),
+        )
         .bind(&host.vtep_address)
         .bind(&host.last_heartbeat)
         .bind(host.healthy)
@@ -1214,7 +1309,8 @@ pub struct HostRow {
     pub total_cpu: i64,
     pub total_memory_mib: i64,
     pub total_disk_gib: i64,
-    pub gpu_inventory: String,
+    #[sqlx(json)]
+    pub gpu_inventory: Vec<GpuInfo>,
     /// IP address the agent uses as the VXLAN src for outgoing tunneled
     /// frames. Reported on `RegisterHostRequest`; empty string means
     /// the agent is pre-VXLAN and cross-host traffic for any tree it
@@ -1322,9 +1418,14 @@ pub struct ClusterRow {
     pub tree_id: String,
     pub parent_cluster_id: Option<String>,
     pub control_plane_endpoint: String,
-    /// Pool name the apiserver VIP was carved from at CreateCluster.
-    /// Empty string means the VIP came from the tree's `vip_range`.
-    pub apiserver_pool: String,
+    /// Pool name the cluster's external IPs (apiserver VIP and
+    /// Service block) were carved from at CreateCluster. Empty means
+    /// nested — the cluster has no LAN exposure and both allocations
+    /// came from the tree's `vip_range`.
+    pub external_pool: String,
+    /// CIDR of this cluster's LoadBalancer Service block. Empty when
+    /// the cluster asked for 0 service IPs.
+    pub service_block_cidr: String,
     pub created_at: String,
 }
 
@@ -1383,18 +1484,19 @@ impl ParsedRange {
         })
     }
 
-    fn parse_pool_range(pool: &Pool) -> Result<Self, DbError> {
-        let start: Ipv4Addr = pool
-            .range_start
+    /// Derive an inclusive allocatable range from a pool's CIDR:
+    /// `[network+1, broadcast-1]` for /N<31. /30 yields the two host
+    /// addresses; smaller pools are rejected upstream by `Pool::validate`.
+    pub fn parse_pool_range(pool: &Pool) -> Result<Self, DbError> {
+        let net: ipnet::Ipv4Net = pool
+            .cidr
             .parse()
-            .map_err(|e| DbError::Malformed(format!("pool '{}' range_start: {e}", pool.name)))?;
-        let end: Ipv4Addr = pool
-            .range_end
-            .parse()
-            .map_err(|e| DbError::Malformed(format!("pool '{}' range_end: {e}", pool.name)))?;
+            .map_err(|e| DbError::Malformed(format!("pool '{}' cidr: {e}", pool.name)))?;
+        let net_addr = u32::from(net.network());
+        let bcast = u32::from(net.broadcast());
         Ok(Self {
-            start: u32::from(start),
-            end: u32::from(end),
+            start: net_addr + 1,
+            end: bcast - 1,
         })
     }
 }
@@ -1413,17 +1515,15 @@ mod tests {
             tree_supernet: "10.0.0.0/8".to_string(),
             tree_prefix: 20,
             bridge_reserve: 32,
-            vip_reserve: 16,
+            vip_reserve: 32,
+            default_external_service_ips: 16,
             vni_range: VniRange {
                 start: 10_000,
                 end: 10_010,
             },
             pools: vec![Pool {
                 name: "cell-internal".to_string(),
-                cidr: "192.168.100.0/24".to_string(),
-                gateway: "192.168.100.1".to_string(),
-                range_start: "192.168.100.20".to_string(),
-                range_end: "192.168.100.30".to_string(),
+                cidr: "192.168.100.0/27".to_string(),
             }],
         }
     }
@@ -1440,7 +1540,7 @@ mod tests {
             total_cpu: 16,
             total_memory_mib: 65536,
             total_disk_gib: 1000,
-            gpu_inventory: "[]".to_string(),
+            gpu_inventory: Vec::new(),
             vtep_address: format!("10.100.0.{}", id.bytes().last().unwrap_or(b'1')),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,
@@ -1454,7 +1554,8 @@ mod tests {
             tree_id: tree_id.to_string(),
             parent_cluster_id: None,
             control_plane_endpoint: endpoint.to_string(),
-            apiserver_pool: String::new(),
+            external_pool: String::new(),
+            service_block_cidr: String::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }
     }

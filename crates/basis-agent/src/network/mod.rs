@@ -69,12 +69,20 @@ impl NetworkManager {
         self.uplink.bridge_name()
     }
 
+    /// Tree-overlay inner MTU (uplink minus VXLAN overhead). Plumbed
+    /// to cloud-init so the guest's primary NIC matches the bridge,
+    /// avoiding silent drops on >MTU egress.
+    pub fn inner_mtu(&self) -> u32 {
+        self.trees.inner_mtu()
+    }
+
     pub async fn validate_uplink(&self) -> Result<(), NetworkError> {
         self.uplink.validate().await
     }
 
     pub async fn ensure_uplink_bridge(&self) -> Result<(), NetworkError> {
-        self.uplink.ensure().await
+        self.uplink.ensure().await?;
+        ensure_vxlan_spoof_guard().await
     }
 
     pub async fn reconcile_trees(&self, desired: &[TreeState]) -> Result<(), NetworkError> {
@@ -359,90 +367,113 @@ pub async fn list_agent_taps() -> Result<Vec<String>, NetworkError> {
 }
 
 /// Install a source-scoped MASQUERADE rule for `tree_cidr` egressing
-/// out `uplink`. Narrower than a blanket `-o uplink` catch-all: leaves
-/// host-originated LAN traffic untouched. Without this a tree VM's
-/// default route dead-ends at the host — packets forwarded out the
-/// uplink would source from a tree address the upstream router can't
-/// reverse-route to.
+/// out `uplink`, plus a TCP MSS clamp on the forward chain. Narrower
+/// than a blanket `-o uplink` catch-all: leaves host-originated LAN
+/// traffic untouched. Without MASQUERADE, a tree VM's default route
+/// dead-ends at the host — packets forwarded out the uplink would
+/// source from a tree address the upstream router can't
+/// reverse-route to. Without MSS clamping, return packets from
+/// servers that ignore PMTUD (notably some Google front-ends) get
+/// silently dropped at the bridge once VXLAN's 50 bytes of overhead
+/// pushes them past the underlay MTU — TCP connect hangs even
+/// though SYN/SYN-ACK got through.
 ///
-/// Guarded by an `iptables -C` existence check so repeat calls don't
+/// Guarded by `iptables -C` existence checks so repeat calls don't
 /// stack duplicates.
 pub(crate) async fn ensure_tree_masquerade(
     tree_cidr: &str,
     uplink: &str,
 ) -> Result<(), NetworkError> {
-    let exists = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-C",
-            "POSTROUTING",
-            "-s",
-            tree_cidr,
-            "-o",
-            uplink,
-            "-j",
-            "MASQUERADE",
-        ])
-        .output()
-        .await?;
-    if exists.status.success() {
-        return Ok(());
-    }
-    run_cmd(
-        "iptables",
+    ensure_iptables_rule(
+        "nat",
+        "POSTROUTING",
         &[
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            tree_cidr,
-            "-o",
-            uplink,
-            "-j",
-            "MASQUERADE",
+            "-s", tree_cidr, "-o", uplink, "-j", "MASQUERADE",
         ],
     )
     .await?;
-    info!(tree_cidr, uplink, "installed per-tree MASQUERADE rule");
+    // `--clamp-mss-to-pmtu` rewrites MSS in TCP SYN/SYN-ACK to the
+    // egress interface's MTU minus 40 (IPv4+TCP headers), so
+    // segments fit underlay MTU even when the guest reports a
+    // larger NIC MTU or PMTUD is broken end-to-end.
+    ensure_iptables_rule(
+        "mangle",
+        "FORWARD",
+        &[
+            "-s", tree_cidr,
+            "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+            "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+        ],
+    )
+    .await?;
+    info!(tree_cidr, uplink, "installed per-tree MASQUERADE + MSS clamp");
     Ok(())
 }
 
-/// Best-effort removal of the per-tree MASQUERADE rule. A missing rule
-/// is the desired state — iptables returns non-zero for `-D` on an
-/// absent match, which we log and ignore.
+/// Best-effort removal of the per-tree MASQUERADE + MSS clamp rules.
+/// Missing rules are the desired state — iptables returns non-zero
+/// for `-D` on an absent match, which we log and ignore.
 pub(crate) async fn remove_tree_masquerade(tree_cidr: &str, uplink: &str) {
-    let out = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-D",
-            "POSTROUTING",
-            "-s",
-            tree_cidr,
-            "-o",
-            uplink,
-            "-j",
-            "MASQUERADE",
-        ])
-        .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => {
-            info!(tree_cidr, uplink, "removed per-tree MASQUERADE rule");
-        }
-        Ok(o) => {
-            warn!(
-                tree_cidr,
-                uplink,
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                "per-tree MASQUERADE remove: rule absent or iptables error (treating as gone)"
-            );
-        }
-        Err(e) => {
-            warn!(tree_cidr, uplink, error = %e, "spawning iptables for rule removal");
-        }
+    delete_iptables_rule(
+        "nat",
+        "POSTROUTING",
+        &["-s", tree_cidr, "-o", uplink, "-j", "MASQUERADE"],
+    )
+    .await;
+    delete_iptables_rule(
+        "mangle",
+        "FORWARD",
+        &[
+            "-s", tree_cidr,
+            "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+            "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+        ],
+    )
+    .await;
+    info!(tree_cidr, uplink, "removed per-tree MASQUERADE + MSS clamp");
+}
+
+/// Drop forwarded VXLAN traffic (UDP/4789) on this host's FORWARD
+/// chain. Host-originated VXLAN encap goes through OUTPUT (untouched);
+/// only frames forwarded from a tap match here. A tenant VM that
+/// crafts a VXLAN packet with a foreign VNI to poison a peer's FDB
+/// goes through FORWARD and gets dropped at the source.
+///
+/// Without this rule, enabling VXLAN learning on the receive path
+/// would let any in-tree VM spoof MAC entries for any other tree on
+/// peer hosts — a cross-tenant data leak. With it, peer FDBs only
+/// learn from genuine host-originated gARP floods.
+async fn ensure_vxlan_spoof_guard() -> Result<(), NetworkError> {
+    ensure_iptables_rule(
+        "filter",
+        "FORWARD",
+        &["-p", "udp", "--dport", "4789", "-j", "DROP"],
+    )
+    .await
+}
+
+async fn ensure_iptables_rule(
+    table: &str,
+    chain: &str,
+    spec: &[&str],
+) -> Result<(), NetworkError> {
+    let mut check_args = vec!["-t", table, "-C", chain];
+    check_args.extend_from_slice(spec);
+    let exists = Command::new("iptables").args(&check_args).output().await?;
+    if exists.status.success() {
+        return Ok(());
+    }
+    let mut add_args = vec!["-t", table, "-A", chain];
+    add_args.extend_from_slice(spec);
+    run_cmd("iptables", &add_args).await
+}
+
+async fn delete_iptables_rule(table: &str, chain: &str, spec: &[&str]) {
+    let mut args = vec!["-t", table, "-D", chain];
+    args.extend_from_slice(spec);
+    let out = Command::new("iptables").args(&args).output().await;
+    if let Err(e) = out {
+        warn!(table, chain, error = %e, "spawning iptables for rule removal");
     }
 }
 

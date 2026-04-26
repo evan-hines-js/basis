@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use basis_common::gpu::GpuInfo;
-use basis_common::json::parse_owned_json;
 use basis_proto::CreateMachineRequest;
 
 use crate::db::{HostRow, HostUsage};
@@ -100,10 +99,11 @@ pub fn schedule(
             continue;
         }
 
-        let inventory: Vec<GpuInfo> = parse_owned_json(&host.gpu_inventory, "hosts.gpu_inventory");
-        let free_gpus: Vec<GpuInfo> = inventory
-            .into_iter()
+        let free_gpus: Vec<GpuInfo> = host
+            .gpu_inventory
+            .iter()
             .filter(|g| !usage.assigned_pci.contains(&g.pci_address))
+            .cloned()
             .collect();
 
         let (score, selected) = if req.gpus > 0 {
@@ -205,7 +205,7 @@ mod tests {
             total_cpu: cpu,
             total_memory_mib: mem,
             total_disk_gib: disk,
-            gpu_inventory: serde_json::to_string(gpus).unwrap(),
+            gpu_inventory: gpus.to_vec(),
             vtep_address: format!("10.100.0.{id}"),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,

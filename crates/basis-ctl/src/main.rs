@@ -114,16 +114,22 @@ async fn apply(client: &BasisClient, file: &Path) -> Result<()> {
                     .create_cluster(basis_client::ClusterRequest {
                         name: c.metadata.name.clone(),
                         parent_cluster_id,
-                        apiserver_vip_pool: c.spec.apiserver_vip_pool.clone(),
+                        external_ip_pool: c.spec.external_ip_pool.clone(),
+                        external_service_ips: c.spec.external_service_ips,
                     })
                     .await?;
                 println!(
-                    "cluster  {name:30}  id={id}  tree={tree}  vni={vni}  endpoint={ep}",
+                    "cluster  {name:30}  id={id}  tree={tree}  vni={vni}  endpoint={ep}  services={svc}",
                     name = c.metadata.name,
                     id = created.cluster_id,
                     tree = created.tree_id,
                     vni = created.vni,
                     ep = created.control_plane_endpoint,
+                    svc = if created.service_block_cidr.is_empty() {
+                        "none".to_string()
+                    } else {
+                        created.service_block_cidr.clone()
+                    },
                 );
             }
             Resource::Machine(m) => {

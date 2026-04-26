@@ -18,10 +18,10 @@ network:
       dhcp4: false
       dhcp6: false
       addresses:
-        - "{{ ansible_default_ipv4.address }}/{{ ansible_default_ipv4.prefix }}"
+        - "{{ ansible_facts.default_ipv4.address }}/{{ ansible_facts.default_ipv4.prefix }}"
       routes:
         - to: default
-          via: "{{ ansible_default_ipv4.gateway }}"
+          via: "{{ ansible_facts.default_ipv4.gateway }}"
       nameservers:
         addresses: {{ ansible_dns.nameservers | default(['1.1.1.1', '1.0.0.1']) | to_json }}
       parameters:

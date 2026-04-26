@@ -17,8 +17,6 @@ use axum::{
     routing::get,
     Router,
 };
-use basis_common::gpu::GpuInfo;
-use basis_common::json::parse_owned_json;
 use basis_proto::MachineState;
 use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge,
@@ -386,11 +384,10 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
             .with_label_values(&[h])
             .set(usage.used_disk_gib);
 
-        let inventory: Vec<GpuInfo> = parse_owned_json(&host.gpu_inventory, "hosts.gpu_inventory");
         metrics
             .host_gpus_total
             .with_label_values(&[h])
-            .set(inventory.len() as i64);
+            .set(host.gpu_inventory.len() as i64);
         metrics
             .host_gpus_assigned
             .with_label_values(&[h])
@@ -523,7 +520,7 @@ mod tests {
             total_cpu,
             total_memory_mib: 65536,
             total_disk_gib: 1000,
-            gpu_inventory: "[]".to_string(),
+            gpu_inventory: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
             last_heartbeat: basis_common::time::now_rfc3339(),
             healthy,
@@ -555,17 +552,15 @@ mod tests {
             tree_supernet: "10.0.0.0/8".to_string(),
             tree_prefix: 20,
             bridge_reserve: 32,
-            vip_reserve: 16,
+            vip_reserve: 32,
+            default_external_service_ips: 16,
             vni_range: VniRange {
                 start: 10_000,
                 end: 10_010,
             },
             pools: vec![Pool {
                 name: "cell-internal".to_string(),
-                cidr: "192.168.100.0/24".to_string(),
-                gateway: "192.168.100.1".to_string(),
-                range_start: "192.168.100.20".to_string(),
-                range_end: "192.168.100.30".to_string(),
+                cidr: "192.168.100.0/27".to_string(),
             }],
         }
     }
@@ -582,7 +577,8 @@ mod tests {
             tree_id: tree.id,
             parent_cluster_id: None,
             control_plane_endpoint: "unused-endpoint".to_string(),
-            apiserver_pool: String::new(),
+            external_pool: String::new(),
+            service_block_cidr: String::new(),
             created_at: basis_common::time::now_rfc3339(),
         };
         db.insert_cluster(&row).await.unwrap();

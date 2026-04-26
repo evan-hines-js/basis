@@ -41,17 +41,19 @@ fn test_network_config() -> basis_controller::config::NetworkConfig {
         tree_supernet: "10.0.0.0/8".to_string(),
         tree_prefix: 24,
         bridge_reserve: 8,
+        // vip_reserve=16 + default_external_service_ips=4 keeps the
+        // tree-side allocations tight so per-tree assertions land on
+        // predictable addresses without over-reserving.
         vip_reserve: 16,
+        default_external_service_ips: 4,
         vni_range: basis_controller::config::VniRange {
             start: 10_000,
             end: 11_000,
         },
         pools: vec![basis_controller::config::Pool {
             name: "cell-internal".to_string(),
-            cidr: "192.168.100.0/24".to_string(),
-            gateway: "192.168.100.1".to_string(),
-            range_start: "192.168.100.20".to_string(),
-            range_end: "192.168.100.100".to_string(),
+            // /27 = 32 addrs total → 30 allocatable (.1..=.30).
+            cidr: "192.168.100.0/27".to_string(),
         }],
     }
 }
@@ -164,7 +166,8 @@ async fn create_cluster(running: &RunningController, name: &str) -> (String, Str
         .create_cluster(CreateClusterRequest {
             name: name.to_string(),
             parent_cluster_id: String::new(),
-            apiserver_vip_pool: String::new(),
+            external_ip_pool: String::new(),
+            external_service_ips: 0,
         })
         .await
         .unwrap()
@@ -350,7 +353,7 @@ async fn test_create_cluster_reserves_vip() {
     let (cluster_id, vip) = create_cluster(&running, "my-cluster").await;
 
     assert!(!cluster_id.is_empty());
-    // The `create_cluster` helper leaves `apiserver_vip_pool` empty,
+    // The `create_cluster` helper leaves `external_ip_pool` empty,
     // so the VIP comes from the tree's top-of-CIDR vip_range — the
     // nested-cluster path. For the /24 tree with vip_reserve=16, the
     // first VIP is broadcast(10.0.0.255) - 1 - (16-1) = 10.0.0.239.
@@ -376,23 +379,26 @@ async fn test_create_cluster_reserves_vip() {
 }
 
 #[tokio::test]
-async fn test_apiserver_vip_pool_routes_to_named_pool() {
-    // Root/management clusters name a LAN pool so the apiserver VIP
-    // is routable. The first address in the configured pool
-    // (192.168.100.20) should be handed out as the VIP, distinct
-    // from the tree-scoped .239 the default (empty) path returns.
+async fn test_external_ip_pool_routes_to_named_pool() {
+    // Root/management clusters name a LAN pool so the cluster's
+    // external IPs are routable. The pool is 192.168.100.0/27, so
+    // the allocatable range is [.1, .30] — apiserver VIP gets .1, and
+    // with `default_external_service_ips=4` (a /30) the Service block
+    // lands at the next aligned /30 (.4/30).
     let (running, _db) = RunningController::start().await;
     let mut capi = running.capi_client().await;
     let resp = capi
         .create_cluster(CreateClusterRequest {
             name: "lan-root".to_string(),
             parent_cluster_id: String::new(),
-            apiserver_vip_pool: "cell-internal".to_string(),
+            external_ip_pool: "cell-internal".to_string(),
+            external_service_ips: 0,
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.control_plane_endpoint, "192.168.100.20");
+    assert_eq!(resp.control_plane_endpoint, "192.168.100.1");
+    assert_eq!(resp.service_block_cidr, "192.168.100.4/30");
 }
 
 #[tokio::test]
@@ -403,7 +409,8 @@ async fn test_child_cluster_inherits_parent_tree() {
         .create_cluster(CreateClusterRequest {
             name: "root".to_string(),
             parent_cluster_id: String::new(),
-            apiserver_vip_pool: String::new(),
+            external_ip_pool: String::new(),
+            external_service_ips: 0,
         })
         .await
         .unwrap()
@@ -412,7 +419,8 @@ async fn test_child_cluster_inherits_parent_tree() {
         .create_cluster(CreateClusterRequest {
             name: "child".to_string(),
             parent_cluster_id: root.cluster_id.clone(),
-            apiserver_vip_pool: String::new(),
+            external_ip_pool: String::new(),
+            external_service_ips: 0,
         })
         .await
         .unwrap()
@@ -436,7 +444,8 @@ async fn test_create_cluster_is_idempotent_by_name() {
         .create_cluster(CreateClusterRequest {
             name: "dup".to_string(),
             parent_cluster_id: String::new(),
-            apiserver_vip_pool: String::new(),
+            external_ip_pool: String::new(),
+            external_service_ips: 0,
         })
         .await
         .unwrap()
@@ -543,7 +552,8 @@ async fn test_delete_cluster_cascades_machine_deletes() {
         .create_cluster(CreateClusterRequest {
             name: "after-delete".to_string(),
             parent_cluster_id: String::new(),
-            apiserver_vip_pool: String::new(),
+            external_ip_pool: String::new(),
+            external_service_ips: 0,
         })
         .await
         .unwrap()
@@ -563,7 +573,7 @@ async fn test_create_machine_no_agent() {
         total_cpu: 16,
         total_memory_mib: 65536,
         total_disk_gib: 1000,
-        gpu_inventory: "[]".to_string(),
+        gpu_inventory: Vec::new(),
         vtep_address: "10.100.0.99".to_string(),
         last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
         healthy: true,

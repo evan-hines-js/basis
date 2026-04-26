@@ -1,0 +1,13 @@
+# Skip everything that bloats the build context. The Dockerfile only
+# needs source — no compiled artifacts, no playbook state, no caches.
+# Without this, `docker build` ships ~1.4GB of `target/` over the wire
+# every time.
+target/
+build/
+node_modules/
+deploy/ansible/pki/
+deploy/ansible/build/
+deploy/ansible/inventory.ini
+deploy/ansible/secrets.yml
+.git/
+**/.DS_Store

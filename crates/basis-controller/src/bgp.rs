@@ -137,11 +137,13 @@ async fn nft_apply(ruleset: &str) -> anyhow::Result<()> {
 }
 
 /// Render the nftables ruleset that allows BGP only from the given
-/// permitted source set, drops everything else on tcp/179. Always
-/// flushes the table first so the result is the full intended state
-/// — no rule-stacking across reruns.
+/// permitted source set, drops everything else on tcp/179. `add table`
+/// first so the flush is idempotent on the very first apply (when the
+/// table doesn't exist yet); then flush so we redefine full intended
+/// state with no rule-stacking across reruns.
 fn render_acl_ruleset(allowed: &BTreeSet<IpAddr>) -> String {
     let mut out = String::new();
+    out.push_str(&format!("add table inet {NFT_TABLE}\n"));
     out.push_str(&format!("flush table inet {NFT_TABLE}\n"));
     out.push_str(&format!("table inet {NFT_TABLE} {{\n"));
     out.push_str(&format!(

@@ -118,7 +118,7 @@ pub fn bgp_running_config(
     if !networks_json.is_empty() {
         bgp_body["global"]["afi-safis"] = json!({
             "afi-safi": [{
-                "name": "ietf-bgp-types:ipv4-unicast",
+                "name": "iana-bgp-types:ipv4-unicast",
                 "ipv4-unicast": {
                     "network-config": { "network": networks_json }
                 }

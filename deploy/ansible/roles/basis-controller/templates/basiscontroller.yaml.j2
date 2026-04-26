@@ -12,13 +12,13 @@ spec:
     ca: {{ basis_tls_dir }}/ca.crt
   network:
     treeSupernet: {{ basis_network.tree_supernet }}
+{% if basis_network.default_external_service_ips is defined %}
+    defaultExternalServiceIps: {{ basis_network.default_external_service_ips }}
+{% endif %}
     pools:
 {% for pool in basis_network.pools %}
       - name: {{ pool.name }}
         cidr: {{ pool.cidr }}
-        gateway: {{ pool.gateway }}
-        rangeStart: {{ pool.range_start }}
-        rangeEnd: {{ pool.range_end }}
 {% endfor %}
 {% if basis_dns_servers is defined %}
   dnsServers:

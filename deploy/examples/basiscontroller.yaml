@@ -16,16 +16,21 @@ spec:
     # sub-CIDR out of this supernet. Does NOT need to match the
     # physical LAN; VMs reach it via VXLAN.
     treeSupernet: 10.100.0.0/16
-    # Named LAN-routable pools. A cluster's `apiserverVipPool` picks
-    # which pool its apiserver VIP comes from (and consequently the
-    # source for its edge-NIC VMs). Empty `apiserverVipPool` keeps
-    # the VIP inside the tree overlay (nested clusters).
+    # Named LAN-routable pools. A cluster's `externalIpPool` picks
+    # which pool its apiserver VIP and Cilium LoadBalancer Service
+    # block are carved from. Empty `externalIpPool` keeps the cluster
+    # inside the tree overlay (nested cluster, no LAN exposure).
     pools:
+      # Each pool is the LAN slice basis owns, expressed as a single
+      # CIDR. Allocations walk the host range (skip network +
+      # broadcast). Carve smaller CIDRs to express partial-subnet
+      # ownership.
       - name: cell-internal
-        cidr: 192.168.1.0/24
-        gateway: 192.168.1.1
-        rangeStart: 192.168.1.240
-        rangeEnd: 192.168.1.250
+        cidr: 192.168.1.240/28      # 16 addrs → 14 allocatable
+    # Cell-wide default for the per-cluster Cilium LB Service block.
+    # Must be a power of two. Override per-cluster via
+    # `BasisCluster.spec.externalServiceIps` for the rare case.
+    defaultExternalServiceIps: 16
   # CPU overcommit: assigned vCPU is allowed to exceed the host's
   # logical CPU count by this factor. Memory and disk stay strict.
   cpuOvercommitRatio: 4.0

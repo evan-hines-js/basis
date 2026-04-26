@@ -14,7 +14,7 @@
   # If {{ basis_bridge }} already exists, pick its first non-tap slave —
   # this is the correct answer both before the first apply (bridge
   # absent, fall through to default-route interface) and after it
-  # (bridge owns the IP, so ansible_default_ipv4.interface would
+  # (bridge owns the IP, so ansible_facts.default_ipv4.interface would
   # otherwise resolve to the bridge itself).
   ansible.builtin.shell: |
     set -o pipefail
@@ -26,7 +26,7 @@
     if [ -n "$slave" ]; then
       echo "$slave"
     else
-      echo "{{ ansible_default_ipv4.interface | default('') }}"
+      echo "{{ ansible_facts.default_ipv4.interface | default('') }}"
     fi
   register: _basis_nic_detect
   changed_when: false
@@ -54,10 +54,10 @@
 
 - name: Check whether the host IP is already on the bridge
   # On ex-Proxmox hosts (or any host where netplan already routes via
-  # the bridge), `ansible_default_ipv4.interface` resolves to the
+  # the bridge), `ansible_facts.default_ipv4.interface` resolves to the
   # bridge. That's the target state — no netplan work to do.
   ansible.builtin.set_fact:
-    _basis_ip_already_on_bridge: "{{ ansible_default_ipv4.interface | default('') == basis_bridge }}"
+    _basis_ip_already_on_bridge: "{{ ansible_facts.default_ipv4.interface | default('') == basis_bridge }}"
 
 - name: Render netplan bridge config
   # Captures the host's current IPv4 identity onto the bridge, with the
@@ -88,7 +88,7 @@
     - _basis_netplan_render.changed
 
 - name: Re-gather facts after reboot
-  # Reboot doesn't auto-refresh facts; gather again so ansible_default_ipv4
+  # Reboot doesn't auto-refresh facts; gather again so ansible_facts.default_ipv4
   # reflects the bridge-owned IP rather than the pre-reboot state.
   ansible.builtin.setup:
   when: _basis_rebooted is defined and _basis_rebooted is changed

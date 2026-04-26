@@ -9,27 +9,52 @@
 # Pinned to a tagged release so the YANG-northbound JSON shape basis
 # pushes stays stable across upgrades. Bumping holo_version requires
 # re-validating basis-controller's bgp module against the new schema.
+#
+# Two build paths:
+#
+#   * Linux control host with the same arch as the targets: build
+#     once, copy the binary to every host. Fast — one cargo+rustc
+#     run for the whole fleet.
+#   * Non-Linux control (e.g. macOS dev), or arch mismatch: build on
+#     each host. Slow first run (5–10 min per host of compile time),
+#     parallel across hosts under ansible's `forks` setting.
 
-- name: Build holod on the control node (idempotent across hosts)
+- name: Decide whether the control node can build holod for the targets
+  # Same OS + same arch is enough for a glibc Linux binary built on
+  # one box to run on another. We don't try to detect cross-distro
+  # libc version skew here — if you're running ansible from a 24.04
+  # control host against 22.04 targets, you'll learn it through
+  # holod's first run failing on a missing GLIBC symbol.
+  ansible.builtin.set_fact:
+    _holod_build_on_control: >-
+      {{
+        hostvars['localhost'].ansible_facts.system | default('') == 'Linux'
+        and hostvars['localhost'].ansible_facts.architecture | default('')
+            == ansible_facts.architecture
+      }}
+
+# --- Path A: build on control, ship binary -------------------------
+
+- name: Build holod on the control node
   delegate_to: localhost
   become: false
   run_once: true
   block:
-    - name: Check whether the control node already has the right holod build
+    - name: Check installed holod version on the control node
       ansible.builtin.command: "{{ holo_build_dir }}/bin/holod --version"
-      register: _holod_local_version
+      register: _holod_control_version
       failed_when: false
       changed_when: false
       check_mode: false
 
-    - name: cargo install holod into the control-node staging dir
-      # `--root` puts the binary at $root/bin/holod. We pin to a tag
-      # and use --locked so the build is fully reproducible across
-      # control nodes. CARGO_TARGET_DIR keeps build artifacts off
-      # the playbook tree. Requires `libyang-dev` (yang4 binding) +
-      # `cargo` on the control node — both are standard dev deps and
-      # not enforced here so the failure mode points at the missing
-      # package directly.
+    - name: cargo install holod (control node staging dir)
+      # `--root` puts the binary at $root/bin/holod. We pin to a
+      # tagged release and use --locked so the build is fully
+      # reproducible. CARGO_TARGET_DIR keeps build artifacts out of
+      # the playbook tree (which is gitignored under deploy/ansible/build).
+      # Requires `cargo` + `libyang-dev` on the control node — the
+      # role doesn't install those because the control host is the
+      # operator's workstation, not a managed inventory host.
       ansible.builtin.command:
         cmd: >-
           cargo install --git https://github.com/holo-routing/holo.git
@@ -42,20 +67,118 @@
       environment:
         CARGO_TARGET_DIR: "{{ holo_build_dir }}/target"
       when:
-        - _holod_local_version.rc != 0
-          or holo_version not in (_holod_local_version.stdout | default(''))
+        - _holod_control_version.rc != 0
+          or holo_version not in (_holod_control_version.stdout | default(''))
+  when: _holod_build_on_control
 
-- name: Install holod runtime deps + nftables (BGP source-IP ACL)
+# --- System deps on each managed host ------------------------------
+# `libyang-dev` exists on Ubuntu/Debian regardless of whether the
+# runtime ships as libyang2 (22.04) or libyang3 (24.04) and depends
+# on the right one — using it here costs a few MB of unused headers
+# but keeps the role distro-portable. nftables is needed by
+# basis-controller's ACL reconciler. We deliberately do NOT install
+# distro `cargo`/`rustc`: Ubuntu 22.04 ships rustc 1.85 and holo
+# v0.9.0's MSRV is 1.88, so per-host builds use a rustup-installed
+# toolchain (see below). `curl` is what we feed rustup-init through.
+
+- name: Install holod runtime deps
   ansible.builtin.package:
-    name:
-      # holod links libyang at runtime — the cargo build statically
-      # links the yang4 bindings but the underlying libyang shared
-      # library is a runtime dependency.
-      - libyang2
-      # basis-controller's ACL reconciler shells out to `nft` to
-      # rewrite the BGP source-IP allowlist on every host-set change.
-      - nftables
+    name: "{{ _holod_runtime_pkgs + (_holod_build_pkgs if not _holod_build_on_control else []) }}"
     state: present
+  vars:
+    _holod_runtime_pkgs:
+      - libyang-dev
+      - nftables
+    _holod_build_pkgs:
+      - build-essential
+      - pkg-config
+      - curl
+      - cmake
+      - git
+      - protobuf-compiler
+
+# --- Path A copy: from control to each host ------------------------
+
+- name: Copy prebuilt holod from control node
+  ansible.builtin.copy:
+    src: "{{ holo_build_dir }}/bin/holod"
+    dest: /usr/local/bin/holod
+    owner: root
+    group: root
+    mode: "0755"
+  when: _holod_build_on_control
+  notify: Restart holod
+
+# --- Path B: build on the host itself ------------------------------
+# Use rustup to pin the toolchain, since the holo MSRV outpaces
+# Ubuntu's apt rustc. Toolchain lives under /var/cache/holo-build/rustup
+# so it's separate from any operator-installed rustup in /root or
+# /home/* and so it gets cleaned up alongside the build target dir.
+
+- name: Check installed holod version on the host
+  ansible.builtin.command: /usr/local/bin/holod --version
+  register: _holod_version_check
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  when: not _holod_build_on_control
+
+- name: Install rustup-managed Rust toolchain for holod build
+  ansible.builtin.shell:
+    # Idempotent: rustup-init is a no-op if the toolchain is already
+    # at the requested version, so re-runs are cheap once warm.
+    cmd: |
+      set -euo pipefail
+      export RUSTUP_HOME=/var/cache/holo-build/rustup
+      export CARGO_HOME=/var/cache/holo-build/cargo
+      mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
+      if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --no-modify-path --default-toolchain {{ holo_rust_version }} --profile minimal
+      fi
+      "$CARGO_HOME/bin/rustup" toolchain install {{ holo_rust_version }} --profile minimal
+      "$CARGO_HOME/bin/rustup" default {{ holo_rust_version }}
+    executable: /bin/bash
+  register: _holod_rustup
+  changed_when: "'installed' in _holod_rustup.stdout or 'updated' in _holod_rustup.stdout"
+  when:
+    - not _holod_build_on_control
+    # holod prints `holod 0.9.0` (no leading `v`); the tag carries it.
+    # Strip the prefix so the substring check compares like-with-like.
+    - _holod_version_check.rc != 0
+      or (holo_version | regex_replace('^v', ''))
+         not in (_holod_version_check.stdout | default(''))
+
+- name: cargo install holod from source (per-host) — 5-10 min, polls every 30s
+  ansible.builtin.command:
+    cmd: >-
+      /var/cache/holo-build/cargo/bin/cargo install
+      --git https://github.com/holo-routing/holo.git
+      --tag {{ holo_version }}
+      --root /usr/local
+      --bin holod
+      --locked
+      --force
+      holo-daemon
+  environment:
+    CARGO_TARGET_DIR: /var/cache/holo-build/target
+    RUSTUP_HOME: /var/cache/holo-build/rustup
+    CARGO_HOME: /var/cache/holo-build/cargo
+    PATH: "/var/cache/holo-build/cargo/bin:{{ ansible_facts.env.PATH }}"
+  # Run async so ansible prints a polling tick instead of going dark for
+  # the duration of the cargo build. 30 min hard cap.
+  async: 1800
+  poll: 30
+  when:
+    - not _holod_build_on_control
+    # holod prints `holod 0.9.0` (no leading `v`); the tag carries it.
+    # Strip the prefix so the substring check compares like-with-like.
+    - _holod_version_check.rc != 0
+      or (holo_version | regex_replace('^v', ''))
+         not in (_holod_version_check.stdout | default(''))
+  notify: Restart holod
+
+# --- Common: user, dirs, config, unit, gRPC ready ------------------
 
 - name: Ensure holo system user exists
   ansible.builtin.user:
@@ -77,15 +200,6 @@
     - { path: /etc/holo, owner: root, group: root, mode: "0755" }
     - { path: /var/opt/holo, owner: holo, group: holo, mode: "0755" }
     - { path: /var/log/holo, owner: holo, group: holo, mode: "0755" }
-
-- name: Copy holod binary
-  ansible.builtin.copy:
-    src: "{{ holo_build_dir }}/bin/holod"
-    dest: /usr/local/bin/holod
-    owner: root
-    group: root
-    mode: "0755"
-  notify: Restart holod
 
 - name: Render holod.toml
   ansible.builtin.template:

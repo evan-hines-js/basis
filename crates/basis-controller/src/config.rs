@@ -24,16 +24,17 @@
 //!
 //! Address space has two planes:
 //!   * `treeSupernet` — overlay CIDR, auto-carved per-tree. VM primary
-//!     NICs, per-host bridge gateway IPs, and tree-internal cluster
-//!     VIPs come from here. Not routable outside the VXLAN fabric.
+//!     NICs, per-host bridge gateway IPs, and tree-internal allocations
+//!     come from here. Not routable outside the VXLAN fabric.
 //!   * `pools[]` — named LAN-routable pools. A cluster picks one pool
-//!     for its apiserver VIP via `apiserverVipPool`; that same pool
-//!     supplies the cluster's edge-NIC VMs.
+//!     for its `externalIpPool`; both the apiserver VIP and the Cilium
+//!     LoadBalancer Service block are carved from it.
 //!
-//! An empty / absent `apiserverVipPool` selects the cluster's own tree
-//! `vip_range` (nested clusters, kube-vip on `ens3`, no LAN exposure);
-//! any non-empty name resolves to a LAN pool and requires `edge: true`
-//! on the cluster's CP VMs so kube-vip can gARP on `ens4`.
+//! An empty / absent `externalIpPool` selects the cluster's tree CIDR
+//! (nested cluster, kube-vip claims the apiserver VIP inside the tree,
+//! no LAN exposure). Any non-empty name resolves to a LAN pool and the
+//! host carrying the tree advertises the allocations via BGP plus
+//! proxy-ARP on the underlay so LAN clients can reach them.
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -133,11 +134,16 @@ pub struct NetworkConfig {
     pub tree_prefix: u8,
 
     /// Number of addresses at the TOP of each tree's CIDR reserved
-    /// for cluster VIPs allocated when a cluster's `apiserverVipPool`
-    /// is empty — nested clusters whose apiservers stay inside their
-    /// own tree. Default 16.
+    /// for nested-cluster allocations — apiserver VIPs and Service
+    /// blocks for clusters whose `externalIpPool` is empty. Default 32.
     #[serde(default = "default_vip_reserve")]
     pub vip_reserve: u32,
+
+    /// Cell-wide default for `CreateClusterRequest.external_service_ips`
+    /// when the caller passes 0. Must be a power of two so the
+    /// allocator can carve an aligned /N. Default 16 (a /28).
+    #[serde(default = "default_external_service_ips")]
+    pub default_external_service_ips: u32,
 
     /// Number of addresses at the BOTTOM of each tree's CIDR reserved
     /// for per-host bridge IPs. Each hypervisor carrying this tree is
@@ -154,7 +160,7 @@ pub struct NetworkConfig {
     #[serde(default = "default_vni_range")]
     pub vni_range: VniRange,
 
-    /// Named LAN-routable pools. A cluster's `apiserverVipPool` must
+    /// Named LAN-routable pools. A cluster's `externalIpPool` must
     /// match one of these by name (or be empty for tree-scoped).
     pub pools: Vec<Pool>,
 }
@@ -170,25 +176,29 @@ pub struct VniRange {
 #[serde(rename_all = "camelCase")]
 pub struct Pool {
     /// Unique, user-chosen name. Referenced by `BasisCluster.spec`.
-    /// Must not be empty (empty is reserved for "use the tree
-    /// vip_range").
+    /// Must not be empty (empty is reserved for "nested cluster, use
+    /// the tree CIDR").
     pub name: String,
-    /// CIDR the pool draws from. Must be disjoint from every other
-    /// pool and from `treeSupernet`.
+    /// CIDR slice basis owns within the LAN. Both the pool's name and
+    /// the addresses it allocates come from here — the allocator
+    /// walks `[network+1, broadcast-1]` (skipping network and
+    /// broadcast). Carve smaller CIDRs to express "basis only owns
+    /// part of this subnet"; non-power-of-two ranges become multiple
+    /// pool entries.
     pub cidr: String,
-    pub gateway: String,
-    pub range_start: String,
-    pub range_end: String,
 }
 
 fn default_tree_prefix() -> u8 {
     20
 }
 fn default_vip_reserve() -> u32 {
-    16
+    32
 }
 fn default_bridge_reserve() -> u32 {
     32
+}
+fn default_external_service_ips() -> u32 {
+    16
 }
 fn default_vni_range() -> VniRange {
     VniRange {
@@ -297,6 +307,13 @@ impl NetworkConfig {
             );
         }
 
+        if !self.default_external_service_ips.is_power_of_two() {
+            anyhow::bail!(
+                "network.defaultExternalServiceIps must be a power of two (got {})",
+                self.default_external_service_ips,
+            );
+        }
+
         if self.pools.is_empty() {
             anyhow::bail!("network.pools must contain at least one entry");
         }
@@ -326,6 +343,29 @@ impl NetworkConfig {
                     );
                 }
             }
+            // Reject the silent "fits at create time but not at allocate
+            // time" trap: the allocator carves an aligned /N service
+            // block out of the pool's [network+1, broadcast-1] range. A
+            // /N (count=2^(32-N)) needs the pool's prefix to be at
+            // least 2 bits wider than /N — otherwise every aligned /N
+            // boundary inside the pool clips either the network or
+            // broadcast address. A pool that's exactly the same prefix
+            // as the requested service block has zero usable slots.
+            // Spotting it here means the operator sees the error during
+            // `ansible-playbook`, not when the first cluster apply
+            // bounces with a cryptic alignment message.
+            let service_prefix =
+                32 - self.default_external_service_ips.trailing_zeros() as u8;
+            if service_prefix < 32 && net.prefix_len() + 2 > service_prefix {
+                anyhow::bail!(
+                    "pool '{}' cidr {net} can't fit a /{service_prefix} service block \
+                     (defaultExternalServiceIps = {}); pool prefix must be at most /{} \
+                     to leave aligned space for the block",
+                    pool.name,
+                    self.default_external_service_ips,
+                    service_prefix.saturating_sub(2),
+                );
+            }
             nets.push(net);
         }
         Ok(())
@@ -337,41 +377,37 @@ impl Pool {
         if self.name.is_empty() {
             anyhow::bail!("pool name must not be empty");
         }
-        let net: ipnet::Ipv4Net = parse_cidr(&format!("pool '{}' cidr", self.name), &self.cidr)?;
-        let gw = parse_ip("gateway", &self.name, &self.gateway)?;
-        let start = parse_ip("rangeStart", &self.name, &self.range_start)?;
-        let end = parse_ip("rangeEnd", &self.name, &self.range_end)?;
-        if !net.contains(&gw) {
-            anyhow::bail!("pool '{}' gateway {gw} not in {net}", self.name);
-        }
-        if !net.contains(&start) || !net.contains(&end) {
+        let net = self.parsed_cidr()?;
+        // /32 is degenerate (no allocatable host addresses). /31 is
+        // also degenerate for our model: under RFC 3021 it has 2
+        // hosts and no broadcast, but our allocator treats network +
+        // broadcast as reserved, leaving 0 allocatable. Reject
+        // upfront so the operator gets a clear error instead of
+        // exhaustion later.
+        if net.prefix_len() >= 31 {
             anyhow::bail!(
-                "pool '{}' range [{start}..={end}] not inside {net}",
-                self.name
+                "pool '{}' cidr /{} too narrow — /30 (4 addrs) is the minimum",
+                self.name,
+                net.prefix_len(),
             );
-        }
-        if u32::from(start) > u32::from(end) {
-            anyhow::bail!("pool '{}' rangeStart {start} > rangeEnd {end}", self.name);
         }
         Ok(())
     }
 
     pub fn prefix_len(&self) -> u8 {
-        self.cidr
-            .parse::<ipnet::Ipv4Net>()
+        self.parsed_cidr()
             .expect("pool.validate guarantees cidr parses")
             .prefix_len()
+    }
+
+    fn parsed_cidr(&self) -> anyhow::Result<ipnet::Ipv4Net> {
+        parse_cidr(&format!("pool '{}' cidr", self.name), &self.cidr)
     }
 }
 
 fn parse_cidr(label: &str, s: &str) -> anyhow::Result<ipnet::Ipv4Net> {
     s.parse()
         .map_err(|e| anyhow::anyhow!("{label} '{s}' invalid: {e}"))
-}
-
-fn parse_ip(field: &str, pool_name: &str, s: &str) -> anyhow::Result<Ipv4Addr> {
-    s.parse()
-        .map_err(|e| anyhow::anyhow!("pool '{pool_name}' {field} '{s}' invalid: {e}"))
 }
 
 fn cidrs_overlap(a: &ipnet::Ipv4Net, b: &ipnet::Ipv4Net) -> bool {
@@ -406,9 +442,6 @@ spec:
     pools:
       - name: cell-internal
         cidr: 192.168.100.0/24
-        gateway: 192.168.100.1
-        rangeStart: 192.168.100.20
-        rangeEnd: 192.168.100.250
   bgp:
     asn: 64500
     routerId: 10.0.0.1
@@ -422,7 +455,8 @@ spec:
         let spec = BasisControllerSpec::load(f.path()).unwrap();
         assert_eq!(spec.network.tree_prefix, 20);
         assert_eq!(spec.network.bridge_reserve, 32);
-        assert_eq!(spec.network.vip_reserve, 16);
+        assert_eq!(spec.network.vip_reserve, 32);
+        assert_eq!(spec.network.default_external_service_ips, 16);
         assert_eq!(spec.network.vni_range.start, 10_000);
         assert_eq!(spec.network.vni_range.end, 16_000_000);
         assert_eq!(spec.network.pools.len(), 1);
@@ -431,13 +465,31 @@ spec:
     }
 
     #[test]
+    fn rejects_pool_too_narrow_for_default_service_block() {
+        let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
+        // Default of 16 IPs = /28, needs pool /26 or wider. /27
+        // looks like it should fit (32 addrs ≥ 16) but the only
+        // aligned /28 inside clips network or broadcast.
+        spec.network.default_external_service_ips = 16;
+        spec.network.pools[0].cidr = "192.168.100.0/27".to_string();
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(err.contains("can't fit a /28"), "got: {err}");
+        spec.network.pools[0].cidr = "192.168.100.0/26".to_string();
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_non_power_of_two_default_service_ips() {
+        let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
+        spec.network.default_external_service_ips = 17;
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
     fn rejects_duplicate_pool_names() {
         let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
         let mut dup = spec.network.pools[0].clone();
         dup.cidr = "192.168.101.0/24".to_string();
-        dup.gateway = "192.168.101.1".to_string();
-        dup.range_start = "192.168.101.20".to_string();
-        dup.range_end = "192.168.101.30".to_string();
         spec.network.pools.push(dup);
         assert!(spec.validate().is_err());
     }
@@ -446,9 +498,6 @@ spec:
     fn rejects_pool_overlap_with_tree_supernet() {
         let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
         spec.network.pools[0].cidr = "10.200.0.0/24".to_string();
-        spec.network.pools[0].gateway = "10.200.0.1".to_string();
-        spec.network.pools[0].range_start = "10.200.0.20".to_string();
-        spec.network.pools[0].range_end = "10.200.0.30".to_string();
         assert!(spec.validate().is_err());
     }
 
@@ -469,18 +518,32 @@ spec:
     }
 
     #[test]
-    fn rejects_pool_gateway_outside_cidr() {
+    fn rejects_pool_cidr_too_narrow() {
         let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
-        spec.network.pools[0].gateway = "10.99.99.99".to_string();
+        // Use a /32 service-block default so /30 is the smallest pool
+        // that has any allocatable host range — keeps this test
+        // focused on the network/broadcast guard, not on
+        // service-block fit (covered separately).
+        spec.network.default_external_service_ips = 1;
+        spec.network.pools[0].cidr = "192.168.100.0/31".to_string();
         assert!(spec.validate().is_err());
+        spec.network.pools[0].cidr = "192.168.100.0/32".to_string();
+        assert!(spec.validate().is_err());
+        spec.network.pools[0].cidr = "192.168.100.0/30".to_string();
+        assert!(spec.validate().is_ok());
     }
 
     #[test]
     fn rejects_tree_prefix_too_narrow_for_reserves() {
         let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
-        spec.network.tree_prefix = 26;
+        // Explicit reserves so the test stays decoupled from default
+        // changes: 32 + 32 + 2 = 66 sentinels means /25 (128 addrs)
+        // fits with VM headroom and /26 (64) is just over the cliff.
+        spec.network.bridge_reserve = 32;
+        spec.network.vip_reserve = 32;
+        spec.network.tree_prefix = 25;
         assert!(spec.validate().is_ok());
-        spec.network.tree_prefix = 27;
+        spec.network.tree_prefix = 26;
         assert!(spec.validate().is_err());
     }
 

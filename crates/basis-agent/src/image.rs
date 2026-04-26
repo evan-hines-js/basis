@@ -148,6 +148,12 @@ pub struct GuestNetwork<'a> {
     pub gateway: &'a str,
     pub prefix_len: u32,
     pub dns_servers: &'a [String],
+    /// Inner-MTU for the tree NIC. Must equal `uplink_mtu - 50`
+    /// (VXLAN header overhead) so guest IP packets fit in a single
+    /// underlay frame. Without this the guest defaults to 1500,
+    /// large packets silently drop on the bridge, and overlay TLS
+    /// handshakes hang at ClientHello.
+    pub mtu: u32,
 }
 
 /// Name of the ISO-9660 producer resolved at startup. `mkisofs` and
@@ -494,8 +500,8 @@ impl ImageManager {
 /// VFIO devices) and a literal name would silently apply to nothing.
 fn network_config(primary: &GuestNetwork<'_>) -> String {
     let mut s = format!(
-        "network:\n  version: 2\n  ethernets:\n    primary:\n      match:\n        macaddress: {}\n      addresses:\n        - {}/{}\n      gateway4: {}\n      nameservers:\n        addresses:\n",
-        primary.mac, primary.ip_address, primary.prefix_len, primary.gateway,
+        "network:\n  version: 2\n  ethernets:\n    primary:\n      match:\n        macaddress: {}\n      mtu: {}\n      addresses:\n        - {}/{}\n      gateway4: {}\n      nameservers:\n        addresses:\n",
+        primary.mac, primary.mtu, primary.ip_address, primary.prefix_len, primary.gateway,
     );
     for d in primary.dns_servers {
         s.push_str(&format!("          - {d}\n"));
@@ -633,6 +639,7 @@ mod tests {
             gateway: "10.1.0.1",
             prefix_len: 20,
             dns_servers: &["8.8.8.8".to_string()],
+            mtu: 1450,
         };
         let s = network_config(&primary);
         assert!(

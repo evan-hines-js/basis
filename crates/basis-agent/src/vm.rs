@@ -20,10 +20,11 @@
 //! — `lvm.rs` owns the storage rationale; the `--disk` flag comments
 //! below explain the cloud-hypervisor-specific gotchas.
 //!
-//! Delete is intentionally not idempotent at the `systemctl` level —
-//! we always attempt a graceful shutdown via the API socket first and
-//! fall back to `systemctl stop`. The directory cleanup is best-effort
-//! because the VM dir is regenerated on next create anyway.
+//! Delete relies on `systemctl stop` for graceful shutdown:
+//! cloud-hypervisor handles SIGTERM by ACPI-powering-off the guest
+//! before exiting, and systemd's TimeoutStopSec (default 90s) gives
+//! the guest time to flush before SIGKILL. Directory cleanup is
+//! best-effort — the VM dir is regenerated on next create.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,7 +32,7 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use basis_proto::CreateVmCommand;
 
@@ -244,14 +245,11 @@ impl VmManager {
             .map(|t| t.vm_dir.clone())
             .unwrap_or_else(|| self.vms_dir.join(vm_id));
 
-        // Try graceful shutdown via cloud-hypervisor API socket first
-        let socket_path = vm_dir.join("cloud-hypervisor.sock");
-        if socket_path.exists() {
-            let _ = shutdown_via_api(&socket_path).await;
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-
-        // Stop the systemd unit (kills the process if still running)
+        // `systemctl stop` sends SIGTERM, which cloud-hypervisor
+        // handles by ACPI-powering-off the guest cleanly before
+        // exiting. systemd's TimeoutStopSec (default 90s) gives the
+        // guest time to flush before SIGKILL, so this is already a
+        // graceful shutdown — no separate API call needed.
         let _ = Command::new("systemctl")
             .args(["stop", &unit_name])
             .output()
@@ -406,32 +404,6 @@ impl VmManager {
             _ => false,
         }
     }
-}
-
-/// Send shutdown command to cloud-hypervisor via its HTTP API socket.
-async fn shutdown_via_api(socket_path: &Path) -> Result<(), VmError> {
-    let socket = socket_path.to_string_lossy().to_string();
-
-    let output = Command::new("curl")
-        .args([
-            "--unix-socket",
-            &socket,
-            "-X",
-            "PUT",
-            "http://localhost/api/v1/vm.shutdown",
-        ])
-        .output()
-        .await
-        .map_err(|e| VmError::ProcessFailed(e.to_string()))?;
-
-    if !output.status.success() {
-        warn!(
-            "shutdown API call failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    Ok(())
 }
 
 /// Transient systemd unit name for a VM. Services (not scopes) — see the

@@ -4,6 +4,10 @@
 # push config via the gRPC northbound. Only the gRPC plugin is enabled;
 # gNMI is off because nothing speaks it in basis today.
 
+# holod is launched as root by systemd, then drops to this user
+# itself after grabbing privileged sockets. Don't try to do this
+# drop in the unit (`User=`) — holod refuses to start unprivileged
+# with "need privileged user".
 user = "holo"
 group = "holo"
 database_path = "/var/opt/holo/holo.db"

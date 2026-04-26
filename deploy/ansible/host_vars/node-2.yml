@@ -12,13 +12,7 @@ basis_lvm_devices:
   - /dev/sdd
   - /dev/sde
 
-# One LAN pool on the routed lab subnet. VM primary IPs come from
-# `tree_supernet` (overlay), so only VIPs need LAN addresses.
-basis_network:
-  tree_supernet: 10.100.0.0/16
-  pools:
-    - name: cell-public
-      cidr: 10.0.0.0/24
-      gateway: 10.0.0.1
-      range_start: 10.0.0.200
-      range_end: 10.0.0.205
+# Network config (tree_supernet, pools, default_external_service_ips)
+# lives in group_vars/all.yml — it's a cell-wide concern, not per-host.
+# Only override here for fields that genuinely vary across hosts in
+# the same cell (none today).

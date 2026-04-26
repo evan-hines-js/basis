@@ -27,13 +27,18 @@ pub struct ClusterSpec {
     #[serde(default, rename = "parentCluster")]
     pub parent_cluster: Option<String>,
 
-    /// Named pool the apiserver VIP is carved from. Empty / unset →
-    /// the cluster's own tree vip_range (nested cluster, kube-vip
-    /// on `ens3`, external access via parent-cell proxy). A pool
-    /// name resolves to a LAN pool in the controller's config; CP
-    /// VMs must then be `edge: true`.
-    #[serde(default, rename = "apiserverVipPool")]
-    pub apiserver_vip_pool: String,
+    /// Named LAN pool both the apiserver VIP and the LoadBalancer
+    /// Service block are carved from. Empty / unset → tree CIDR
+    /// (nested cluster, no LAN exposure). A pool name resolves to
+    /// a LAN pool in the controller's `network.pools[]`.
+    #[serde(default, rename = "externalIpPool")]
+    pub external_ip_pool: String,
+
+    /// Number of LoadBalancer Service IPs Cilium should be configured
+    /// with. 0 / unset → cell-wide default (`network.defaultExternalServiceIps`).
+    /// Must be a power of two.
+    #[serde(default, rename = "externalServiceIps")]
+    pub external_service_ips: u32,
 }
 
 #[derive(Debug, Deserialize)]

@@ -31,6 +31,11 @@
 # reflector lives on the controller; speakers run on every agent.
 # Independent systemd lifecycle from basis so a basis bounce doesn't
 # drop sessions and flap VIPs.
+- name: Gather control-node facts (used by basis-holod to pick build path)
+  hosts: localhost
+  gather_facts: true
+  tags: [holod]
+
 - name: Install holod on every basis host
   hosts: basis
   become: true

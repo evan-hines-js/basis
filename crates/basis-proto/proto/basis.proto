@@ -36,23 +36,28 @@ message CreateClusterRequest {
   // materializes a new tree (allocates a VNI, carves a CIDR) before
   // inserting the cluster row.
   string parent_cluster_id = 2;
-  // Named pool the apiserver VIP is carved from. Empty selects the
-  // cluster's own tree vip_range (nested cluster, VIP stays inside
-  // the overlay, external access goes through a parent-cell auth
-  // proxy). Any non-empty name resolves to a pool in the
-  // controller's `network.pools[]`. Pool /32s are advertised by the
-  // host running the VIP-claiming VM via the cell's BGP reflector;
-  // VMs are single-homed on the tree NIC and don't need to be on
-  // the LAN themselves.
-  string apiserver_vip_pool = 3;
+  // Named pool the cluster's LAN-routable IPs are carved from — both
+  // the apiserver VIP (one /32) and the Cilium LoadBalancer Service
+  // block (one /N where N is derived from `external_service_ips`).
+  // Empty selects the cluster's tree CIDR for both (nested cluster,
+  // no LAN exposure; reachable only from sibling clusters in the
+  // tree). Any non-empty name resolves to a pool in the controller's
+  // `network.pools[]`. Allocations are advertised by every host
+  // carrying the cluster's tree via the cell BGP reflector.
+  string external_ip_pool = 3;
+  // Number of LoadBalancer Service IPs this cluster gets, exposed to
+  // Cilium via a CiliumLoadBalancerIPPool. Must be a power of two so
+  // the controller can carve an aligned /N out of the pool. 0 falls
+  // back to the cell-wide default in `network.defaultExternalServiceIps`.
+  uint32 external_service_ips = 4;
 }
 
 message CreateClusterResponse {
   string cluster_id = 1;
   // Control-plane endpoint VIP, allocated by the controller from
-  // whichever pool the caller named in `apiserver_vip_pool` (or the
-  // tree vip_range when that field is empty). Recorded onto the
-  // caller's `InfrastructureCluster` CR; CAPI core propagates it to
+  // whichever pool the caller named in `external_ip_pool` (or the
+  // tree CIDR when that field is empty). Recorded onto the caller's
+  // `InfrastructureCluster` CR; CAPI core propagates it to
   // `Cluster.spec.controlPlaneEndpoint`.
   string control_plane_endpoint = 2;
   // Tree this cluster belongs to. Root clusters materialize a new
@@ -60,6 +65,9 @@ message CreateClusterResponse {
   string tree_id = 3;
   // VXLAN Network Identifier for the tree. 24-bit.
   uint32 vni = 4;
+  // CIDR of the cluster's LoadBalancer Service block. Same source as
+  // the apiserver VIP. Empty when the cluster requested 0 service IPs.
+  string service_block_cidr = 5;
 }
 
 message DeleteClusterRequest {
@@ -79,6 +87,9 @@ message Cluster {
   string parent_cluster_id = 4;
   string control_plane_endpoint = 5;
   uint32 vni = 6;
+  // Same shape as `CreateClusterResponse.service_block_cidr`. Empty
+  // when the cluster has no LoadBalancer Service block.
+  string service_block_cidr = 7;
 }
 
 message ListClustersRequest {}

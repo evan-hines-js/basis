@@ -3,8 +3,14 @@ kind: Cluster
 metadata:
   name: debug
 spec:
-  # Picks the LAN pool for this cluster's apiserver VIP and edge-NIC
-  # VMs. Must match a `name` in the controller's `network.pools[]`.
-  # Leave empty for nested clusters whose VIP stays inside the tree
-  # overlay (kube-vip on `ens3`, no LAN exposure).
-  apiserverVipPool: cell-internal
+  # Names the LAN pool the cluster's external IPs are carved from —
+  # both the apiserver VIP (one /32) and the LoadBalancer Service
+  # block (count comes from the cell-wide default; 0 / unset →
+  # `network.defaultExternalServiceIps`). Must match a `name` in the
+  # controller's `network.pools[]`. Leave empty for nested clusters
+  # whose allocations stay inside the tree overlay.
+  externalIpPool: cell-public
+  # cell-public on this lab is only 6 IPs wide (10.0.0.200..=10.0.0.205);
+  # the cell-wide default of 16 doesn't fit. Pin to 2 so the smoke can
+  # run alongside other allocations in the same pool.
+  externalServiceIps: 2

@@ -10,9 +10,3 @@ spec:
   image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
   bootstrapDataFile: ./bootstrap-debug.yaml
   gpus: 0
-  # Attaches a second NIC on the physical LAN with an IP from the
-  # cluster's `apiserverVipPool` — the only path that's reachable
-  # from outside the hypervisor. Required here because the cluster
-  # pins `apiserverVipPool: cell-internal` and tree-side IPs are
-  # overlay-only.
-  edge: true

@@ -7,10 +7,18 @@
 holo_version: v0.9.0
 holo_grpc_host: 127.0.0.1
 holo_grpc_port: 50051
-# Control-node staging dir for the holod build. `cargo install` writes
-# the binary to ${holo_build_dir}/bin/holod; the role copies that to
-# /usr/local/bin/holod on each managed host. Excluded from the
-# playbook tree by .gitignore (build/).
+# Rust toolchain holod is built with. Distro-packaged rustc on
+# Ubuntu LTS lags the holo MSRV — and holo's source uses recently
+# stabilized syntax (e.g. `_` array lengths in holo-yang) that even
+# tags claiming MSRV 1.88 won't actually compile under. We track
+# `stable` so rustup fetches whatever current stable is; pin to a
+# specific version only if you need reproducible builds.
+holo_rust_version: stable
+# Control-node staging dir for the holod build. Used only when the
+# control host is Linux + same arch as targets — then `cargo install`
+# writes the binary to ${holo_build_dir}/bin/holod and the role copies
+# it to /usr/local/bin/holod on each managed host. Excluded from the
+# repo by deploy/ansible/.gitignore.
 holo_build_dir: "{{ playbook_dir }}/build/holo"
 
 # Paths on managed hosts.
@@ -102,33 +110,45 @@ basis_leaf_validity_days: 365
 # host's uplink address, the inner is tree-space).
 #
 # `pools` are uplink-routable LAN ranges. A cluster's
-# `apiserverVipPool` names one of these to put its VIP on the LAN
-# (and source IPs for its edge-NIC VMs). An empty pool name keeps
-# the cluster's VIP inside the tree overlay (nested cluster).
+# `externalIpPool` names one of these and gets BOTH its apiserver VIP
+# (one /32) and its LoadBalancer Service block (one /N — Cilium picks
+# Service IPs from inside the block) carved from it. An empty pool
+# name keeps the cluster's allocations inside the tree overlay
+# (nested cluster, no LAN exposure).
 #
 # Pool CIDRs must be pairwise disjoint. The two-pool model assumes
 # distinct LAN segments (typically separate VLANs / IP subnets):
-#   * cell-internal — workload clusters' apiserver VIPs and LB blocks.
-#     Stays inside the cell; not advertised externally.
+#   * cell-internal — workload clusters' apiserver VIPs and Service
+#     blocks. Stays inside the cell; not advertised externally.
 #   * cell-public   — root/management cluster's apiserver VIP and any
 #     externally-reachable VIPs. Reachable from operator laptops,
 #     bootstrap kind clusters, and the customer upstream.
+#
+# `default_external_service_ips` is the cell-wide default block size
+# for Cilium LoadBalancer Services. Must be a power of two. Override
+# per-cluster only when a specific cluster needs a different count.
 #
 # Override these per environment in host/group vars to match your
 # actual LAN segmentation.
 basis_network:
   tree_supernet: 10.100.0.0/16
+  default_external_service_ips: 16
+  # Each pool is the LAN slice basis owns, expressed as a single CIDR.
+  # The allocator walks the host range (skip network + broadcast) and
+  # picks an aligned /N out of it for service blocks. For a shared
+  # subnet where basis only owns part of it, carve a smaller CIDR
+  # matching that slice — the cidr IS the exclusion mechanism, so
+  # picking `.192/27` excludes the LAN gateway at `.1`.
+  # Non-power-of-two ranges become multiple pool entries.
   pools:
-    - name: cell-internal
-      cidr: 10.255.0.0/24
-      gateway: 10.255.0.1
-      range_start: 10.255.0.200
-      range_end: 10.255.0.250
+    # /26 → 64 addrs, 62 allocatable. Sized for the cell-wide
+    # default_external_service_ips=16: a /27 has only 30 allocatable
+    # addresses with no aligned /28 inside (the only candidates clip
+    # the parent /27's network or broadcast), so the allocator can't
+    # place a Service block there. /26 leaves room for one apiserver
+    # VIP plus a /28 Service block per cluster, plus headroom.
     - name: cell-public
-      cidr: 10.0.0.0/24
-      gateway: 10.0.0.1
-      range_start: 10.0.0.200
-      range_end: 10.0.0.205
+      cidr: 10.0.0.192/26
 
 # Credentials for private OCI registries basis-agent pulls VM images
 # from. Override in host/group vars or vault when deploying against
@@ -149,7 +169,7 @@ basis_bridge: vmbr0
 # basis-prereqs: picks the bridge's non-tap slave if the bridge already
 # exists, otherwise the default-route interface. This keeps detection
 # correct *after* the first netplan apply has moved the host IP onto
-# the bridge (when ansible_default_ipv4.interface would otherwise
+# the bridge (when ansible_facts.default_ipv4.interface would otherwise
 # resolve to the bridge itself). Override in host_vars or inventory for
 # nodes with multiple NICs or a non-default routing setup.
 basis_physical_nic: ""
