@@ -305,7 +305,13 @@ impl ClusterManager {
             let _ = run_cmd(
                 "bridge",
                 &[
-                    "fdb", "del", "00:00:00:00:00:00", "dev", vxlan, "dst", stale,
+                    "fdb",
+                    "del",
+                    "00:00:00:00:00:00",
+                    "dev",
+                    vxlan,
+                    "dst",
+                    stale,
                 ],
             )
             .await;
@@ -314,7 +320,13 @@ impl ClusterManager {
             run_cmd(
                 "bridge",
                 &[
-                    "fdb", "append", "00:00:00:00:00:00", "dev", vxlan, "dst", new,
+                    "fdb",
+                    "append",
+                    "00:00:00:00:00:00",
+                    "dev",
+                    vxlan,
+                    "dst",
+                    new,
                 ],
             )
             .await?;

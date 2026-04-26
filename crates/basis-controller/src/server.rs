@@ -5,7 +5,7 @@ use std::time::Instant;
 use basis_proto::*;
 use dashmap::DashMap;
 use futures::Stream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -200,6 +200,7 @@ impl BasisServer {
             network: self.network.clone(),
             bgp: self.bgp.clone(),
             agents: self.agents.clone(),
+            placement_lock: Mutex::new(()),
         });
         let basis_svc = basis_server::BasisServer::new(BasisApiService {
             shared: shared.clone(),
@@ -222,6 +223,14 @@ struct SharedCtx {
     network: Arc<NetworkConfig>,
     bgp: Arc<BgpConfig>,
     agents: Arc<DashMap<String, ConnectedAgent>>,
+    /// Serializes placement: held across `pick_host` → `insert_vm` so
+    /// each scoring pass sees the prior placement's commit. Without
+    /// this, N concurrent creates against an empty cluster all read
+    /// the same "0 VMs everywhere" snapshot, all tie at every score
+    /// dimension, and all pick the first host in iteration order —
+    /// stampeding one host until anti-affinity catches up on the next
+    /// snapshot.
+    placement_lock: Mutex<()>,
 }
 
 impl SharedCtx {
@@ -651,6 +660,13 @@ impl BasisApiService {
         cluster: &ClusterRow,
         now: &str,
     ) -> Result<Placement, PlaceError> {
+        // Serialize placement across the snapshot → score → commit
+        // window so the next placer reads a snapshot that includes
+        // this VM. The retry loop in `create_machine` is now the only
+        // place that races (and only on capacity exhaustion or host
+        // disappearance, not on stale-snapshot stampedes).
+        let _placement_guard = self.shared.placement_lock.lock().await;
+
         let (host_id, gpus) = self.pick_host(req).await.map_err(|s| {
             if s.code() == tonic::Code::ResourceExhausted {
                 PlaceError::NoCapacity(s)

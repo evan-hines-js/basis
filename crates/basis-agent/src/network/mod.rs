@@ -81,10 +81,7 @@ impl NetworkManager {
         ensure_vxlan_spoof_guard().await
     }
 
-    pub async fn reconcile_clusters(
-        &self,
-        desired: &[ClusterState],
-    ) -> Result<(), NetworkError> {
+    pub async fn reconcile_clusters(&self, desired: &[ClusterState]) -> Result<(), NetworkError> {
         self.clusters.reconcile(desired).await
     }
 

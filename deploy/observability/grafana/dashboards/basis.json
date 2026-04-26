@@ -68,7 +68,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "sum by (state) (basis_vms)",
+          "expr": "sum by (state) (basis_vms{cluster=~\"$cluster\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "{{state}}",
@@ -516,7 +516,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Prometheus" },
-          "expr": "basis_vm_age_in_state_seconds{state=~\"PENDING|CREATING|STOPPING\"} > 120",
+          "expr": "basis_vm_age_in_state_seconds{state=~\"PENDING|CREATING|STOPPING\",cluster=~\"$cluster\"} > 120",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -747,6 +747,6 @@
   "timezone": "browser",
   "title": "Basis Cluster",
   "uid": "basis-cluster",
-  "version": 13,
+  "version": 14,
   "weekStart": ""
 }

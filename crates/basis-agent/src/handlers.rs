@@ -400,8 +400,7 @@ mod tests {
             std::env::temp_dir().join("basis-test-reconcile"),
         ));
         let uplink = UplinkBridge::new("test-br".to_string(), "lo".to_string(), 9000);
-        let clusters =
-            ClusterManager::new("127.0.0.1".to_string(), 9000, "test-br".to_string());
+        let clusters = ClusterManager::new("127.0.0.1".to_string(), 9000, "test-br".to_string());
         (vm_mgr, NetworkManager::new(uplink, clusters))
     }
 

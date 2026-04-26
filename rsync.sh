@@ -9,7 +9,7 @@
 set -euo pipefail
 # user@host pairs — 10.0.0.206 is provisioned with root login (no
 # unprivileged ubuntu user), the install host runs as ubuntu.
-for target in ubuntu@10.0.0.131 root@10.0.0.206; do
+for target in ubuntu@10.0.0.131 root@10.0.0.206 root@10.0.0.97; do
   rsync -az --delete \
     --exclude='build' \
     --exclude='target' \

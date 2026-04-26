@@ -133,7 +133,11 @@ impl From<&CreateMachineRequest> for ScheduleRequest {
                 .as_ref()
                 .map(|c| c.min_group_size)
                 .unwrap_or(0),
-            placement: req.placement.clone().map(Placement::from).unwrap_or_default(),
+            placement: req
+                .placement
+                .clone()
+                .map(Placement::from)
+                .unwrap_or_default(),
         }
     }
 }
@@ -288,14 +292,16 @@ pub fn schedule(
     }
 
     if candidates.is_empty() {
-        return Err(if !any_passed_requires && !req.placement.requires.is_empty() {
-            SchedulerError::UnsatisfiedRequirements(req.placement.describe_requires())
-        } else {
-            SchedulerError::NoCapacity(format!(
-                "cpu={}, mem={}MiB, disk={}GiB, gpus={}",
-                req.cpu, req.memory_mib, req.disk_gib, req.gpus
-            ))
-        });
+        return Err(
+            if !any_passed_requires && !req.placement.requires.is_empty() {
+                SchedulerError::UnsatisfiedRequirements(req.placement.describe_requires())
+            } else {
+                SchedulerError::NoCapacity(format!(
+                    "cpu={}, mem={}MiB, disk={}GiB, gpus={}",
+                    req.cpu, req.memory_mib, req.disk_gib, req.gpus
+                ))
+            },
+        );
     }
 
     let winner = candidates
@@ -448,8 +454,7 @@ mod tests {
         cluster_vms: u32,
     ) -> HostUsage {
         let mut u = usage(cpu, mem, disk, &[]);
-        u.vms_by_cluster
-            .insert(cluster_id.to_string(), cluster_vms);
+        u.vms_by_cluster.insert(cluster_id.to_string(), cluster_vms);
         u
     }
 

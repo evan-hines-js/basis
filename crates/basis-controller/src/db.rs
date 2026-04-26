@@ -589,11 +589,10 @@ impl Db {
                 .bind(scope)
                 .fetch_all(&mut *tx)
                 .await?;
-        let host_vteps: Vec<String> = sqlx::query_scalar(
-            "SELECT vtep_address FROM hosts WHERE vtep_address != ''",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
+        let host_vteps: Vec<String> =
+            sqlx::query_scalar("SELECT vtep_address FROM hosts WHERE vtep_address != ''")
+                .fetch_all(&mut *tx)
+                .await?;
         let used: std::collections::HashSet<u32> = used_allocs
             .into_iter()
             .chain(host_vteps)
@@ -844,12 +843,11 @@ impl Db {
 
     /// Host IDs currently carrying VMs in this cluster.
     pub async fn list_hosts_in_cluster(&self, cluster_id: &str) -> Result<Vec<String>, DbError> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT host_id FROM vms WHERE cluster_id = ?",
-        )
-        .bind(cluster_id)
-        .fetch_all(&self.reader)
-        .await?;
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT DISTINCT host_id FROM vms WHERE cluster_id = ?")
+                .bind(cluster_id)
+                .fetch_all(&self.reader)
+                .await?;
         Ok(rows.into_iter().map(|(h,)| h).collect())
     }
 
@@ -1710,10 +1708,7 @@ mod tests {
         // bridge_range = bottom `bridge_reserve` after the network
         // address; vm_range = the rest minus the broadcast; private
         // apiserver = last usable.
-        assert_eq!(
-            u32::from(n.bridge_start),
-            u32::from(n.cidr.network()) + 1
-        );
+        assert_eq!(u32::from(n.bridge_start), u32::from(n.cidr.network()) + 1);
         assert_eq!(
             u32::from(n.bridge_end) - u32::from(n.bridge_start),
             (net.bridge_reserve - 1) as u32

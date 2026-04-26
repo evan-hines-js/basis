@@ -399,11 +399,16 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
             .set(age_seconds(&host.last_heartbeat));
     }
 
-    // host_id → hostname lookup so VM labels carry the human-readable
-    // hostname instead of the UUID.
+    // host_id → hostname and cluster_id → cluster name lookups so VM
+    // labels carry human-readable names instead of UUIDs. Cluster names
+    // are unique across the controller, so the name alone disambiguates.
     let host_id_to_name: HashMap<&str, &str> = hosts
         .iter()
         .map(|h| (h.id.as_str(), h.hostname.as_str()))
+        .collect();
+    let cluster_id_to_name: HashMap<&str, &str> = clusters
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
         .collect();
 
     // Emit a (state, cluster) series at value 0 for every known cluster ×
@@ -422,14 +427,16 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
     for state in ALL_VM_STATES {
         vm_counts.insert((state, ""), 0);
         for cluster in &clusters {
-            vm_counts.insert((state, cluster.id.as_str()), 0);
+            vm_counts.insert((state, cluster.name.as_str()), 0);
         }
     }
     for vm in &vms {
         let state = state_label(vm.state);
-        *vm_counts
-            .entry((state, vm.cluster_id.as_str()))
-            .or_insert(0) += 1;
+        let cluster_name = cluster_id_to_name
+            .get(vm.cluster_id.as_str())
+            .copied()
+            .unwrap_or("unknown");
+        *vm_counts.entry((state, cluster_name)).or_insert(0) += 1;
 
         let host_name = host_id_to_name
             .get(vm.host_id.as_str())
@@ -437,7 +444,7 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
             .unwrap_or("unknown");
         metrics
             .vm_age_in_state_seconds
-            .with_label_values(&[&vm.id, &vm.name, state, host_name, &vm.cluster_id])
+            .with_label_values(&[&vm.id, &vm.name, state, host_name, cluster_name])
             .set(age_seconds(&vm.updated_at));
     }
     for ((state, cluster), count) in vm_counts {
