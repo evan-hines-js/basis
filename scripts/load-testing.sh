@@ -1,42 +1,55 @@
 #!/usr/bin/env bash
-# Load test: spawn N parallel smoke.sh workers forever, each with a
-# unique cluster/machine name so they don't collide on controller
-# state. Every worker loops `smoke.sh --quick --suffix=ltNNN`.
-# Ctrl-C stops the workers.
+# Load test: hammer one cluster with create/delete churn so the
+# scheduler runs the placement chain (capacity + anti-affinity + rank
+# + labels) thousands of times across whatever hosts are connected.
+# A single shared cluster is the realistic shape — anti-affinity is
+# per-cluster, so spreading the same cluster's VMs across hosts is
+# what we actually want to stress.
+#
+# Each "slot" worker runs forever:
+#   create VM → hold for random 10..60s → delete → repeat
+# `WORKERS` is the cap on concurrent VMs. With WORKERS=10 the cluster
+# has 0..10 VMs alive at any moment, depending on timing.
 #
 # Usage:
-#   scripts/load-testing.sh                    # 100 workers
+#   scripts/load-testing.sh                    # 10 workers, 10..60s VM lifetimes
 #   WORKERS=25 scripts/load-testing.sh
+#   MIN_HOLD_SECS=5 MAX_HOLD_SECS=15 scripts/load-testing.sh
 #   LOG_DIR=/var/log/basis scripts/load-testing.sh
 #
 # Failures surface in three places (in increasing verbosity):
 #   - This terminal, as a single line per failure (streamed live)
-#   - $LOG_DIR/failures.log, the aggregate of every worker's failures
-#   - $LOG_DIR/ltNNN.log, full stdout+stderr of each failing run
+#   - $LOG_DIR/failures.log, the aggregate of every slot's failures
+#   - $LOG_DIR/ltNNN.log, full stdout+stderr of each failing op
 #
-# And for progress:
-#   - $LOG_DIR/ltNNN.summary, one line per worker with counters and
-#     the most recent failure reason inline. `tail *.summary` tells
-#     you at a glance which workers are healthy and why unhealthy
-#     ones fell over.
+# Progress:
+#   - $LOG_DIR/ltNNN.summary, one line per slot with counters + last
+#     failure reason inline. `tail *.summary` tells you which slots
+#     are healthy and why unhealthy ones fell over.
+#   - $LOG_DIR/distribution.log, per-host VM counts every 10s. Shows
+#     the scheduler's anti-affinity spread in real time.
 
 set -euo pipefail
 
 : "${BASIS_ENDPOINT:?BASIS_ENDPOINT not set}"
 
-WORKERS="${WORKERS:-100}"
+WORKERS="${WORKERS:-10}"
+MIN_HOLD_SECS="${MIN_HOLD_SECS:-10}"
+MAX_HOLD_SECS="${MAX_HOLD_SECS:-60}"
 LOG_DIR="${LOG_DIR:-/tmp/basis-load}"
+CLUSTER_NAME="${CLUSTER_NAME:-loadtest}"
+EXTERNAL_POOL="${EXTERNAL_POOL:-cell-public}"
+EXTERNAL_SERVICE_IPS="${EXTERNAL_SERVICE_IPS:-2}"
+DISTRIBUTION_INTERVAL_SECS="${DISTRIBUTION_INTERVAL_SECS:-10}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SMOKE="$SCRIPT_DIR/smoke.sh"
+FIXTURES="$REPO_ROOT/crates/basis-ctl/fixtures"
+BIN="$REPO_ROOT/target/release/basis-ctl"
 
-# Same fallback resolution smoke.sh uses: when BASIS_TLS_* is unset
-# OR points at a path that doesn't exist (e.g. an operator's stale
-# .basis.credentials still pointing at /root/deploy/...), fall back
-# to the rsync'd repo's $REPO_ROOT/deploy/ansible/pki/. Without this,
-# running on the build hypervisor as root errors out with a generic
-# "No such file" from tonic instead of a diagnosable message.
+# PKI fallback (mirrors smoke.sh): rsync.sh syncs deploy/ansible/pki/
+# to every host, so unset/stale BASIS_TLS_* paths fall back there
+# rather than blowing up with a bare "No such file" from tonic.
 PKI_DEFAULT_DIR="$REPO_ROOT/deploy/ansible/pki"
 resolve_pki() {
     local var="$1" filename="$2" current
@@ -61,10 +74,11 @@ resolve_pki BASIS_TLS_CERT capi-provider.crt
 resolve_pki BASIS_TLS_KEY  capi-provider.key
 
 # Start clean so stale failure captures from a prior run don't
-# confuse `tail failures.log`. Per-worker logs will be recreated.
+# confuse `tail failures.log`. Per-slot logs will be recreated.
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
 : >"$LOG_DIR/failures.log"
+: >"$LOG_DIR/distribution.log"
 
 echo "building basis-ctl..."
 # Same cargo resolution smoke.sh uses — prefer the rustup toolchain
@@ -80,9 +94,25 @@ if [[ -x /var/cache/holo-build/cargo/bin/cargo ]]; then
 else
     (cd "$REPO_ROOT" && cargo build --release --quiet -p basis-ctl)
 fi
-export SMOKE_SKIP_BUILD=1
+[[ -x "$BIN" ]] || { echo "FAIL: basis-ctl missing at $BIN"; exit 2; }
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/basis-load.XXXXXX")"
+
+# One shared cluster. Generated rather than using the shipped fixture
+# so CLUSTER_NAME / EXTERNAL_POOL are operator-tunable.
+CLUSTER_FIXTURE="$TMP_DIR/cluster.yaml"
+cat >"$CLUSTER_FIXTURE" <<YAML
+apiVersion: basis.dev/v1
+kind: Cluster
+metadata:
+  name: $CLUSTER_NAME
+spec:
+  externalIpPool: $EXTERNAL_POOL
+  externalServiceIps: $EXTERNAL_SERVICE_IPS
+YAML
 
 PIDS=()
+DIST_PID=""
 
 stop() {
     echo
@@ -90,7 +120,16 @@ stop() {
     for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
+    [[ -n "$DIST_PID" ]] && kill "$DIST_PID" 2>/dev/null || true
     wait 2>/dev/null || true
+
+    echo
+    echo "tearing down cluster $CLUSTER_NAME (cascades all VMs)..."
+    "$BIN" delete -f "$CLUSTER_FIXTURE" >/dev/null 2>&1 \
+        || echo "  warn: cluster delete returned non-zero (may already be gone)"
+
+    rm -rf "$TMP_DIR"
+
     echo
     echo "final summary:"
     shopt -s nullglob
@@ -102,12 +141,10 @@ stop() {
     local total_fails
     total_fails="$(wc -l <"$LOG_DIR/failures.log" | tr -d ' ')"
     echo "total failures: $total_fails  (see $LOG_DIR/failures.log)"
+    echo "host distribution log: $LOG_DIR/distribution.log"
 }
 trap stop EXIT INT TERM
 
-# Pull the first interesting error line out of a captured run. Prefers
-# the smoke.sh-emitted "FAIL:" assertion, falls back to "Error:"
-# (basis-ctl RPC surface), falls back to the last non-blank line.
 extract_reason() {
     local f="$1"
     local line
@@ -115,72 +152,140 @@ extract_reason() {
     if [[ -z "$line" ]]; then
         line="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -1 || true)"
     fi
-    # Trim to one line and cap length so summary lines stay readable.
     printf '%s' "${line:0:240}"
 }
 
+# Per-slot worker. Each slot owns one VM at a time: create, hold,
+# delete, repeat. Random hold time means slots desynchronize after
+# the first cycle so create/delete operations spread out across the
+# wall clock (instead of stampeding the controller every N seconds).
 worker() {
-    local suffix="$1"
-    local log="$LOG_DIR/$suffix.log"
-    local current="$LOG_DIR/$suffix.current"
-    local summary="$LOG_DIR/$suffix.summary"
-    local runs=0 fails=0 last_fail_at="-" last_fail_reason="-"
+    local slot="$1"
+    local log="$LOG_DIR/$slot.log"
+    local current="$LOG_DIR/$slot.current"
+    local summary="$LOG_DIR/$slot.summary"
+    local creates=0 deletes=0 fails=0 last_fail_at="-" last_fail_reason="-"
 
-    # Write an initial summary so `tail *.summary` works immediately.
-    printf 'worker=%s runs=0 fails=0 last_fail=-\n' "$suffix" >"$summary"
+    printf 'slot=%s creates=0 deletes=0 fails=0 last_fail=-\n' "$slot" >"$summary"
+
+    # Per-slot machine fixture, regenerated each cycle so the VM name
+    # carries the slot suffix (idempotent: re-applying same spec hits
+    # `create_machine`'s name-based idempotency rather than a fresh
+    # slot each cycle, which is what we want — an apply-then-delete
+    # cadence that exercises the scheduler on each create).
+    local machine_fixture="$TMP_DIR/$slot-machine.yaml"
+    local machine_name="loadtest-$slot"
+    cat >"$machine_fixture" <<YAML
+apiVersion: basis.dev/v1
+kind: Machine
+metadata:
+  name: $machine_name
+spec:
+  cluster: $CLUSTER_NAME
+  cpu: 2
+  memoryMib: 2048
+  diskGib: 10
+  image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
+  bootstrapDataFile: $FIXTURES/bootstrap-debug.yaml
+  gpus: 0
+YAML
+
+    record_failure() {
+        local op="$1"
+        fails=$((fails + 1))
+        last_fail_at="$(date -u +%FT%TZ)"
+        last_fail_reason="$op: $(extract_reason "$current")"
+        [[ -z "$last_fail_reason" ]] && last_fail_reason="$op: (empty output; see $log)"
+        {
+            echo "===== $op FAILED at $last_fail_at (creates=$creates deletes=$deletes) ====="
+            cat "$current"
+            echo
+        } >>"$log"
+        printf '[%s] %s %s: %s\n' \
+               "$last_fail_at" "$slot" "$op" "$last_fail_reason" \
+               >>"$LOG_DIR/failures.log"
+        printf '%s %s %s FAIL: %s\n' \
+               "$last_fail_at" "$slot" "$op" "$last_fail_reason" >&2
+    }
 
     while :; do
-        runs=$((runs + 1))
-        if "$SMOKE" --quick "--suffix=$suffix" \
-                >"$current" 2>&1; then
-            :
+        if "$BIN" apply -f "$machine_fixture" >"$current" 2>&1; then
+            creates=$((creates + 1))
         else
-            fails=$((fails + 1))
-            last_fail_at="$(date -u +%FT%TZ)"
-            last_fail_reason="$(extract_reason "$current")"
-            [[ -z "$last_fail_reason" ]] && last_fail_reason="(empty output; see $log)"
-
-            # Append the full failing run to per-worker log.
-            {
-                echo "===== run $runs FAILED at $last_fail_at ====="
-                cat "$current"
-                echo
-            } >>"$log"
-
-            # Short form → shared failures.log AND the main terminal.
-            # POSIX guarantees atomic writes below PIPE_BUF (~4 KiB),
-            # so two workers appending short lines won't interleave.
-            printf '[%s] %s run=%d: %s\n' \
-                   "$last_fail_at" "$suffix" "$runs" "$last_fail_reason" \
-                   >>"$LOG_DIR/failures.log"
-            printf '%s %s run=%d FAIL: %s\n' \
-                   "$last_fail_at" "$suffix" "$runs" "$last_fail_reason" >&2
+            record_failure "create"
+            sleep 1
+            continue
         fi
-        printf 'worker=%s runs=%d fails=%d last_fail_at=%s last_fail=%s\n' \
-               "$suffix" "$runs" "$fails" "$last_fail_at" "$last_fail_reason" \
+
+        local hold=$((MIN_HOLD_SECS + RANDOM % (MAX_HOLD_SECS - MIN_HOLD_SECS + 1)))
+        sleep "$hold"
+
+        if "$BIN" delete -f "$machine_fixture" >"$current" 2>&1; then
+            deletes=$((deletes + 1))
+        else
+            record_failure "delete"
+            sleep 1
+        fi
+
+        printf 'slot=%s creates=%d deletes=%d fails=%d last_fail_at=%s last_fail=%s\n' \
+               "$slot" "$creates" "$deletes" "$fails" "$last_fail_at" "$last_fail_reason" \
                >"$summary"
     done
 }
 
+# Periodic snapshot of how many VMs each host is carrying. Reads from
+# the controller via `get-machines`; the third column is the host id.
+# Anti-affinity is per-cluster, so a healthy spread looks like
+# (count_h1 - count_h2) bouncing around 0; a stuck-on-one-host pattern
+# is a regression in either anti-affinity scoring or label filtering.
+distribution_logger() {
+    while :; do
+        local ts
+        ts="$(date -u +%FT%TZ)"
+        # `get-machines` columns: id name state ip host. We only care
+        # about state=RUNNING so failed/pending don't skew the picture.
+        local snapshot
+        snapshot="$("$BIN" get-machines 2>/dev/null \
+            | awk -v cluster="$CLUSTER_NAME" '
+                NR == 1 { next }                  # header
+                $2 ~ ("^loadtest-") && $3 == "RUNNING" { print $5 }
+              ' \
+            | sort | uniq -c | awk '{ printf "%s=%d ", $2, $1 }')"
+        [[ -z "$snapshot" ]] && snapshot="(no running VMs)"
+        printf '%s %s\n' "$ts" "$snapshot" >>"$LOG_DIR/distribution.log"
+        sleep "$DISTRIBUTION_INTERVAL_SECS"
+    done
+}
+
+echo "creating shared cluster $CLUSTER_NAME..."
+"$BIN" apply -f "$CLUSTER_FIXTURE" \
+    || { echo "FAIL: cluster apply failed; see controller log"; exit 1; }
+
 cat <<EOF
-starting $WORKERS workers, logs in $LOG_DIR/
+
+starting $WORKERS slot workers, hold time ${MIN_HOLD_SECS}..${MAX_HOLD_SECS}s
+logs in $LOG_DIR/
 
 live failures stream to this terminal below.
 
 from another shell:
-  tail -f $LOG_DIR/failures.log   # aggregate failure stream
-  tail    $LOG_DIR/*.summary      # per-worker counters + last fail reason
-  less    $LOG_DIR/ltNNN.log      # full captured output of each failing run
+  tail -f $LOG_DIR/failures.log      # aggregate failure stream
+  tail -f $LOG_DIR/distribution.log  # per-host VM counts (anti-affinity check)
+  tail    $LOG_DIR/*.summary         # per-slot counters + last fail reason
+  less    $LOG_DIR/ltNNN.log         # full output of each failing op
 
-ctrl-c to stop.
+ctrl-c to stop (cluster + all VMs cleaned up on exit).
 ----------
 EOF
 
+distribution_logger &
+DIST_PID=$!
+
 for i in $(seq 1 "$WORKERS"); do
-    suffix="$(printf 'lt%03d' "$i")"
-    worker "$suffix" &
+    slot="$(printf 'lt%03d' "$i")"
+    worker "$slot" &
     PIDS+=($!)
 done
 
-echo "$WORKERS workers running."
+echo "$WORKERS slots running, distribution snapshots every ${DISTRIBUTION_INTERVAL_SECS}s."
 wait || true
