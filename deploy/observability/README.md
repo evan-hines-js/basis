@@ -65,6 +65,19 @@ name probably drifted, not the scrape.
 - `basis_vm_create_duration_seconds{result}` — end-to-end CreateMachine latency, same `result` labels as the counter
 - `basis_vm_time_to_running_seconds` — CREATING → RUNNING provisioning time, observed even after a CreateMachine timeout
 
+## Metrics the agent emits
+
+Per-step create latency (see `basis-agent` dashboard for the full set):
+- `basis_agent_image_ensure_cached_seconds`, `basis_agent_lv_snapshot_seconds`, `basis_agent_data_disk_create_seconds`, `basis_agent_cloud_init_iso_seconds`, `basis_agent_tap_create_seconds`, `basis_agent_vfio_bind_seconds`, `basis_agent_vm_spawn_seconds`, `basis_agent_lv_permit_wait_seconds`
+- `basis_agent_orphan_sweep_reclaimed_total{kind}` — counter
+
+Per-VM gauges, refreshed every 5s from the agent DB and systemd's per-unit accounting (`CPUUsageNSec`, `MemoryCurrent`, `SubState`):
+- `basis_agent_vm_info{vm_id, name, ip, image}` — always 1; join target for the runtime gauges below
+- `basis_agent_vm_running{vm_id}` — 1 iff cloud-hypervisor is alive in the unit
+- `basis_agent_vm_cpu_seconds{vm_id}` — cumulative cgroup CPU seconds; use `rate()` for vCPU usage
+- `basis_agent_vm_memory_bytes{vm_id}`, `basis_agent_vm_memory_limit_bytes{vm_id}`
+- `basis_agent_vm_cpu_quota{vm_id}`, `basis_agent_vm_disk_gib{vm_id}` — allocations
+
 ## Layout
 
 ```

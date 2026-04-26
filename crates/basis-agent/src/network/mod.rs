@@ -387,9 +387,7 @@ pub(crate) async fn ensure_tree_masquerade(
     ensure_iptables_rule(
         "nat",
         "POSTROUTING",
-        &[
-            "-s", tree_cidr, "-o", uplink, "-j", "MASQUERADE",
-        ],
+        &["-s", tree_cidr, "-o", uplink, "-j", "MASQUERADE"],
     )
     .await?;
     // `--clamp-mss-to-pmtu` rewrites MSS in TCP SYN/SYN-ACK to the
@@ -400,13 +398,23 @@ pub(crate) async fn ensure_tree_masquerade(
         "mangle",
         "FORWARD",
         &[
-            "-s", tree_cidr,
-            "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-            "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+            "-s",
+            tree_cidr,
+            "-p",
+            "tcp",
+            "--tcp-flags",
+            "SYN,RST",
+            "SYN",
+            "-j",
+            "TCPMSS",
+            "--clamp-mss-to-pmtu",
         ],
     )
     .await?;
-    info!(tree_cidr, uplink, "installed per-tree MASQUERADE + MSS clamp");
+    info!(
+        tree_cidr,
+        uplink, "installed per-tree MASQUERADE + MSS clamp"
+    );
     Ok(())
 }
 
@@ -424,9 +432,16 @@ pub(crate) async fn remove_tree_masquerade(tree_cidr: &str, uplink: &str) {
         "mangle",
         "FORWARD",
         &[
-            "-s", tree_cidr,
-            "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-            "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+            "-s",
+            tree_cidr,
+            "-p",
+            "tcp",
+            "--tcp-flags",
+            "SYN,RST",
+            "SYN",
+            "-j",
+            "TCPMSS",
+            "--clamp-mss-to-pmtu",
         ],
     )
     .await;
@@ -452,11 +467,7 @@ async fn ensure_vxlan_spoof_guard() -> Result<(), NetworkError> {
     .await
 }
 
-async fn ensure_iptables_rule(
-    table: &str,
-    chain: &str,
-    spec: &[&str],
-) -> Result<(), NetworkError> {
+async fn ensure_iptables_rule(table: &str, chain: &str, spec: &[&str]) -> Result<(), NetworkError> {
     let mut check_args = vec!["-t", table, "-C", chain];
     check_args.extend_from_slice(spec);
     let exists = Command::new("iptables").args(&check_args).output().await?;

@@ -114,6 +114,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    {
+        let rt = runtime.read().await;
+        let metrics = rt.metrics.clone();
+        let agent_db = rt.agent_db.clone();
+        let vm_mgr = rt.vm_mgr.clone();
+        tokio::spawn(metrics::run_vm_poller(
+            metrics,
+            agent_db,
+            vm_mgr,
+            CancellationToken::new(),
+        ));
+    }
+
     // Loops that outlive individual sessions — host-local state the
     // controller isn't involved in. Spawning these inside `run_session`
     // would leak one extra copy each time the controller stream

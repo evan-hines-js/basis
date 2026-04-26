@@ -10,6 +10,7 @@
 //! separate port, Prometheus scrapes it directly.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::{
     extract::State,
@@ -18,10 +19,17 @@ use axum::{
     routing::get,
     Router,
 };
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, GaugeVec, Histogram, HistogramOpts, IntCounterVec, IntGaugeVec, Opts, Registry,
+    TextEncoder,
+};
 use tokio::net::TcpListener;
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
+
+use crate::db::AgentDb;
+use crate::vm::{unit_name_for_vm, VmManager};
 
 /// Process-wide `Metrics` handle.
 ///
@@ -69,6 +77,42 @@ pub struct Metrics {
     /// means the leak is faster than the sweep; investigate the happy
     /// path rather than tuning the sweep.
     pub orphan_sweep_reclaimed_total: IntCounterVec,
+
+    // --- Per-VM gauges (refreshed by `run_vm_poller`) ---
+    /// Identity / allocation labels for every VM the agent currently
+    /// manages, set to `1`. Designed to be joined into the runtime
+    /// gauges below by `vm_id` so dashboards can pull `name`, `ip`,
+    /// `image`, `cluster` (last segment of vm name's prefix is opaque
+    /// — agent doesn't know cluster, only vm_id/name) into the same
+    /// row. Cardinality is bounded by the live VM count on this host;
+    /// `reset()` between polls so deleted VMs drop off cleanly.
+    pub vm_info: IntGaugeVec,
+    /// 1 iff the VM's systemd unit currently has a live cloud-hypervisor
+    /// process (same predicate as `VmManager::has_live_process`). 0 means
+    /// the unit exists but the process exited — usually FAILED.
+    pub vm_running: IntGaugeVec,
+    /// CPU seconds consumed by the VM's cloud-hypervisor process,
+    /// accumulated by systemd via `CPUUsageNSec`. Exposed as a gauge
+    /// rather than a counter because we read a wall-clock-cumulative
+    /// value from systemd — Prometheus's `rate()` over the gauge gives
+    /// the same answer as if we treated it as a counter, and a counter
+    /// with `reset()` semantics would falsely emit a reset every poll
+    /// for VMs that haven't changed.
+    pub vm_cpu_seconds: GaugeVec,
+    /// Resident memory currently in use by the VM, from systemd's
+    /// `MemoryCurrent`. Compare against `vm_memory_limit_bytes` to spot
+    /// guests that are about to OOM.
+    pub vm_memory_bytes: IntGaugeVec,
+    /// Allocated memory ceiling (MemoryMax) — what we asked systemd to
+    /// cap the VM's cgroup at. Equal to `--memory=size=` from create.
+    pub vm_memory_limit_bytes: IntGaugeVec,
+    /// vCPU count assigned to the VM. Constant per VM; surfaced as a
+    /// gauge so dashboards can compute "CPU seconds per vCPU" without
+    /// rejoining against a separate config table.
+    pub vm_cpu_quota: IntGaugeVec,
+    /// Sum of root + extra-disk allocations in GiB. Constant per VM;
+    /// useful as the "size" column in the per-VM table panel.
+    pub vm_disk_gib: IntGaugeVec,
 }
 
 impl Metrics {
@@ -184,6 +228,71 @@ impl Metrics {
         )?;
         registry.register(Box::new(orphan_sweep_reclaimed_total.clone()))?;
 
+        let vm_info = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_vm_info",
+                "Per-VM identity / allocation labels (always 1). Join \
+                 against per-VM runtime gauges by vm_id to enrich them \
+                 with name / ip / image",
+            ),
+            &["vm_id", "name", "ip", "image"],
+        )?;
+        registry.register(Box::new(vm_info.clone()))?;
+
+        let vm_running = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_vm_running",
+                "1 iff the VM's systemd unit currently has a live \
+                 cloud-hypervisor process",
+            ),
+            &["vm_id"],
+        )?;
+        registry.register(Box::new(vm_running.clone()))?;
+
+        let vm_cpu_seconds = GaugeVec::new(
+            Opts::new(
+                "basis_agent_vm_cpu_seconds",
+                "Total CPU seconds consumed by the VM's cgroup, from \
+                 systemd's CPUUsageNSec. Use rate() to derive vCPU usage",
+            ),
+            &["vm_id"],
+        )?;
+        registry.register(Box::new(vm_cpu_seconds.clone()))?;
+
+        let vm_memory_bytes = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_vm_memory_bytes",
+                "Resident memory in use by the VM (systemd MemoryCurrent)",
+            ),
+            &["vm_id"],
+        )?;
+        registry.register(Box::new(vm_memory_bytes.clone()))?;
+
+        let vm_memory_limit_bytes = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_vm_memory_limit_bytes",
+                "Memory ceiling configured for the VM cgroup (matches \
+                 cloud-hypervisor --memory)",
+            ),
+            &["vm_id"],
+        )?;
+        registry.register(Box::new(vm_memory_limit_bytes.clone()))?;
+
+        let vm_cpu_quota = IntGaugeVec::new(
+            Opts::new("basis_agent_vm_cpu_quota", "vCPUs assigned to the VM"),
+            &["vm_id"],
+        )?;
+        registry.register(Box::new(vm_cpu_quota.clone()))?;
+
+        let vm_disk_gib = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_vm_disk_gib",
+                "Sum of root + extra-disk allocations for the VM, in GiB",
+            ),
+            &["vm_id"],
+        )?;
+        registry.register(Box::new(vm_disk_gib.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
             image_ensure_cached_seconds,
@@ -195,6 +304,13 @@ impl Metrics {
             vm_spawn_seconds,
             lv_permit_wait_seconds,
             orphan_sweep_reclaimed_total,
+            vm_info,
+            vm_running,
+            vm_cpu_seconds,
+            vm_memory_bytes,
+            vm_memory_limit_bytes,
+            vm_cpu_quota,
+            vm_disk_gib,
         }))
     }
 
@@ -247,4 +363,148 @@ async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRespon
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         metrics.render(),
     )
+}
+
+/// Cadence of the per-VM gauge refresh. Same 5s the controller's
+/// `refresh()` uses — short enough that a Grafana table panel feels
+/// live, long enough that `systemctl show` for every VM doesn't show
+/// up in the agent's CPU profile.
+const VM_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Periodic poller that refreshes the per-VM gauges from the agent DB
+/// and systemd's per-unit accounting. Runs for the lifetime of the
+/// agent; cancellable via the shutdown token mostly so tests don't
+/// leak the task.
+pub async fn run_vm_poller(
+    metrics: Arc<Metrics>,
+    agent_db: AgentDb,
+    vm_mgr: Arc<VmManager>,
+    shutdown: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(VM_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = interval.tick() => {
+                if let Err(e) = refresh_vm_gauges(&metrics, &agent_db, &vm_mgr).await {
+                    warn!(error = %e, "per-VM metrics refresh failed");
+                }
+            }
+        }
+    }
+}
+
+/// One pass of the refresh loop. Resets the per-VM label sets first so
+/// a deleted VM stops emitting stale `running=1` / memory readings on
+/// the next scrape — same pattern the controller's `refresh()` uses.
+async fn refresh_vm_gauges(
+    metrics: &Metrics,
+    agent_db: &AgentDb,
+    vm_mgr: &Arc<VmManager>,
+) -> anyhow::Result<()> {
+    let vms = agent_db.list_vms().await?;
+
+    metrics.vm_info.reset();
+    metrics.vm_running.reset();
+    metrics.vm_cpu_seconds.reset();
+    metrics.vm_memory_bytes.reset();
+    metrics.vm_memory_limit_bytes.reset();
+    metrics.vm_cpu_quota.reset();
+    metrics.vm_disk_gib.reset();
+
+    for vm in &vms {
+        let vm_id = vm.vm_id.as_str();
+
+        metrics
+            .vm_info
+            .with_label_values(&[vm_id, &vm.name, &vm.ip_address, &vm.image])
+            .set(1);
+        metrics.vm_cpu_quota.with_label_values(&[vm_id]).set(vm.cpu);
+
+        let total_disk_gib = vm.disk_gib + vm.extra_disks().iter().map(|g| *g as i64).sum::<i64>();
+        metrics
+            .vm_disk_gib
+            .with_label_values(&[vm_id])
+            .set(total_disk_gib);
+        metrics
+            .vm_memory_limit_bytes
+            .with_label_values(&[vm_id])
+            .set(vm.memory_mib * 1024 * 1024);
+
+        // is_pending elides the systemctl probe — for a mid-create VM
+        // the unit may not exist yet and `systemctl show` returns junk
+        // values that we'd otherwise publish as zeros.
+        if vm_mgr.is_pending(vm_id).await {
+            metrics.vm_running.with_label_values(&[vm_id]).set(0);
+            continue;
+        }
+
+        let stats = read_unit_stats(&unit_name_for_vm(vm_id)).await;
+        metrics
+            .vm_running
+            .with_label_values(&[vm_id])
+            .set(if stats.running { 1 } else { 0 });
+        if let Some(ns) = stats.cpu_nsec {
+            metrics
+                .vm_cpu_seconds
+                .with_label_values(&[vm_id])
+                .set(ns as f64 / 1e9);
+        }
+        if let Some(b) = stats.memory_current {
+            metrics
+                .vm_memory_bytes
+                .with_label_values(&[vm_id])
+                .set(b as i64);
+        }
+    }
+    Ok(())
+}
+
+/// Per-unit accounting snapshot read from systemd via `systemctl show`.
+/// `None` for a counter means "couldn't parse it" — usually because the
+/// unit just exited and systemd is reporting `[not set]`. We elide the
+/// gauge update in that case so a transient hiccup doesn't blip a real
+/// reading down to zero.
+struct UnitStats {
+    running: bool,
+    cpu_nsec: Option<u64>,
+    memory_current: Option<u64>,
+}
+
+async fn read_unit_stats(unit: &str) -> UnitStats {
+    // One `systemctl show` query for all three properties keeps this to
+    // a single fork per VM per poll, vs three separate calls.
+    let out = Command::new("systemctl")
+        .args([
+            "show",
+            "--property=SubState",
+            "--property=CPUUsageNSec",
+            "--property=MemoryCurrent",
+            unit,
+        ])
+        .output()
+        .await;
+    let mut stats = UnitStats {
+        running: false,
+        cpu_nsec: None,
+        memory_current: None,
+    };
+    let Ok(out) = out else { return stats };
+    if !out.status.success() {
+        return stats;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    for line in body.lines() {
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "SubState" => stats.running = val.trim() == "running",
+            "CPUUsageNSec" => stats.cpu_nsec = val.trim().parse::<u64>().ok(),
+            "MemoryCurrent" => stats.memory_current = val.trim().parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    stats
 }

@@ -23,9 +23,6 @@
 set -euo pipefail
 
 : "${BASIS_ENDPOINT:?BASIS_ENDPOINT not set}"
-: "${BASIS_TLS_CA:?BASIS_TLS_CA not set}"
-: "${BASIS_TLS_CERT:?BASIS_TLS_CERT not set}"
-: "${BASIS_TLS_KEY:?BASIS_TLS_KEY not set}"
 
 WORKERS="${WORKERS:-100}"
 LOG_DIR="${LOG_DIR:-/tmp/basis-load}"
@@ -34,6 +31,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SMOKE="$SCRIPT_DIR/smoke.sh"
 
+# Same fallback resolution smoke.sh uses: when BASIS_TLS_* is unset
+# OR points at a path that doesn't exist (e.g. an operator's stale
+# .basis.credentials still pointing at /root/deploy/...), fall back
+# to the rsync'd repo's $REPO_ROOT/deploy/ansible/pki/. Without this,
+# running on the build hypervisor as root errors out with a generic
+# "No such file" from tonic instead of a diagnosable message.
+PKI_DEFAULT_DIR="$REPO_ROOT/deploy/ansible/pki"
+resolve_pki() {
+    local var="$1" filename="$2" current
+    current="${!var:-}"
+    if [[ -n "$current" && -f "$current" ]]; then
+        return 0
+    fi
+    local fallback="$PKI_DEFAULT_DIR/$filename"
+    if [[ -f "$fallback" ]]; then
+        if [[ -n "$current" ]]; then
+            echo "  warn: $var=$current does not exist; falling back to $fallback" >&2
+        fi
+        printf -v "$var" '%s' "$fallback"
+        export "${var?}"
+        return 0
+    fi
+    echo "FAIL: $var unset (or stale) and no fallback at $fallback" >&2
+    exit 2
+}
+resolve_pki BASIS_TLS_CA   ca.crt
+resolve_pki BASIS_TLS_CERT capi-provider.crt
+resolve_pki BASIS_TLS_KEY  capi-provider.key
+
 # Start clean so stale failure captures from a prior run don't
 # confuse `tail failures.log`. Per-worker logs will be recreated.
 rm -rf "$LOG_DIR"
@@ -41,7 +67,19 @@ mkdir -p "$LOG_DIR"
 : >"$LOG_DIR/failures.log"
 
 echo "building basis-ctl..."
-(cd "$REPO_ROOT" && cargo build --release --quiet -p basis-ctl)
+# Same cargo resolution smoke.sh uses — prefer the rustup toolchain
+# the basis-holod ansible role installs. Hypervisors run Ubuntu's
+# apt rustc 1.85, below the `time` crate's 1.88 MSRV; falling back
+# to system cargo on those hosts produces an inscrutable dep-graph
+# error.
+if [[ -x /var/cache/holo-build/cargo/bin/cargo ]]; then
+    (cd "$REPO_ROOT" && \
+     RUSTUP_HOME=/var/cache/holo-build/rustup \
+     CARGO_HOME=/var/cache/holo-build/cargo \
+        /var/cache/holo-build/cargo/bin/cargo build --release --quiet -p basis-ctl)
+else
+    (cd "$REPO_ROOT" && cargo build --release --quiet -p basis-ctl)
+fi
 export SMOKE_SKIP_BUILD=1
 
 PIDS=()

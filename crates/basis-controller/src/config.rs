@@ -354,8 +354,7 @@ impl NetworkConfig {
             // Spotting it here means the operator sees the error during
             // `ansible-playbook`, not when the first cluster apply
             // bounces with a cryptic alignment message.
-            let service_prefix =
-                32 - self.default_external_service_ips.trailing_zeros() as u8;
+            let service_prefix = 32 - self.default_external_service_ips.trailing_zeros() as u8;
             if service_prefix < 32 && net.prefix_len() + 2 > service_prefix {
                 anyhow::bail!(
                     "pool '{}' cidr {net} can't fit a /{service_prefix} service block \

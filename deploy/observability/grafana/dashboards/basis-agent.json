@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Per-agent VM create pipeline breakdown. Each histogram is observed on the agent at one step of handlers::create_vm_inner — when the controller dashboard shows an end-to-end latency jump, this dashboard tells you which step moved. Filter by host via the `instance` variable.",
+  "description": "Per-agent VM create pipeline breakdown plus per-VM resource usage. Each histogram is observed on the agent at one step of handlers::create_vm_inner — when the controller dashboard shows an end-to-end latency jump, this dashboard tells you which step moved. The per-VM section shows live cgroup accounting for every VM the agent currently manages. Filter by host via the `instance` variable.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -226,6 +226,208 @@
       ],
       "title": "Mean time per step",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 },
+      "id": 300,
+      "panels": [],
+      "title": "Per-VM (live on this agent)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Every VM the selected agent currently manages, with its identity, allocation, and live cgroup readings. Memory is the systemd MemoryCurrent gauge; CPU is the rate of CPUUsageNSec over the last minute, normalized so 1.0 means one fully-saturated vCPU. Running=0 with the unit still listed means cloud-hypervisor exited but systemd's --remain-after-exit kept the unit visible — usually FAILED.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "left", "displayMode": "auto" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "memory_bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] },
+          { "matcher": { "id": "byName", "options": "memory_limit_bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] },
+          { "matcher": { "id": "byName", "options": "disk_gib" }, "properties": [{ "id": "unit", "value": "gbytes" }] },
+          { "matcher": { "id": "byName", "options": "cpu_used" }, "properties": [{ "id": "unit", "value": "none" }, { "id": "decimals", "value": 2 }] }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 21 },
+      "id": 30,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_agent_vm_info{instance=~\"$instance\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "INFO"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_agent_vm_running{instance=~\"$instance\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "RUN"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_agent_vm_cpu_quota{instance=~\"$instance\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "QUOTA"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_vm_cpu_seconds{instance=~\"$instance\"}[1m])",
+          "format": "table",
+          "instant": true,
+          "refId": "CPUUSE"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_agent_vm_memory_bytes{instance=~\"$instance\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "MEM"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_agent_vm_memory_limit_bytes{instance=~\"$instance\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "MEMLIM"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_agent_vm_disk_gib{instance=~\"$instance\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "DISK"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": { "byField": "vm_id", "mode": "outer" }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true, "Time 2": true, "Time 3": true,
+              "Time 4": true, "Time 5": true, "Time 6": true, "Time 7": true,
+              "__name__ 1": true, "__name__ 2": true, "__name__ 3": true,
+              "__name__ 4": true, "__name__ 5": true, "__name__ 6": true, "__name__ 7": true,
+              "job 1": true, "job 2": true, "job 3": true,
+              "job 4": true, "job 5": true, "job 6": true, "job 7": true,
+              "instance 2": true, "instance 3": true,
+              "instance 4": true, "instance 5": true, "instance 6": true, "instance 7": true
+            },
+            "renameByName": {
+              "instance 1": "instance",
+              "Value #INFO": "info",
+              "Value #RUN": "running",
+              "Value #QUOTA": "vcpus",
+              "Value #CPUUSE": "cpu_used",
+              "Value #MEM": "memory_bytes",
+              "Value #MEMLIM": "memory_limit_bytes",
+              "Value #DISK": "disk_gib"
+            },
+            "indexByName": {
+              "vm_id": 0,
+              "name": 1,
+              "ip": 2,
+              "image": 3,
+              "running": 4,
+              "vcpus": 5,
+              "cpu_used": 6,
+              "memory_bytes": 7,
+              "memory_limit_bytes": 8,
+              "disk_gib": 9
+            }
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "vm_id",
+                "name",
+                "ip",
+                "image",
+                "instance",
+                "running",
+                "vcpus",
+                "cpu_used",
+                "memory_bytes",
+                "memory_limit_bytes",
+                "disk_gib"
+              ]
+            }
+          }
+        }
+      ],
+      "title": "VMs on this agent",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Per-VM CPU usage, expressed in vCPUs (1.0 = one fully-saturated vCPU). Derived from rate() of the cgroup CPUUsageNSec gauge. A line riding at the VM's vcpu allocation means the guest is CPU-bound; a line near zero means the guest is idle even though it's still running.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "spanNulls": true },
+          "min": 0,
+          "unit": "none",
+          "decimals": 2
+        }
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 31 },
+      "id": 31,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rate(basis_agent_vm_cpu_seconds{instance=~\"$instance\"}[1m]) * on(vm_id) group_left(name) basis_agent_vm_info{instance=~\"$instance\"}",
+          "legendFormat": "{{name}} ({{vm_id}})",
+          "refId": "A"
+        }
+      ],
+      "title": "CPU used per VM (vCPUs)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Per-VM resident memory from the cgroup, with the configured ceiling shown alongside via basis_agent_vm_memory_limit_bytes. A VM whose `memory_bytes` line is pegged at its limit is the right place to look first when a guest workload reports OOMs.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "spanNulls": true },
+          "min": 0,
+          "unit": "bytes"
+        }
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 31 },
+      "id": 32,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_agent_vm_memory_bytes{instance=~\"$instance\"} * on(vm_id) group_left(name) basis_agent_vm_info{instance=~\"$instance\"}",
+          "legendFormat": "{{name}} ({{vm_id}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Memory used per VM",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
@@ -258,6 +460,6 @@
   "timezone": "browser",
   "title": "Basis Agent",
   "uid": "basis-agent",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }

@@ -638,12 +638,11 @@ impl Db {
         // search runs in memory — the range's typical width is well
         // under 256 IPs, and the writer is single-threaded so
         // serialization with concurrent allocations is automatic.
-        let used: Vec<String> = sqlx::query_scalar(
-            "SELECT ip_address FROM ip_allocations WHERE scope = ?",
-        )
-        .bind(scope)
-        .fetch_all(&mut *tx)
-        .await?;
+        let used: Vec<String> =
+            sqlx::query_scalar("SELECT ip_address FROM ip_allocations WHERE scope = ?")
+                .bind(scope)
+                .fetch_all(&mut *tx)
+                .await?;
         let used: std::collections::HashSet<u32> = used
             .into_iter()
             .filter_map(|s| s.parse::<Ipv4Addr>().ok().map(u32::from))
@@ -791,7 +790,6 @@ impl Db {
         })?;
         Ok(())
     }
-
 
     pub async fn get_cluster(&self, id: &str) -> Result<ClusterRow, DbError> {
         sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters WHERE id = ?")

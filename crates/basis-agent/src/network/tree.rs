@@ -393,11 +393,7 @@ async fn del_prefix_route(prefix: &str, bridge: &str) -> Result<(), NetworkError
 /// Make this host answer ARP for `addr` on the underlay. `replace`
 /// keeps it idempotent across reconciles.
 async fn add_proxy_arp(addr: &str, uplink: &str) -> Result<(), NetworkError> {
-    run_cmd(
-        "ip",
-        &["neigh", "replace", "proxy", addr, "dev", uplink],
-    )
-    .await
+    run_cmd("ip", &["neigh", "replace", "proxy", addr, "dev", uplink]).await
 }
 
 async fn del_proxy_arp(addr: &str, uplink: &str) -> Result<(), NetworkError> {

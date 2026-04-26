@@ -1,12 +1,18 @@
 #!/bin/bash
-# Sync basis source + ansible-issued PKI to the install host. The
-# pki/ dir under deploy/ansible/ rides along — lattice-cli install
-# on the remote sources `.basis.credentials` which `cat`s the certs
-# straight out of that synced directory. Re-rsync after every
-# ansible run to keep the install host's view of PKI current.
+# Sync basis source + ansible-issued PKI to the relevant hosts:
+#   - 10.0.0.131 — install host (lattice-cli install sources
+#     ~/basis/.basis.credentials, which `cat`s the synced PKI).
+#   - 10.0.0.206 — hypervisor used to run smoke.sh's Section 1
+#     end-to-end (the in-VM SSH + egress checks need a route into
+#     the tree CIDR, which only a hypervisor has).
+# Re-rsync after every ansible run to keep both hosts current.
 set -euo pipefail
-rsync -az --delete \
-  --exclude='build' \
-  --exclude='target' \
-  --exclude='node_modules' \
-  ../basis/ ubuntu@10.0.0.131:~/basis/
+# user@host pairs — 10.0.0.206 is provisioned with root login (no
+# unprivileged ubuntu user), the install host runs as ubuntu.
+for target in ubuntu@10.0.0.131 root@10.0.0.206; do
+  rsync -az --delete \
+    --exclude='build' \
+    --exclude='target' \
+    --exclude='node_modules' \
+    ../basis/ "$target:~/basis/"
+done

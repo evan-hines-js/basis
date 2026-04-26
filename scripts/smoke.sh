@@ -49,9 +49,40 @@
 set -euo pipefail
 
 : "${BASIS_ENDPOINT:?BASIS_ENDPOINT not set (e.g. https://10.0.0.206:7443)}"
-: "${BASIS_TLS_CA:?BASIS_TLS_CA not set (path to ca.crt)}"
-: "${BASIS_TLS_CERT:?BASIS_TLS_CERT not set (path to capi-provider.crt)}"
-: "${BASIS_TLS_KEY:?BASIS_TLS_KEY not set (path to capi-provider.key)}"
+
+# PKI path resolution. ansible writes the issued certs into the repo's
+# deploy/ansible/pki/ on the install host, and rsync.sh syncs that
+# whole tree to every other host — so the rsync'd checkout reliably
+# has working certs at $REPO_ROOT/deploy/ansible/pki/. We use those
+# as the fallback when the BASIS_TLS_* env vars are unset OR set to a
+# stale path (e.g. an operator's .basis.credentials still pointing at
+# /root/deploy/... from before the repo moved under ~/basis/). Without
+# this fallback, the only signal is a generic "No such file" from the
+# tonic TLS loader, which usually sends people on a long detour.
+SCRIPT_DIR_FOR_PKI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT_FOR_PKI="$(cd "$SCRIPT_DIR_FOR_PKI/.." && pwd)"
+PKI_DEFAULT_DIR="$REPO_ROOT_FOR_PKI/deploy/ansible/pki"
+resolve_pki() {
+    local var="$1" filename="$2" current
+    current="${!var:-}"
+    if [[ -n "$current" && -f "$current" ]]; then
+        return 0
+    fi
+    local fallback="$PKI_DEFAULT_DIR/$filename"
+    if [[ -f "$fallback" ]]; then
+        if [[ -n "$current" ]]; then
+            echo "  warn: $var=$current does not exist; falling back to $fallback" >&2
+        fi
+        printf -v "$var" '%s' "$fallback"
+        export "${var?}"
+        return 0
+    fi
+    echo "FAIL: $var unset (or stale) and no fallback at $fallback" >&2
+    exit 2
+}
+resolve_pki BASIS_TLS_CA   ca.crt
+resolve_pki BASIS_TLS_CERT capi-provider.crt
+resolve_pki BASIS_TLS_KEY  capi-provider.key
 command -v sshpass >/dev/null \
     || { echo "smoke needs sshpass for guest egress checks: apt install sshpass" >&2; exit 2; }
 
@@ -103,6 +134,30 @@ wait_for_ssh() {
     local ip="$1"
     local deadline=$((SECONDS + BOOT_DEADLINE_SECONDS))
     until ssh_guest "$ip" 'true' 2>/dev/null; do
+        (( SECONDS < deadline )) || return 1
+        sleep 2
+    done
+}
+
+# True iff a TCP connection to <ip>:22 completes within 1s. Lets the
+# caller tell "sshd hasn't started yet" apart from "sshd is up but
+# rejected our credentials" — those two failures want different
+# triage. Uses bash's /dev/tcp so we don't add another tool dep.
+tcp22_open() {
+    local ip="$1"
+    timeout 1 bash -c ">/dev/tcp/$ip/22" 2>/dev/null
+}
+
+# Wait until sshd's TCP port is reachable, separately from auth working.
+# Returns 0 on success, 1 if the port never opened. Used to give a
+# precise failure when sshd is up but `ssh ubuntu@…` keeps getting
+# Permission denied — historically that meant the bootstrap fixture
+# locked the ubuntu account (lock_passwd defaulted to true) and every
+# password attempt was rejected with no usable signal.
+wait_for_ssh_port() {
+    local ip="$1"
+    local deadline=$((SECONDS + BOOT_DEADLINE_SECONDS))
+    until tcp22_open "$ip"; do
         (( SECONDS < deadline )) || return 1
         sleep 2
     done
@@ -192,7 +247,25 @@ reset_state() {
 
 if [[ "${SMOKE_SKIP_BUILD:-0}" != 1 ]]; then
     step "Build basis-ctl"
-    cargo build --release --quiet -p basis-ctl
+    # Prefer the rustup-managed cargo the basis-holod ansible role
+    # installs at /var/cache/holo-build/cargo/bin/cargo. Hypervisors
+    # run Ubuntu 22.04's apt rustc 1.85 by default, which is below
+    # the `time` crate's 1.88 MSRV — so falling back to system cargo
+    # on those hosts produces a confusing dep-graph error. Laptops
+    # without that path keep using whatever cargo is on PATH.
+    #
+    # The cargo at /var/cache/holo-build/cargo/bin/cargo is a rustup
+    # proxy. It needs RUSTUP_HOME + CARGO_HOME pointed at the same
+    # /var/cache/holo-build/{rustup,cargo} directories the role wrote
+    # the toolchain to — without them, the proxy reads root's empty
+    # rustup config and errors with "no default toolchain configured."
+    if [[ -x /var/cache/holo-build/cargo/bin/cargo ]]; then
+        RUSTUP_HOME=/var/cache/holo-build/rustup \
+        CARGO_HOME=/var/cache/holo-build/cargo \
+            /var/cache/holo-build/cargo/bin/cargo build --release --quiet -p basis-ctl
+    else
+        cargo build --release --quiet -p basis-ctl
+    fi
 fi
 [[ -x "$BIN" ]] || fail "basis-ctl did not build at $BIN"
 
@@ -265,7 +338,19 @@ if [[ "$QUICK" == 0 ]]; then
         # VMs reach the internet via the hypervisor's MASQUERADE on
         # the tree CIDR.
         step "Wait for guest sshd + verify external egress (tree → hypervisor NAT)"
-        wait_for_ssh "$VM_IP" || fail "guest sshd on $VM_IP not reachable within ${BOOT_DEADLINE_SECONDS}s"
+        # Two-stage check so a "sshd never started" failure (TCP-22 never
+        # opens) reports differently from "sshd answers but rejects the
+        # password" (TCP-22 open, ssh keeps returning Permission denied).
+        # Triage for the former is journalctl on the agent host; for the
+        # latter, /var/log/cloud-init-output.log inside the guest.
+        wait_for_ssh_port "$VM_IP" \
+            || fail "guest sshd on $VM_IP did not open port 22 within ${BOOT_DEADLINE_SECONDS}s"
+        if ! wait_for_ssh "$VM_IP"; then
+            fail "sshd on $VM_IP accepts TCP but password auth for ubuntu/basis is being rejected — \
+check bootstrap-debug.yaml landed on this host and that cloud-init's chpasswd ran \
+(/var/log/cloud-init-output.log inside the guest)"
+        fi
+        pass "guest accepts password auth for ubuntu/basis"
         status=$(guest_curl_ghcr "$VM_IP")
         [[ "$status" =~ ^[1-5][0-9]{2}$ ]] \
             || fail "guest at $VM_IP cannot reach https://ghcr.io/v2/ (status=$status) — tree CIDR MASQUERADE broken"
