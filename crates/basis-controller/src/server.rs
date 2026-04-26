@@ -35,9 +35,9 @@ fn db_status(e: DbError) -> Status {
         DbError::NotFound(_) => Status::not_found(e.to_string()),
         DbError::Conflict(_) => Status::already_exists(e.to_string()),
         DbError::Exhausted(_) => Status::resource_exhausted(e.to_string()),
-        DbError::HostUnavailable(_)
-        | DbError::CapacityRaced(_)
-        | DbError::AllocationRaced(_) => Status::unavailable(e.to_string()),
+        DbError::HostUnavailable(_) | DbError::CapacityRaced(_) | DbError::AllocationRaced(_) => {
+            Status::unavailable(e.to_string())
+        }
         DbError::Sqlx(_) | DbError::Migrate(_) | DbError::Malformed(_) => {
             Status::internal(e.to_string())
         }
@@ -265,10 +265,7 @@ impl SharedCtx {
                     ))
                 })?;
             if visibility == ApiserverVisibility::ApiserverPublic {
-                if let Ok(vip) = cluster
-                    .control_plane_endpoint
-                    .parse::<std::net::Ipv4Addr>()
-                {
+                if let Ok(vip) = cluster.control_plane_endpoint.parse::<std::net::Ipv4Addr>() {
                     cluster_vips.push(format!("{vip}/32"));
                 }
             }
@@ -784,13 +781,12 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<CreateClusterResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
-        let visibility =
-            ApiserverVisibility::try_from(req.apiserver_visibility).map_err(|_| {
-                Status::invalid_argument(format!(
-                    "unknown apiserver_visibility {}",
-                    req.apiserver_visibility,
-                ))
-            })?;
+        let visibility = ApiserverVisibility::try_from(req.apiserver_visibility).map_err(|_| {
+            Status::invalid_argument(format!(
+                "unknown apiserver_visibility {}",
+                req.apiserver_visibility,
+            ))
+        })?;
         info!(
             name = %req.name,
             external_pool = %req.external_ip_pool,
@@ -1178,6 +1174,7 @@ impl basis_server::Basis for BasisApiService {
         let Some(agent) = self.shared.agents.get(&host_id) else {
             outcome.set("no_agent");
             warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: scheduled host has no connected agent");
+            self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
             return Err(Status::unavailable(format!(
                 "agent for host '{host_id}' not connected"
             )));
@@ -1576,6 +1573,7 @@ impl BasisAgentService {
             vtep_address: register.vtep_address.clone(),
             last_heartbeat: now_rfc3339(),
             healthy: true,
+            rank: register.rank as i64,
         };
         self.shared
             .db
@@ -1587,6 +1585,21 @@ impl BasisAgentService {
     }
 }
 
+/// Look up the kind of pending op waiting on `vm_id`, but only if the
+/// op was registered against `host_id`. Returning `None` for a wrong-
+/// host match (rather than the kind) is what stops a misbehaving
+/// stream from satisfying a wait that belongs to a different host.
+fn pending_op_kind_for(
+    pending_ops: &DashMap<String, PendingVmOp>,
+    vm_id: &str,
+    host_id: &str,
+) -> Option<VmOpKind> {
+    pending_ops
+        .get(vm_id)
+        .filter(|p| p.host_id == host_id)
+        .map(|p| p.kind)
+}
+
 async fn handle_agent_message(
     shared: &SharedCtx,
     pending_ops: &DashMap<String, PendingVmOp>,
@@ -1594,17 +1607,41 @@ async fn handle_agent_message(
     msg: AgentMessage,
 ) -> anyhow::Result<()> {
     match msg.payload {
-        Some(agent_message::Payload::Heartbeat(hb)) => {
+        Some(agent_message::Payload::Heartbeat(_)) => {
+            // Identity is the authenticated stream's host_id, never
+            // anything in the message body — see HeartbeatRequest's
+            // proto comment.
             shared
                 .db
-                .update_host_heartbeat(&hb.host_id, &now_rfc3339())
+                .update_host_heartbeat(host_id, &now_rfc3339())
                 .await?;
         }
         Some(agent_message::Payload::VmState(report)) => {
             let state = report.state();
             let now = now_rfc3339();
 
-            let prev = shared.db.get_vm(&report.vm_id).await.ok();
+            let prev = match shared.db.get_vm(&report.vm_id).await {
+                Ok(row) => row,
+                Err(DbError::NotFound(_)) => {
+                    warn!(
+                        stream_host_id = %host_id,
+                        vm_id = %report.vm_id,
+                        "ignoring VM state report for unknown VM"
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            if prev.host_id != host_id {
+                warn!(
+                    stream_host_id = %host_id,
+                    vm_id = %report.vm_id,
+                    vm_host_id = %prev.host_id,
+                    "ignoring VM state report for a different host"
+                );
+                return Ok(());
+            }
 
             shared
                 .db
@@ -1612,26 +1649,22 @@ async fn handle_agent_message(
                 .await?;
 
             if state == MachineState::Running {
-                let prev_state = prev.as_ref().map(|r| r.state);
-                let first_time_running = prev_state != Some(MachineState::Running as i64);
+                let first_time_running = prev.state != MachineState::Running as i64;
                 if first_time_running {
-                    if let Some(row) = prev.as_ref() {
-                        if let Ok(created) = humantime::parse_rfc3339(&row.created_at) {
-                            if let Ok(elapsed) =
-                                std::time::SystemTime::now().duration_since(created)
-                            {
-                                shared
-                                    .metrics
-                                    .vm_time_to_running_seconds
-                                    .observe(elapsed.as_secs_f64());
-                            }
+                    if let Ok(created) = humantime::parse_rfc3339(&prev.created_at) {
+                        if let Ok(elapsed) = std::time::SystemTime::now().duration_since(created) {
+                            shared
+                                .metrics
+                                .vm_time_to_running_seconds
+                                .observe(elapsed.as_secs_f64());
                         }
                     }
                 }
             }
 
+            let pending_kind = pending_op_kind_for(pending_ops, &report.vm_id, host_id);
             let resolves = matches!(
-                (pending_ops.get(&report.vm_id).map(|p| p.kind), state),
+                (pending_kind, state),
                 (Some(VmOpKind::Create), MachineState::Running)
                     | (Some(VmOpKind::Delete), MachineState::Stopped)
                     | (Some(_), MachineState::Failed)

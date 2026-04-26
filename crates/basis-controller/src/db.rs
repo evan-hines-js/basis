@@ -136,11 +136,26 @@ impl Db {
                 gpu_inventory TEXT NOT NULL DEFAULT '[]',
                 vtep_address TEXT NOT NULL DEFAULT '',
                 last_heartbeat TEXT NOT NULL,
-                healthy INTEGER NOT NULL DEFAULT 1
+                healthy INTEGER NOT NULL DEFAULT 1,
+                rank INTEGER NOT NULL DEFAULT 0
             )",
         )
         .execute(&self.writer)
         .await?;
+        // Forward-compat: bring older DBs (created before `rank` was
+        // added) up to the current schema. SQLite errors on duplicate
+        // columns, so we swallow that one specific failure — every
+        // other error still propagates.
+        if let Err(sqlx::Error::Database(e)) = sqlx::query(
+            "ALTER TABLE hosts ADD COLUMN rank INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.writer)
+        .await
+        {
+            if !e.message().contains("duplicate column") {
+                return Err(DbError::Sqlx(sqlx::Error::Database(e)));
+            }
+        }
 
         // Per-cluster network identity:
         //   * `vni` — VXLAN Network Identifier, unique cell-wide.
@@ -573,17 +588,28 @@ impl Db {
         let prefix_len: u8 = 32 - count.trailing_zeros() as u8;
 
         let mut tx = self.writer.begin().await?;
-        // Pull the current allocations in one pass so the alignment
-        // search runs in memory — the range's typical width is well
-        // under 256 IPs, and the writer is single-threaded so
-        // serialization with concurrent allocations is automatic.
-        let used: Vec<String> =
+        // Pull the current allocations + registered host underlay IPs
+        // in one pass so the alignment search runs in memory — the
+        // range's typical width is well under 256 IPs, and the writer
+        // is single-threaded so serialization with concurrent
+        // allocations is automatic. Host vtep_addresses are excluded
+        // for the same reason as in `allocate_from_range`: when the
+        // pool overlaps the host underlay range, an aligned block
+        // that contains a hypervisor's IP would steal LAN traffic for
+        // that host via the leader-host's proxy-ARP advertisement.
+        let used_allocs: Vec<String> =
             sqlx::query_scalar("SELECT ip_address FROM ip_allocations WHERE scope = ?")
                 .bind(scope)
                 .fetch_all(&mut *tx)
                 .await?;
-        let used: std::collections::HashSet<u32> = used
+        let host_vteps: Vec<String> = sqlx::query_scalar(
+            "SELECT vtep_address FROM hosts WHERE vtep_address != ''",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let used: std::collections::HashSet<u32> = used_allocs
             .into_iter()
+            .chain(host_vteps)
             .filter_map(|s| s.parse::<Ipv4Addr>().ok().map(u32::from))
             .collect();
 
@@ -639,6 +665,14 @@ impl Db {
             vm_id.is_some() != cluster_id.is_some(),
             "exactly one of vm_id / cluster_id must be set",
         );
+        // Exclude registered host underlay IPs from the candidate set:
+        // when a LAN-routable pool (cell-public) overlaps the host
+        // underlay range, the allocator could otherwise hand out an
+        // address that's already a hypervisor's primary IP. The agent
+        // would then install proxy-ARP on the leader host for that IP
+        // and steal the LAN's frames for the real host. Empty
+        // vtep_address (pre-VXLAN agent or just-registered host) is
+        // ignored — the second condition guards that.
         let allocated: Option<String> = sqlx::query_scalar(
             r#"
             WITH RECURSIVE
@@ -655,6 +689,11 @@ impl Db {
                                (n >>  8) & 255,  n        & 255)
                         NOT IN (SELECT ip_address FROM ip_allocations
                                 WHERE scope = ?)
+                    AND printf('%d.%d.%d.%d',
+                               (n >> 24) & 255, (n >> 16) & 255,
+                               (n >>  8) & 255,  n        & 255)
+                        NOT IN (SELECT vtep_address FROM hosts
+                                WHERE vtep_address != '')
                   ORDER BY n
                   LIMIT 1
               )
@@ -832,8 +871,8 @@ impl Db {
     pub async fn upsert_host(&self, host: &HostRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO hosts (id, hostname, total_cpu, total_memory_mib, total_disk_gib,
-                gpu_inventory, vtep_address, last_heartbeat, healthy)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gpu_inventory, vtep_address, last_heartbeat, healthy, rank)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 hostname = excluded.hostname,
                 total_cpu = excluded.total_cpu,
@@ -842,7 +881,8 @@ impl Db {
                 gpu_inventory = excluded.gpu_inventory,
                 vtep_address = excluded.vtep_address,
                 last_heartbeat = excluded.last_heartbeat,
-                healthy = excluded.healthy",
+                healthy = excluded.healthy,
+                rank = excluded.rank",
         )
         .bind(&host.id)
         .bind(&host.hostname)
@@ -856,6 +896,7 @@ impl Db {
         .bind(&host.vtep_address)
         .bind(&host.last_heartbeat)
         .bind(host.healthy)
+        .bind(host.rank)
         .execute(&self.writer)
         .await?;
         Ok(())
@@ -1110,6 +1151,7 @@ impl Db {
                     used_memory_mib: mem,
                     used_disk_gib: disk,
                     assigned_pci: HashSet::new(),
+                    vms_by_cluster: HashMap::new(),
                 },
             );
         }
@@ -1121,6 +1163,21 @@ impl Db {
                 .await?;
         for (host_id, pci) in gpus {
             out.entry(host_id).or_default().assigned_pci.insert(pci);
+        }
+
+        // Per-cluster VM counts per host — feeds the scheduler's soft
+        // anti-affinity tie-break so a cluster's VMs prefer hosts that
+        // don't already run a sibling.
+        let cluster_counts = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT host_id, cluster_id, COUNT(*) FROM vms GROUP BY host_id, cluster_id",
+        )
+        .fetch_all(&self.reader)
+        .await?;
+        for (host_id, cluster_id, count) in cluster_counts {
+            out.entry(host_id)
+                .or_default()
+                .vms_by_cluster
+                .insert(cluster_id, count as u32);
         }
 
         Ok(out)
@@ -1303,6 +1360,12 @@ pub struct HostRow {
     pub vtep_address: String,
     pub last_heartbeat: String,
     pub healthy: bool,
+    /// Operator-assigned placement preference, lower is preferred.
+    /// Used by the scheduler as a tiebreaker after capacity + GPU
+    /// topology + anti-affinity. Default 0 means "no preference";
+    /// operators bump deprioritized hosts (e.g. consumer-disk boxes
+    /// that shouldn't carry etcd) to a higher number.
+    pub rank: i64,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1394,6 +1457,10 @@ pub struct HostUsage {
     pub used_memory_mib: i64,
     pub used_disk_gib: i64,
     pub assigned_pci: HashSet<String>,
+    /// Number of VMs from each cluster currently on this host. Drives
+    /// soft anti-affinity in the scheduler so a cluster's VMs spread
+    /// across hosts before bin-packing decides where to land.
+    pub vms_by_cluster: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1568,6 +1635,7 @@ mod tests {
             vtep_address: format!("10.100.0.{}", id.bytes().last().unwrap_or(b'1')),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,
+            rank: 0,
         }
     }
 
@@ -2009,5 +2077,10 @@ mod tests {
         assert_eq!(u.used_memory_mib, 8192);
         assert_eq!(u.used_disk_gib, 150, "disk usage = rootfs + extras");
         assert!(u.assigned_pci.is_empty());
+        assert_eq!(
+            u.vms_by_cluster.get("c1").copied(),
+            Some(1),
+            "per-cluster VM count populated from vms.cluster_id"
+        );
     }
 }

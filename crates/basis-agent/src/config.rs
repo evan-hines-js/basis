@@ -53,6 +53,16 @@ pub struct HostSpec {
     /// default; override only if you've rebound holod's gRPC plugin.
     #[serde(default = "default_holod_endpoint")]
     pub holod_endpoint: String,
+
+    /// Operator-assigned placement preference, lower wins. The
+    /// scheduler uses this as a tiebreaker after capacity + GPU
+    /// topology + anti-affinity, so two equally-good hosts go to
+    /// the lower-rank one. Default 0 = "no preference"; bump
+    /// deprioritized hosts (e.g. consumer-disk boxes that shouldn't
+    /// carry etcd) to a higher number. Reported once at registration;
+    /// changes require a basis-agent restart.
+    #[serde(default)]
+    pub rank: u32,
 }
 
 fn default_metrics_listen() -> String {

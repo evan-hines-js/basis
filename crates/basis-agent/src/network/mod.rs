@@ -34,14 +34,10 @@ pub enum NetworkError {
     BridgeFailed(String),
 
     #[error(
-        "bridge '{bridge}' exists but already has master '{current_master}', not '{expected}' \
-         — either pick a different bridge name in host.yaml or move the NIC manually"
+        "bridge '{bridge}' exists but the configured uplink NIC '{nic}' is not a slave of it \
+         — either attach the NIC to the bridge manually or pick a different bridge in host.yaml"
     )]
-    BridgeOwnedByOther {
-        bridge: String,
-        current_master: String,
-        expected: String,
-    },
+    UplinkNicNotOnBridge { bridge: String, nic: String },
 
     #[error("tap '{tap}' inconsistent: {reason}")]
     TapInconsistent { tap: String, reason: String },
@@ -212,9 +208,14 @@ impl UplinkBridge {
         &self.bridge_name
     }
 
-    /// Preflight: NIC exists and the bridge, if it already exists,
-    /// is ours or empty. No MTU check — standard 1500 MTU works fine,
-    /// guests see 1450 inner and TCP MSS clamps the rest.
+    /// Preflight: NIC exists, and if the bridge already exists, the
+    /// NIC is one of its slaves. We deliberately tolerate other slaves
+    /// (PVE colocation puts firewall veth pairs and tap devices on
+    /// vmbr0 for its own VMs, and basis is meant to share the bridge
+    /// in that mode). The check we actually need is "this host can
+    /// reach the LAN through the bridge", which is true iff our
+    /// physical NIC bridges into it. No MTU check — standard 1500
+    /// works fine, guests see 1450 inner and TCP MSS clamps the rest.
     pub async fn validate(&self) -> Result<(), NetworkError> {
         let nic_check = Command::new("ip")
             .args(["link", "show", &self.physical_nic])
@@ -227,25 +228,31 @@ impl UplinkBridge {
             });
         }
 
-        let slaves = Command::new("ip")
-            .args(["-o", "link", "show", "master", &self.bridge_name])
+        let bridge_exists = Command::new("ip")
+            .args(["link", "show", &self.bridge_name])
             .output()
-            .await?;
-        if slaves.status.success() && !slaves.stdout.is_empty() {
+            .await?
+            .status
+            .success();
+        if bridge_exists {
+            let slaves = Command::new("ip")
+                .args(["-o", "link", "show", "master", &self.bridge_name])
+                .output()
+                .await?;
             let text = String::from_utf8_lossy(&slaves.stdout);
-            let current: Vec<String> = text
-                .lines()
-                .filter_map(|l| l.split_whitespace().nth(1))
-                .map(|s| s.trim_end_matches(':').trim_end_matches('@').to_string())
-                .collect();
-            if let Some(stranger) = current
-                .iter()
-                .find(|s| !is_agent_managed_tap(s) && s.as_str() != self.physical_nic)
-            {
-                return Err(NetworkError::BridgeOwnedByOther {
+            let nic_attached = text.lines().any(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .map(|s| {
+                        let name = s.trim_end_matches(':').split('@').next().unwrap_or("");
+                        name == self.physical_nic
+                    })
+                    .unwrap_or(false)
+            });
+            if !nic_attached {
+                return Err(NetworkError::UplinkNicNotOnBridge {
                     bridge: self.bridge_name.clone(),
-                    current_master: stranger.clone(),
-                    expected: self.physical_nic.clone(),
+                    nic: self.physical_nic.clone(),
                 });
             }
         }

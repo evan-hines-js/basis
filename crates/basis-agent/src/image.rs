@@ -128,10 +128,16 @@ const MEDIA_TYPE_INITRD: &str = "application/vnd.lattice.node.v1+initrd";
 /// cloud-hypervisor boots directly; `image_hash` is the stable prefix
 /// used to name the golden LV in the LVM thin pool — per-VM rootfs LVs
 /// are thin snapshots of `/dev/basis/image-<image_hash>`.
+/// `virtual_size_gib` is the qcow2's declared virtual size, exposed
+/// here so the create path can reject sub-image disk requests up
+/// front (you can't shrink an LV out from under a guest's filesystem
+/// — the LV-level tolerance in `lvm::lvextend` rounds up silently,
+/// but the API boundary should also fail loud on operator error).
 pub struct CachedImage {
     pub image_hash: String,
     pub kernel: PathBuf,
     pub initrd: PathBuf,
+    pub virtual_size_gib: u64,
 }
 
 /// Guest-side primary-NIC configuration (the tree-side NIC).
@@ -270,10 +276,15 @@ impl ImageManager {
             && initrd.exists()
             && lvm::image_lv_path(&prefix).exists()
         {
+            // qemu-img info is local file I/O + JSON parse, sub-100ms
+            // on a populated qcow2 — cheap enough to call on every
+            // ensure rather than caching the size separately.
+            let virtual_size_gib = qcow2_virtual_size_gib(&rootfs).await?;
             return Ok(CachedImage {
                 image_hash: prefix,
                 kernel,
                 initrd,
+                virtual_size_gib,
             });
         }
 
@@ -304,6 +315,7 @@ impl ImageManager {
             image_hash: prefix,
             kernel,
             initrd,
+            virtual_size_gib,
         })
     }
 

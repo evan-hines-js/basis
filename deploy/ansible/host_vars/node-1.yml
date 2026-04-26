@@ -1,0 +1,17 @@
+---
+# 10.0.0.97: PVE host. /dev/sdf (931 GiB) sits in PVE's `data` VG but
+# the storage.cfg pins that VG to a different node — so on this host
+# the drive is idle. We claim the whole disk for basis.
+#
+# First-apply prep (run once on the host):
+#   vgremove -y data
+#   wipefs -a /dev/sdf
+basis_lvm_devices:
+  - /dev/sdf
+
+# Deprioritize this host vs node-2 for placement: node-2 has enterprise
+# SSDs with PLP, this NUC has a single SATA drive shared with PVE. The
+# scheduler still uses both — anti-affinity spreads multi-VM clusters
+# across them — but the *first* VM in any cluster (notably control
+# planes) lands on node-2 by default.
+basis_host_rank: 10

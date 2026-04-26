@@ -105,6 +105,20 @@
   failed_when: false
   check_mode: false
 
+- name: Refresh apt cache if stale
+  # Without this, freshly imaged hosts can fail to find packages whose
+  # apt index entries postdate the image. cache_valid_time bounds
+  # re-runs to once an hour so back-to-back applies don't re-fetch.
+  # `failed_when: false` because PVE hosts ship with the proxmox
+  # enterprise repos enabled but no subscription — those return 401
+  # even when the debian repos refresh fine. The next `package` task
+  # below fails loudly if anything we actually need is missing.
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts['pkg_mgr'] == 'apt'
+  failed_when: false
+
 - name: Install qemu-utils (unless qemu-img is already provided)
   ansible.builtin.package:
     name: qemu-utils

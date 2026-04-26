@@ -578,10 +578,19 @@ async fn lvremove(lv_name: &str) -> Result<()> {
         .map(|_| ())
 }
 
-/// Extend an LV to `size_gib` GiB. Idempotent: if the LV is already at
-/// the requested size (snapshot of an image LV that's already the right
-/// size), LVM exits non-zero with "No size change" — treated as success
-/// since the post-condition ("LV is `size_gib` GiB") holds.
+/// Grow an LV to *at least* `size_gib` GiB. Idempotent and never
+/// shrinks: the post-condition we care about is "guest sees ≥
+/// size_gib", so a snapshot that already meets or exceeds the request
+/// is success, not failure. `lvextend` itself surfaces the two flavours
+/// of "no work to do" with non-zero exit codes that we collapse here:
+///
+///   * "No size change" — the snapshot is exactly the requested size.
+///   * "New size given (N extents) not larger than existing size (M
+///     extents)" — the snapshot is already larger (image's virtual
+///     size > request). We never want to shrink an LV out from under
+///     a running guest's filesystem; rejecting the request would force
+///     callers to know the image's virtual size, which is a leaky
+///     abstraction.
 ///
 /// `-L 10G` (uppercase) is gibibytes (2^30). Lowercase `g` is SI
 /// gigabytes (10^9) and is wrong for the API contract the caller wants.
@@ -593,7 +602,11 @@ async fn lvextend(lv_name: &str, size_gib: u64) -> Result<()> {
     .await
     {
         Ok(_) => Ok(()),
-        Err(LvmError::Command { stderr, .. }) if stderr.contains("No size change") => Ok(()),
+        Err(LvmError::Command { stderr, .. })
+            if stderr.contains("No size change") || stderr.contains("not larger than") =>
+        {
+            Ok(())
+        }
         Err(e) => Err(e),
     }
 }

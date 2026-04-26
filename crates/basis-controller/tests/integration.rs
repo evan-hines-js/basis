@@ -196,6 +196,7 @@ async fn register_agent(
             total_disk_gib: 1000,
             gpus: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
+            rank: 0,
         })),
     })
     .await
@@ -343,6 +344,25 @@ async fn report_vm_state(
         })
         .await
         .unwrap();
+}
+
+/// Polls `check` for the full `window`, panicking with `msg` the
+/// instant it returns true. Used for negative assertions: "this
+/// shouldn't happen", where there's no observable signal you can
+/// wait *for* — only a bound on how long you'd plausibly need to
+/// wait to be confident it won't happen.
+async fn assert_stays_false<F, Fut>(mut check: F, window: Duration, msg: &str)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    while tokio::time::Instant::now() < deadline {
+        if check().await {
+            panic!("{msg}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -552,6 +572,7 @@ async fn test_create_machine_no_agent() {
         vtep_address: "10.100.0.99".to_string(),
         last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
         healthy: true,
+        rank: 0,
     })
     .await
     .unwrap();
@@ -561,6 +582,21 @@ async fn test_create_machine_no_agent() {
         .create_machine(basic_machine_req("orphan-vm", &cluster_id))
         .await;
     assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+
+    assert!(
+        db.get_vm_by_name(&cluster_id, "orphan-vm")
+            .await
+            .unwrap()
+            .is_none(),
+        "VM row should be cleaned up when no agent is connected"
+    );
+    assert_eq!(
+        db.get_host_bridge_ip(&cluster_id, "ghost-host")
+            .await
+            .unwrap(),
+        None,
+        "host bridge IP should be cleaned up when no VM remains"
+    );
 }
 
 #[tokio::test]
@@ -659,6 +695,7 @@ async fn test_agent_cn_must_match_registered_hostname() {
             total_disk_gib: 1000,
             gpus: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
+            rank: 0,
         })),
     })
     .await
@@ -681,9 +718,7 @@ async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
 
     agent_tx
         .send(AgentMessage {
-            payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
-                host_id: host_id.clone(),
-            })),
+            payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {})),
         })
         .await
         .unwrap();
@@ -702,6 +737,69 @@ async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
 
     drop(agent_tx);
     drop(inbound);
+}
+
+#[tokio::test]
+async fn test_agent_stream_cannot_report_for_other_host() {
+    let (running, db) = RunningController::start().await;
+    let (cluster_id, _vip) = create_cluster(&running, "host-scope-cluster").await;
+    let (agent_a_tx, mut agent_a_inbound, host_a_id, _initial_a) =
+        register_agent(&running, "host-a").await;
+
+    let capi = running.capi_client().await;
+    let mut create_handle = {
+        let mut capi = capi.clone();
+        let req = basic_machine_req("scoped-vm", &cluster_id);
+        tokio::spawn(async move { capi.create_machine(req).await })
+    };
+
+    let vm_id = expect_create_vm(&mut agent_a_inbound).await;
+    let (agent_b_tx, agent_b_inbound, _host_b_id, _initial_b) =
+        register_agent(&running, "host-b").await;
+
+    report_vm_state(&agent_b_tx, &vm_id, MachineState::Running, "", false).await;
+    // The timeout doubles as a deterministic processing window: if the
+    // wrong-host report were honoured it would resolve `create_handle`
+    // (and we'd see Ready inside the 200ms). Failing to resolve in
+    // that window is the strong signal that the report was dropped.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut create_handle)
+            .await
+            .is_err(),
+        "CreateMachine should still be waiting for the assigned host"
+    );
+    assert_eq!(
+        db.get_vm(&vm_id).await.unwrap().state,
+        MachineState::Creating as i64,
+        "VM state report from a different host must be ignored"
+    );
+
+    db.mark_host_unhealthy(&host_a_id).await.unwrap();
+    agent_b_tx
+        .send(AgentMessage {
+            payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {})),
+        })
+        .await
+        .unwrap();
+    // No "rejected" signal observable from the API — assert the wrong-
+    // stream heartbeat *cannot* flip health by waiting longer than the
+    // controller could plausibly take to process it, then probing.
+    // 200ms is generous for an in-process test; CI runners under load
+    // occasionally need more.
+    assert_stays_false(
+        || async { db.get_host(&host_a_id).await.unwrap().healthy },
+        Duration::from_millis(200),
+        "heartbeat from a different stream must not update host health",
+    )
+    .await;
+
+    report_vm_state(&agent_a_tx, &vm_id, MachineState::Running, "", false).await;
+    create_handle.await.unwrap().unwrap();
+
+    drop(agent_a_tx);
+    drop(agent_a_inbound);
+    drop(agent_b_tx);
+    drop(agent_b_inbound);
 }
 
 #[tokio::test]
@@ -757,10 +855,7 @@ async fn test_reconnect_reports_expected_vm_ids_and_clusters() {
     assert_eq!(cluster_state.vni, 10_000);
     // VTEP peer list contains this host's own address. (The agent
     // filters itself out client-side before building FDB entries.)
-    assert_eq!(
-        cluster_state.vtep_addresses,
-        vec!["10.100.0.1".to_string()]
-    );
+    assert_eq!(cluster_state.vtep_addresses, vec!["10.100.0.1".to_string()]);
 }
 
 /// End-to-end verification of the optimistic-concurrency contract:

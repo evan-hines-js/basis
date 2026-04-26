@@ -81,6 +81,25 @@
 # v0.9.0's MSRV is 1.88, so per-host builds use a rustup-installed
 # toolchain (see below). `curl` is what we feed rustup-init through.
 
+- name: Refresh apt cache if stale
+  # `package: update_cache: true` doesn't exist on the generic module;
+  # apt-specific call. cache_valid_time bounds re-runs to once an hour
+  # so back-to-back applies don't re-fetch indexes. Without this a
+  # freshly imaged host whose apt index predates a package's arrival in
+  # the distro repos (libyang-dev was the trigger) fails to find it.
+  #
+  # `failed_when: false` because PVE hosts ship with the proxmox
+  # enterprise repos enabled but no subscription — apt update returns
+  # 401 on those even when the debian repos refresh fine. The next
+  # `package` task will fail loudly with a clear "no candidate" if
+  # anything we actually need is still missing, so swallowing this
+  # error doesn't hide real problems.
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts['pkg_mgr'] == 'apt'
+  failed_when: false
+
 - name: Install holod runtime deps
   ansible.builtin.package:
     name: "{{ _holod_runtime_pkgs + (_holod_build_pkgs if not _holod_build_on_control else []) }}"

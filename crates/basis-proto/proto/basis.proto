@@ -322,11 +322,22 @@ message RegisterHostRequest {
   // once at registration; the controller stores it on `hosts` and
   // includes it in `ClusterState.vtep_addresses` broadcasts.
   string vtep_address = 6;
+  // Operator-assigned placement preference. Lower wins. The
+  // scheduler uses this as a tiebreaker after capacity + GPU
+  // topology + anti-affinity, so two equally-good hosts go to the
+  // lower-rank one. Default 0 = "no preference"; bump deprioritized
+  // hosts (e.g. consumer-disk boxes that shouldn't carry etcd) to a
+  // higher number. Reported once at registration and stored on
+  // `hosts`; change requires a basis-agent restart.
+  uint32 rank = 7;
 }
 
-message HeartbeatRequest {
-  string host_id = 1;
-}
+// Liveness ping. The controller learns *which* host this came from
+// from the authenticated bidi stream's identity, not from any field
+// in this message — a malicious agent could otherwise keep another
+// host marked healthy. Empty body kept (rather than dropping the RPC)
+// so we can extend it later without a streaming-protocol break.
+message HeartbeatRequest {}
 
 message ReportVMStateRequest {
   string vm_id = 1;

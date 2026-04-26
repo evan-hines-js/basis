@@ -110,7 +110,7 @@ BOOT_DEADLINE_SECONDS=90
 
 cd "$REPO_ROOT"
 
-SECTION_TOTAL=9
+SECTION_TOTAL=10
 section() { echo; echo "==> [$1/$SECTION_TOTAL] $2"; }
 step() { echo; echo "    -> $*"; }
 pass() { echo "    ok: $*"; }
@@ -781,6 +781,187 @@ YAML
 
     "$BIN" delete -f "$BGP_MACHINE_FIXTURE" >/dev/null
     "$BIN" delete -f "$CLUSTER_FIXTURE" >/dev/null
+fi
+
+###############################################################################
+# Section 10 — Soft anti-affinity within a cluster.
+# Proves: when the fleet has ≥2 healthy hosts, the scheduler spreads a
+# cluster's VMs instead of bin-packing them all onto one host. Three
+# small same-cluster VMs must land on ≥2 distinct hosts. This is the
+# placement guarantee the cross-host networking path (VXLAN delivery
+# between bridges, BGP from a non-leader host) actually depends on.
+#
+# Self-skips on single-host fleets — the invariant has no meaning when
+# every VM is forced to one host regardless.
+###############################################################################
+if [[ "$QUICK" == 0 ]]; then
+    section 10 "Anti-affinity spreads cluster VMs across hosts"
+
+    # Read the healthy-host count from the controller's prometheus
+    # /metrics endpoint (plain HTTP, not the mTLS gRPC port). Default
+    # port is 9443; override via BASIS_METRICS_PORT.
+    AA_META_HOST="${BASIS_ENDPOINT#*://}"
+    AA_META_HOST="${AA_META_HOST%%:*}"
+    AA_META_PORT="${BASIS_METRICS_PORT:-9443}"
+    AA_HEALTHY_HOSTS=""
+    if command -v curl >/dev/null; then
+        AA_HEALTHY_HOSTS=$(curl -sS --max-time 5 \
+            "http://$AA_META_HOST:$AA_META_PORT/metrics" 2>/dev/null \
+            | awk '/^basis_hosts\{healthy="true"\}/ {print $NF}')
+    fi
+
+    if [[ -z "$AA_HEALTHY_HOSTS" ]]; then
+        echo "  (skipping: could not read basis_hosts from $AA_META_HOST:$AA_META_PORT/metrics — set BASIS_METRICS_PORT or run on the controller host)"
+    elif (( AA_HEALTHY_HOSTS < 2 )); then
+        echo "  (skipping: only $AA_HEALTHY_HOSTS healthy host registered — anti-affinity needs ≥2)"
+    else
+        AA_CLUSTER_FIXTURE="$TMP_DIR/cluster-aa.yaml"
+        AA_CLUSTER_NAME="smoke-aa$S"
+        cat >"$AA_CLUSTER_FIXTURE" <<YAML
+apiVersion: basis.dev/v1
+kind: Cluster
+metadata:
+  name: $AA_CLUSTER_NAME
+spec:
+  externalIpPool: cell-public
+  externalServiceIps: 1
+YAML
+        "$BIN" apply -f "$AA_CLUSTER_FIXTURE" >/dev/null
+
+        # Three identical small VMs in the same cluster. Equal sizing
+        # rules out best-fit deciding the placement; any spread we see
+        # is the anti-affinity tie-break at work. Sized below the
+        # smallest realistic host so all three fit anywhere — a
+        # capacity-driven spill would mask the anti-affinity signal.
+        # Apply in parallel: `basis-ctl apply` blocks until the agent
+        # reports CreateVm completed (~30s), and these three machines
+        # have no dependency on each other. The controller's optimistic
+        # commit gate already serializes capacity claims, so concurrent
+        # CreateMachine calls are safe.
+        AA_FIXTURES=()
+        AA_PIDS=()
+        for i in 0 1 2; do
+            AA_M="$TMP_DIR/machine-aa-$i.yaml"
+            cat >"$AA_M" <<YAML
+apiVersion: basis.dev/v1
+kind: Machine
+metadata:
+  name: aa-$i$S
+spec:
+  cluster: $AA_CLUSTER_NAME
+  cpu: 1
+  memoryMib: 512
+  # Must be >= the node image's virtual size (10 GiB). Smaller asks
+  # the agent to shrink the thin snapshot, which is unsupported and
+  # surfaces as "New size given ... not larger than existing size".
+  diskGib: 10
+  image: ghcr.io/evan-hines-js/lattice-node:v1.32.0
+  bootstrapDataFile: $FIXTURES/bootstrap-debug.yaml
+  gpus: 0
+YAML
+            AA_FIXTURES+=("$AA_M")
+            "$BIN" apply -f "$AA_M" >/dev/null &
+            AA_PIDS+=($!)
+        done
+        AA_FAIL=0
+        for pid in "${AA_PIDS[@]}"; do
+            wait "$pid" || AA_FAIL=1
+        done
+        if (( AA_FAIL )); then
+            for f in "${AA_FIXTURES[@]}"; do "$BIN" delete -f "$f" >/dev/null 2>&1 || true; done
+            "$BIN" delete -f "$AA_CLUSTER_FIXTURE" >/dev/null 2>&1 || true
+            fail "one or more concurrent CreateMachine applies failed — check controller log"
+        fi
+
+        AA_LISTING=$("$BIN" get-machines)
+        # HOST is the last column of `get-machines` output. Pull it for
+        # our three names and uniq.
+        AA_DISTINCT=$(echo "$AA_LISTING" \
+            | awk -v p="aa-[012]$S" '$2 ~ ("^"p"$") {print $NF}' \
+            | sort -u)
+        AA_DISTINCT_COUNT=$(echo "$AA_DISTINCT" | grep -c .)
+        if (( AA_DISTINCT_COUNT < 2 )); then
+            echo "  placement:"
+            echo "$AA_LISTING" | awk -v p="aa-[012]$S" '$2 ~ ("^"p"$") {print "    " $2 " -> " $NF}'
+            for f in "${AA_FIXTURES[@]}"; do "$BIN" delete -f "$f" >/dev/null 2>&1 || true; done
+            "$BIN" delete -f "$AA_CLUSTER_FIXTURE" >/dev/null 2>&1 || true
+            fail "3 same-cluster VMs all landed on one host — soft anti-affinity not splitting"
+        fi
+        pass "3 same-cluster VMs spread across $AA_DISTINCT_COUNT hosts (anti-affinity active)"
+
+        # Cross-node connectivity probe.
+        # Placement spread is necessary but not sufficient — the actual
+        # value of putting VMs on different hosts is that they can still
+        # talk to each other over the per-cluster VXLAN overlay. This
+        # exercises the full data path:
+        #   VM A → tap → bridge → VXLAN encap → underlay → peer host
+        #   → VXLAN decap → bridge → tap → VM B
+        # in both directions (proxy-ARP / FDB regressions can be
+        # one-way, so a unidirectional check would miss them).
+        #
+        # Probes:
+        #   - ICMP: cheapest L3 reachability check.
+        #   - TCP-22: sshd is already listening in every debug VM, so
+        #     this proves bidirectional flow without an extra listener.
+        #
+        # Self-skips when the smoke runner can't reach the tree CIDR
+        # (off-host laptop runs) — same gate as Section 1's egress
+        # check, since we SSH into the source VM to run the probe.
+
+        # Pull (name, ip, host) for our three VMs in one pass. Columns
+        # from `get-machines` are: ID, NAME, STATE, IP, HOST.
+        AA_TRIPLES=$(echo "$AA_LISTING" \
+            | awk -v p="aa-[012]$S" '$2 ~ ("^"p"$") {print $2"|"$4"|"$5}')
+        # Pick any cross-host pair from those three.
+        SRC_NAME=""; SRC_IP=""; SRC_HOST=""
+        DST_NAME=""; DST_IP=""; DST_HOST=""
+        while IFS='|' read -r a_name a_ip a_host; do
+            while IFS='|' read -r b_name b_ip b_host; do
+                if [[ -n "$a_host" && -n "$b_host" && "$a_host" != "$b_host" ]]; then
+                    SRC_NAME=$a_name; SRC_IP=$a_ip; SRC_HOST=$a_host
+                    DST_NAME=$b_name; DST_IP=$b_ip; DST_HOST=$b_host
+                    break 2
+                fi
+            done <<<"$AA_TRIPLES"
+        done <<<"$AA_TRIPLES"
+        [[ -n "$SRC_IP" && -n "$DST_IP" ]] \
+            || fail "could not pick cross-host pair from placement (parse bug?)"
+
+        # On a hypervisor, the route resolves either via `brt<vni>`
+        # (cross-host via the overlay) or `tap<...>` (when the VM is
+        # local to this host). Both mean we can SSH in. Off-host laptop
+        # runs have no route at all and `ip route get` fails — that's
+        # the real skip condition.
+        if ! ip route get "$SRC_IP" >/dev/null 2>&1; then
+            echo "  (skipping cross-node probe: no route to $SRC_IP — re-run on a hypervisor for full coverage)"
+        else
+            step "Cross-node probe: $SRC_NAME ($SRC_IP on $SRC_HOST) <-> $DST_NAME ($DST_IP on $DST_HOST)"
+            wait_for_ssh_port "$SRC_IP" || fail "src $SRC_IP sshd never opened TCP-22"
+            wait_for_ssh_port "$DST_IP" || fail "dst $DST_IP sshd never opened TCP-22"
+            wait_for_ssh "$SRC_IP" || fail "src $SRC_IP sshd open but password auth failing"
+            wait_for_ssh "$DST_IP" || fail "dst $DST_IP sshd open but password auth failing"
+
+            # SRC -> DST.
+            if ! ssh_guest "$SRC_IP" "ping -c3 -W2 $DST_IP" >/dev/null 2>&1; then
+                fail "$SRC_NAME ($SRC_HOST) cannot ping $DST_NAME ($DST_HOST) — VXLAN forwarding broken in SRC->DST direction"
+            fi
+            if ! ssh_guest "$SRC_IP" "timeout 5 bash -c '>/dev/tcp/$DST_IP/22'" >/dev/null 2>&1; then
+                fail "$SRC_NAME ($SRC_HOST) cannot TCP-connect to $DST_NAME:22 ($DST_HOST) — overlay drops or one-way ARP/FDB"
+            fi
+            # DST -> SRC. Asymmetric regressions (e.g. proxy-ARP only on
+            # one host) only fail in one direction.
+            if ! ssh_guest "$DST_IP" "ping -c3 -W2 $SRC_IP" >/dev/null 2>&1; then
+                fail "$DST_NAME ($DST_HOST) cannot ping $SRC_NAME ($SRC_HOST) — VXLAN forwarding broken in DST->SRC direction"
+            fi
+            if ! ssh_guest "$DST_IP" "timeout 5 bash -c '>/dev/tcp/$SRC_IP/22'" >/dev/null 2>&1; then
+                fail "$DST_NAME ($DST_HOST) cannot TCP-connect to $SRC_NAME:22 ($SRC_HOST) — overlay drops or one-way ARP/FDB"
+            fi
+            pass "ICMP + TCP both directions across $SRC_HOST <-> $DST_HOST (overlay forwarding healthy)"
+        fi
+
+        for f in "${AA_FIXTURES[@]}"; do "$BIN" delete -f "$f" >/dev/null; done
+        "$BIN" delete -f "$AA_CLUSTER_FIXTURE" >/dev/null
+    fi
 fi
 
 step "ALL SMOKE TESTS PASSED"

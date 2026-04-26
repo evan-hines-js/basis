@@ -161,6 +161,14 @@ basis_network:
 #       password: "{{ ghcr_token }}"   # source from ansible-vault
 basis_agent_registries: []
 
+# Operator-assigned placement preference, lower is preferred. The
+# scheduler uses this as a tiebreaker after capacity + GPU topology +
+# anti-affinity. Default 0 means "no preference"; bump deprioritized
+# hosts (e.g. consumer-disk boxes that shouldn't carry etcd) to a
+# higher number. Per-host override only — there's no useful cell-wide
+# value other than 0.
+basis_host_rank: 0
+
 # Per-host bridge name. Set to `vmbr0` when colocating Basis on hosts
 # that already run Proxmox — the agent skips bridge creation if one
 # by this name already exists, and Basis's VMs end up on the same L2

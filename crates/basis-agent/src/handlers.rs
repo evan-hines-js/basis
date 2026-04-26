@@ -79,6 +79,24 @@ async fn create_vm_inner(
         .image_ensure_cached_seconds
         .observe(started.elapsed().as_secs_f64());
 
+    // Reject sub-image disk requests at the API boundary. The LVM layer
+    // tolerates "would shrink" by leaving the snapshot at its original
+    // size (see `lvm::lvextend`), but a request below the image's
+    // virtual size is operator error: the caller is asking for a guest
+    // disk smaller than what the image already occupies, and quietly
+    // rounding up would make quota / billing accounting lie. Fail fast
+    // so the surface error names the cause instead of looking like a
+    // disk allocation failure later.
+    if (cmd.disk_gib as u64) < base.virtual_size_gib {
+        anyhow::bail!(
+            "requested disk_gib ({}) is smaller than image '{}' virtual size ({} GiB) — \
+             raise disk_gib to at least the image's virtual size",
+            cmd.disk_gib,
+            cmd.image,
+            base.virtual_size_gib,
+        );
+    }
+
     // Persist the VM record up front so any later failure has a DB row
     // to drive rollback off of.
     let extra_disk_gibs: Vec<u32> = cmd.extra_disks.iter().map(|d| d.size_gib).collect();

@@ -373,7 +373,12 @@ async fn run_session(
     let response = client.stream_messages(outbound).await?;
     let mut inbound = response.into_inner();
 
-    let host_id = handshake(&mut inbound, &runtime).await?;
+    // The handshake's `host_id` return is no longer consumed in this
+    // session-scoped loop (heartbeats no longer carry host_id — the
+    // controller derives it from the authenticated stream). Drop on
+    // the floor; the handshake's side effects on `runtime` are what we
+    // care about.
+    handshake(&mut inbound, &runtime).await?;
 
     {
         let rt = runtime.read().await;
@@ -385,7 +390,7 @@ async fn run_session(
     // reconciler both break on `ChannelClosed`). Agent-lifetime loops
     // (pool capacity, orphan sweep) are spawned once from `run` —
     // spawning them here would leak one per reconnect.
-    spawn_heartbeat_loop(msg_tx.clone(), host_id.clone());
+    spawn_heartbeat_loop(msg_tx.clone());
     spawn_periodic_reconciler(msg_tx.clone(), runtime.clone());
 
     process_inbound(&mut inbound, runtime, msg_tx, reconnect).await
@@ -415,6 +420,7 @@ async fn send_register(
                 total_disk_gib: rt.host_resources.total_disk_gib,
                 gpus: gpu_devices,
                 vtep_address: rt.vtep_address.clone(),
+                rank: rt.spec.rank,
             })),
         })
         .await?;
@@ -528,15 +534,13 @@ async fn apply_reconcile(
     Ok(())
 }
 
-fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>, host_id: String) {
+fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
             let msg = AgentMessage {
-                payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
-                    host_id: host_id.clone(),
-                })),
+                payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {})),
             };
             if sender.send(msg).await.is_err() {
                 break;

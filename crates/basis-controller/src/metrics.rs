@@ -524,6 +524,7 @@ mod tests {
             vtep_address: "10.100.0.1".to_string(),
             last_heartbeat: basis_common::time::now_rfc3339(),
             healthy,
+            rank: 0,
         }
     }
 

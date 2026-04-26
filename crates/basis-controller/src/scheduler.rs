@@ -12,6 +12,11 @@ pub enum SchedulerError {
 }
 
 pub struct ScheduleRequest {
+    /// Cluster this VM belongs to. Drives soft anti-affinity: hosts
+    /// with fewer existing VMs from the same cluster outrank tighter
+    /// fits. Empty string disables the penalty (used in tests that
+    /// pre-date the cluster-aware path).
+    pub cluster_id: String,
     pub cpu: u32,
     pub memory_mib: u32,
     /// Full host-side disk footprint — rootfs plus every extra data
@@ -27,6 +32,7 @@ impl From<&CreateMachineRequest> for ScheduleRequest {
     fn from(req: &CreateMachineRequest) -> Self {
         let extras_total: u32 = req.extra_disks.iter().map(|d| d.size_gib).sum();
         Self {
+            cluster_id: req.cluster_id.clone(),
             cpu: req.cpu,
             memory_mib: req.memory_mib,
             disk_gib: req.disk_gib.saturating_add(extras_total),
@@ -90,7 +96,7 @@ pub fn schedule(
     cpu_overcommit_ratio: f32,
 ) -> Result<(String, Vec<GpuInfo>), SchedulerError> {
     let empty = HostUsage::default();
-    let mut candidates: Vec<(&HostRow, i32, Vec<GpuInfo>, Available)> = Vec::new();
+    let mut candidates: Vec<(&HostRow, i32, Vec<GpuInfo>, Available, u32)> = Vec::new();
 
     for host in hosts.iter().filter(|h| h.healthy) {
         let usage = usage_by_host.get(&host.id).unwrap_or(&empty);
@@ -116,14 +122,35 @@ pub fn schedule(
             (0, Vec::new())
         };
 
-        candidates.push((host, score, selected, avail));
+        let cluster_mates = if req.cluster_id.is_empty() {
+            0
+        } else {
+            usage
+                .vms_by_cluster
+                .get(&req.cluster_id)
+                .copied()
+                .unwrap_or(0)
+        };
+
+        candidates.push((host, score, selected, avail, cluster_mates));
     }
 
-    let (host, _score, selected, _) = candidates
+    let (host, _score, selected, _, _) = candidates
         .into_iter()
-        // Highest GPU-topology score first, then best-fit bin-packing.
+        // Order: GPU-topology score (higher wins) → soft anti-affinity
+        // (fewer same-cluster VMs wins) → operator-assigned rank
+        // (lower wins; lets you say "prefer .206 for control plane")
+        // → best-fit bin-packing (smallest remaining wins).
+        //
+        // Rank sits below the workload-shape signals (GPU + anti-
+        // affinity) so an operator preference can't override a real
+        // placement constraint, but above best-fit so two equally-fit
+        // hosts go to the lower-rank one — which is what the operator
+        // actually meant by setting the rank.
         .max_by(|a, b| {
             a.1.cmp(&b.1)
+                .then_with(|| b.4.cmp(&a.4))
+                .then_with(|| b.0.rank.cmp(&a.0.rank))
                 .then_with(|| b.3.remaining_after(req).cmp(&a.3.remaining_after(req)))
         })
         .ok_or_else(|| {
@@ -209,6 +236,7 @@ mod tests {
             vtep_address: format!("10.100.0.{id}"),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,
+            rank: 0,
         }
     }
 
@@ -223,6 +251,7 @@ mod tests {
 
     fn basic_req(gpus: u32, min_group: u32) -> ScheduleRequest {
         ScheduleRequest {
+            cluster_id: String::new(),
             cpu: 4,
             memory_mib: 8192,
             disk_gib: 100,
@@ -241,7 +270,23 @@ mod tests {
             used_memory_mib: mem,
             used_disk_gib: disk,
             assigned_pci: gpus.iter().map(|g| g.pci_address.clone()).collect(),
+            vms_by_cluster: HashMap::new(),
         }
+    }
+
+    /// Like `usage`, but also seeds the per-cluster count map so tests
+    /// can drive the soft anti-affinity branch.
+    fn usage_with_cluster(
+        cpu: i64,
+        mem: i64,
+        disk: i64,
+        cluster_id: &str,
+        cluster_vms: u32,
+    ) -> HostUsage {
+        let mut u = usage(cpu, mem, disk, &[]);
+        u.vms_by_cluster
+            .insert(cluster_id.to_string(), cluster_vms);
+        u
     }
 
     /// Handy shorthand so test bodies read like "empty fleet".
@@ -265,6 +310,7 @@ mod tests {
     fn test_schedule_no_capacity() {
         let hosts = vec![make_host("h1", 2, 4096, 50, &[])];
         let req = ScheduleRequest {
+            cluster_id: String::new(),
             cpu: 8,
             memory_mib: 16384,
             disk_gib: 100,
@@ -304,6 +350,7 @@ mod tests {
     #[test]
     fn test_schedule_empty_hosts_returns_error() {
         let req = ScheduleRequest {
+            cluster_id: String::new(),
             cpu: 1,
             memory_mib: 1024,
             disk_gib: 10,
@@ -348,6 +395,7 @@ mod tests {
         let mut usage_by_host = HashMap::new();
         usage_by_host.insert("h1".to_string(), usage(4, 8192, 400, &[]));
         let req = ScheduleRequest {
+            cluster_id: String::new(),
             cpu: 4,
             memory_mib: 8192,
             disk_gib: 150,
@@ -481,6 +529,56 @@ mod tests {
         assert_eq!(selected[0].nvlink_group, selected[1].nvlink_group);
     }
 
+    /// Soft anti-affinity: a second VM in the same cluster prefers a
+    /// peer host with no cluster-mate over the host already running
+    /// one, even when the other host is a slightly looser fit. Without
+    /// this, three equal VMs on two equal hosts pile onto the
+    /// best-fit winner and a single host failure kills the cluster.
+    #[test]
+    fn test_schedule_soft_anti_affinity_within_cluster() {
+        let hosts = vec![
+            make_host("h1", 16, 65536, 1000, &[]),
+            make_host("h2", 16, 65536, 1000, &[]),
+        ];
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h1".to_string(), usage_with_cluster(4, 8192, 100, "c1", 1));
+
+        let req = ScheduleRequest {
+            cluster_id: "c1".into(),
+            cpu: 4,
+            memory_mib: 8192,
+            disk_gib: 100,
+            gpus: 0,
+            min_group_size: 0,
+        };
+        let (host_id, _) = schedule(&hosts, &usage_by_host, &req, STRICT).unwrap();
+        assert_eq!(host_id, "h2", "anti-affinity should outweigh tighter fit");
+    }
+
+    /// Anti-affinity is per-cluster: a VM from cluster `c2` is
+    /// indifferent to how many `c1` VMs already sit on a host, so
+    /// best-fit alone decides.
+    #[test]
+    fn test_schedule_anti_affinity_ignores_other_clusters() {
+        let hosts = vec![
+            make_host("h1", 16, 65536, 1000, &[]),
+            make_host("h2", 16, 65536, 1000, &[]),
+        ];
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h1".to_string(), usage_with_cluster(4, 8192, 100, "c1", 1));
+
+        let req = ScheduleRequest {
+            cluster_id: "c2".into(),
+            cpu: 4,
+            memory_mib: 8192,
+            disk_gib: 100,
+            gpus: 0,
+            min_group_size: 0,
+        };
+        let (host_id, _) = schedule(&hosts, &usage_by_host, &req, STRICT).unwrap();
+        assert_eq!(host_id, "h1", "different cluster — best-fit wins");
+    }
+
     #[test]
     fn test_overcommit_allows_placement_over_physical_cpu() {
         // 16-CPU host, one 16-vCPU VM already assigned. A second 16-vCPU
@@ -489,6 +587,7 @@ mod tests {
         let mut usage_by_host = HashMap::new();
         usage_by_host.insert("h1".to_string(), usage(16, 8192, 50, &[]));
         let req = ScheduleRequest {
+            cluster_id: String::new(),
             cpu: 16,
             memory_mib: 8192,
             disk_gib: 50,
@@ -508,6 +607,7 @@ mod tests {
         let mut usage_by_host = HashMap::new();
         usage_by_host.insert("h1".to_string(), usage(2, 8192, 10, &[]));
         let req = ScheduleRequest {
+            cluster_id: String::new(),
             cpu: 2,
             memory_mib: 1024,
             disk_gib: 10,
