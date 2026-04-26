@@ -1,24 +1,24 @@
 //! Host-network plumbing for VM guests.
 //!
-//! Every VM has one TAP, `bas<hash>`, attached to the tree bridge
-//! (`brt<vni>`). The tree bridge has a VXLAN slave (`vxt<vni>`) that
-//! tunnels the tree's L2 to every other hypervisor carrying the
-//! same tree. VMs are single-homed on the overlay; LAN reachability
-//! for VIPs is provided by the host's BGP advertisement, not by a
-//! second per-VM NIC.
+//! Every VM has one TAP, `bas<hash>`, attached to its cluster's
+//! bridge (`brc<vni>`). The cluster bridge has a VXLAN slave
+//! (`vxc<vni>`) that tunnels the cluster's L2 to every other
+//! hypervisor carrying the same cluster. VMs are single-homed on
+//! the overlay; LAN reachability for VIPs is provided by the host's
+//! BGP advertisement, not by a second per-VM NIC.
 //!
 //! Tap names hash the vm_id to stay inside IFNAMSIZ = 15 chars while
 //! being stable across restarts. Orphan sweeps reconstruct the
 //! expected name set from known vm_ids (rather than reversing the
 //! one-way hash).
 
-pub mod tree;
+pub mod cluster;
 
-pub use tree::TreeManager;
+pub use cluster::ClusterManager;
 
 use std::hash::{Hash, Hasher};
 
-use basis_proto::TreeState;
+use basis_proto::ClusterState;
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -53,27 +53,27 @@ pub enum NetworkError {
     CommandFailed(#[from] std::io::Error),
 }
 
-/// Bundles the uplink bridge and the per-tree VXLAN manager so call
-/// sites hold one handle instead of two.
+/// Bundles the uplink bridge and the per-cluster VXLAN manager so
+/// call sites hold one handle instead of two.
 pub struct NetworkManager {
     uplink: UplinkBridge,
-    trees: TreeManager,
+    clusters: ClusterManager,
 }
 
 impl NetworkManager {
-    pub fn new(uplink: UplinkBridge, trees: TreeManager) -> Self {
-        Self { uplink, trees }
+    pub fn new(uplink: UplinkBridge, clusters: ClusterManager) -> Self {
+        Self { uplink, clusters }
     }
 
     pub fn uplink_bridge_name(&self) -> &str {
         self.uplink.bridge_name()
     }
 
-    /// Tree-overlay inner MTU (uplink minus VXLAN overhead). Plumbed
-    /// to cloud-init so the guest's primary NIC matches the bridge,
-    /// avoiding silent drops on >MTU egress.
+    /// Cluster-overlay inner MTU (uplink minus VXLAN overhead).
+    /// Plumbed to cloud-init so the guest's primary NIC matches the
+    /// bridge, avoiding silent drops on >MTU egress.
     pub fn inner_mtu(&self) -> u32 {
-        self.trees.inner_mtu()
+        self.clusters.inner_mtu()
     }
 
     pub async fn validate_uplink(&self) -> Result<(), NetworkError> {
@@ -85,19 +85,22 @@ impl NetworkManager {
         ensure_vxlan_spoof_guard().await
     }
 
-    pub async fn reconcile_trees(&self, desired: &[TreeState]) -> Result<(), NetworkError> {
-        self.trees.reconcile(desired).await
+    pub async fn reconcile_clusters(
+        &self,
+        desired: &[ClusterState],
+    ) -> Result<(), NetworkError> {
+        self.clusters.reconcile(desired).await
     }
 
-    /// Pre-connect tree bootstrap: bring the bridge + VXLAN up with
-    /// an empty FDB so a cold-booted VM can attach its TAP before the
-    /// controller reconcile lands.
-    pub async fn ensure_bootstrap_tree(&self, vni: u32) -> Result<(), NetworkError> {
-        self.trees.ensure_bootstrap(vni).await
+    /// Pre-connect cluster bootstrap: bring the bridge + VXLAN up
+    /// with an empty FDB so a cold-booted VM can attach its TAP
+    /// before the controller reconcile lands.
+    pub async fn ensure_bootstrap_cluster(&self, vni: u32) -> Result<(), NetworkError> {
+        self.clusters.ensure_bootstrap(vni).await
     }
 
     pub async fn attach_vm_primary(&self, vm_id: &str, vni: u32) -> Result<String, NetworkError> {
-        self.trees.attach_vm_primary(vm_id, vni).await
+        self.clusters.attach_vm_primary(vm_id, vni).await
     }
 
     /// Best-effort delete of the VM's TAP.
@@ -257,10 +260,10 @@ impl UplinkBridge {
     }
 
     /// Create the bridge if missing, attach the physical NIC, bring
-    /// both up, and enable IPv4 forwarding so tree packets can be
-    /// routed off-host. Per-tree MASQUERADE rules are owned by
-    /// [`TreeManager`] so they come and go with the tree itself.
-    /// Idempotent.
+    /// both up, and enable IPv4 forwarding so cluster packets can be
+    /// routed off-host. Per-cluster MASQUERADE rules are owned by
+    /// [`ClusterManager`] so they come and go with the cluster
+    /// itself. Idempotent.
     pub async fn ensure(&self) -> Result<(), NetworkError> {
         let exists = Command::new("ip")
             .args(["link", "show", &self.bridge_name])
@@ -366,28 +369,28 @@ pub async fn list_agent_taps() -> Result<Vec<String>, NetworkError> {
     Ok(taps)
 }
 
-/// Install a source-scoped MASQUERADE rule for `tree_cidr` egressing
-/// out `uplink`, plus a TCP MSS clamp on the forward chain. Narrower
-/// than a blanket `-o uplink` catch-all: leaves host-originated LAN
-/// traffic untouched. Without MASQUERADE, a tree VM's default route
-/// dead-ends at the host — packets forwarded out the uplink would
-/// source from a tree address the upstream router can't
-/// reverse-route to. Without MSS clamping, return packets from
-/// servers that ignore PMTUD (notably some Google front-ends) get
-/// silently dropped at the bridge once VXLAN's 50 bytes of overhead
-/// pushes them past the underlay MTU — TCP connect hangs even
-/// though SYN/SYN-ACK got through.
+/// Install a source-scoped MASQUERADE rule for `cluster_cidr`
+/// egressing out `uplink`, plus a TCP MSS clamp on the forward
+/// chain. Narrower than a blanket `-o uplink` catch-all: leaves
+/// host-originated LAN traffic untouched. Without MASQUERADE, a
+/// cluster VM's default route dead-ends at the host — packets
+/// forwarded out the uplink would source from a cluster address the
+/// upstream router can't reverse-route to. Without MSS clamping,
+/// return packets from servers that ignore PMTUD (notably some
+/// Google front-ends) get silently dropped at the bridge once
+/// VXLAN's 50 bytes of overhead pushes them past the underlay MTU —
+/// TCP connect hangs even though SYN/SYN-ACK got through.
 ///
 /// Guarded by `iptables -C` existence checks so repeat calls don't
 /// stack duplicates.
-pub(crate) async fn ensure_tree_masquerade(
-    tree_cidr: &str,
+pub(crate) async fn ensure_cluster_masquerade(
+    cluster_cidr: &str,
     uplink: &str,
 ) -> Result<(), NetworkError> {
     ensure_iptables_rule(
         "nat",
         "POSTROUTING",
-        &["-s", tree_cidr, "-o", uplink, "-j", "MASQUERADE"],
+        &["-s", cluster_cidr, "-o", uplink, "-j", "MASQUERADE"],
     )
     .await?;
     // `--clamp-mss-to-pmtu` rewrites MSS in TCP SYN/SYN-ACK to the
@@ -399,7 +402,7 @@ pub(crate) async fn ensure_tree_masquerade(
         "FORWARD",
         &[
             "-s",
-            tree_cidr,
+            cluster_cidr,
             "-p",
             "tcp",
             "--tcp-flags",
@@ -412,20 +415,20 @@ pub(crate) async fn ensure_tree_masquerade(
     )
     .await?;
     info!(
-        tree_cidr,
-        uplink, "installed per-tree MASQUERADE + MSS clamp"
+        cluster_cidr,
+        uplink, "installed per-cluster MASQUERADE + MSS clamp"
     );
     Ok(())
 }
 
-/// Best-effort removal of the per-tree MASQUERADE + MSS clamp rules.
-/// Missing rules are the desired state — iptables returns non-zero
-/// for `-D` on an absent match, which we log and ignore.
-pub(crate) async fn remove_tree_masquerade(tree_cidr: &str, uplink: &str) {
+/// Best-effort removal of the per-cluster MASQUERADE + MSS clamp
+/// rules. Missing rules are the desired state — iptables returns
+/// non-zero for `-D` on an absent match, which we log and ignore.
+pub(crate) async fn remove_cluster_masquerade(cluster_cidr: &str, uplink: &str) {
     delete_iptables_rule(
         "nat",
         "POSTROUTING",
-        &["-s", tree_cidr, "-o", uplink, "-j", "MASQUERADE"],
+        &["-s", cluster_cidr, "-o", uplink, "-j", "MASQUERADE"],
     )
     .await;
     delete_iptables_rule(
@@ -433,7 +436,7 @@ pub(crate) async fn remove_tree_masquerade(tree_cidr: &str, uplink: &str) {
         "FORWARD",
         &[
             "-s",
-            tree_cidr,
+            cluster_cidr,
             "-p",
             "tcp",
             "--tcp-flags",
@@ -445,7 +448,10 @@ pub(crate) async fn remove_tree_masquerade(tree_cidr: &str, uplink: &str) {
         ],
     )
     .await;
-    info!(tree_cidr, uplink, "removed per-tree MASQUERADE + MSS clamp");
+    info!(
+        cluster_cidr,
+        uplink, "removed per-cluster MASQUERADE + MSS clamp"
+    );
 }
 
 /// Drop forwarded VXLAN traffic (UDP/4789) on this host's FORWARD
@@ -455,9 +461,9 @@ pub(crate) async fn remove_tree_masquerade(tree_cidr: &str, uplink: &str) {
 /// goes through FORWARD and gets dropped at the source.
 ///
 /// Without this rule, enabling VXLAN learning on the receive path
-/// would let any in-tree VM spoof MAC entries for any other tree on
-/// peer hosts — a cross-tenant data leak. With it, peer FDBs only
-/// learn from genuine host-originated gARP floods.
+/// would let any in-cluster VM spoof MAC entries for any other
+/// cluster on peer hosts — a cross-tenant data leak. With it, peer
+/// FDBs only learn from genuine host-originated gARP floods.
 async fn ensure_vxlan_spoof_guard() -> Result<(), NetworkError> {
     ensure_iptables_rule(
         "filter",

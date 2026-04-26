@@ -12,7 +12,7 @@ use basis_agent::host_info::HostResources;
 use basis_agent::image::ImageManager;
 use basis_agent::lvm;
 use basis_agent::metrics::{self, Metrics};
-use basis_agent::network::{probe_uplink, NetworkManager, TreeManager, UplinkBridge};
+use basis_agent::network::{probe_uplink, ClusterManager, NetworkManager, UplinkBridge};
 use basis_agent::reconcile;
 use basis_agent::vm::VmManager;
 use basis_common::gpu::GpuInfo;
@@ -180,12 +180,12 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         spec.network.physical_nic.clone(),
         probe.mtu,
     );
-    let trees = TreeManager::new(
+    let clusters = ClusterManager::new(
         probe.vtep_address.clone(),
         probe.mtu,
         spec.network.bridge.clone(),
     );
-    let net_mgr = NetworkManager::new(uplink, trees);
+    let net_mgr = NetworkManager::new(uplink, clusters);
 
     // Preflight everything in parallel. `try_join!` short-circuits on
     // the first failure.
@@ -482,18 +482,24 @@ fn parse_ipv4(s: &str, field: &str) -> anyhow::Result<std::net::Ipv4Addr> {
         .with_context(|| format!("{field} '{s}' is not a valid IPv4 address"))
 }
 
-/// Apply a `ReconcileHostCommand`: build/tear-down tree bridges to
-/// match the command's `trees`, delete VMs absent from
-/// `expected_vm_ids`, and refresh the BGP advertised prefix set so
-/// the cell knows which tree CIDRs route through this host. Single
-/// path used by the handshake ack, periodic pushes, and ad-hoc
-/// broadcasts.
+/// Apply a `ReconcileHostCommand`: build/tear-down per-cluster
+/// bridges to match the command's `clusters`, delete VMs absent
+/// from `expected_vm_ids`, and refresh the BGP advertised prefix
+/// set so the cell knows which cluster VIPs route through this
+/// host. Single path used by the handshake ack, periodic pushes,
+/// and ad-hoc broadcasts.
+///
+/// Cluster overlay CIDRs are intentionally NOT advertised — VM
+/// IPs are private to the cluster's bridge by design (no
+/// inter-cluster L3 reachability). Only the `cluster_vips` set
+/// (apiserver VIP when `APISERVER_PUBLIC` + LB Service block) is
+/// announced to the cell.
 async fn apply_reconcile(
     rt: &AgentRuntime,
     cmd: &ReconcileHostCommand,
     vm_delete_grace: Duration,
 ) -> anyhow::Result<()> {
-    rt.net_mgr.reconcile_trees(&cmd.trees).await?;
+    rt.net_mgr.reconcile_clusters(&cmd.clusters).await?;
     handlers::reconcile_against_expected(
         &cmd.expected_vm_ids,
         &rt.vm_mgr,
@@ -504,19 +510,12 @@ async fn apply_reconcile(
     .await?;
     if let Some(speaker) = rt.bgp_speaker.as_ref() {
         let mut prefixes: Vec<ipnet::Ipv4Net> = Vec::new();
-        for tree in &cmd.trees {
-            match tree.cidr.parse::<ipnet::Ipv4Net>() {
-                Ok(p) => prefixes.push(p),
-                Err(_) => warn!(
-                    cidr = %tree.cidr, vni = tree.vni,
-                    "BGP advertise: tree cidr unparseable, skipping"
-                ),
-            }
-            for vip in &tree.cluster_vips {
+        for cluster in &cmd.clusters {
+            for vip in &cluster.cluster_vips {
                 match vip.parse::<ipnet::Ipv4Net>() {
                     Ok(p) => prefixes.push(p),
                     Err(_) => warn!(
-                        vip = %vip, vni = tree.vni,
+                        vip = %vip, vni = cluster.vni,
                         "BGP advertise: cluster_vip unparseable, skipping"
                     ),
                 }

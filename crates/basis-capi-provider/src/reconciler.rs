@@ -59,18 +59,9 @@ where
 }
 
 /// Context handed to every reconciler.
-///
-/// `parent_cluster_id` is the basis-side cluster id of the cluster this
-/// provider instance is running in — set at deploy time by whoever
-/// installs the provider (Lattice's installer, or a bare `lattice-cli`
-/// deploy). Every `BasisCluster` the provider creates becomes a child
-/// of this id, which is how the basis "tree" (trust domain) hierarchy
-/// is expressed: the parent is implied by *where* the provider runs,
-/// not by a per-CR field. Empty string on the root cell's provider.
 pub struct ProviderContext {
     pub client: Client,
     pub clients: Arc<BasisClientCache>,
-    pub parent_cluster_id: String,
 }
 
 /// Properties every reconcile-error type carries. Keeps the failure

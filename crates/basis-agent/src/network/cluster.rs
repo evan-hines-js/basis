@@ -1,30 +1,31 @@
-//! Per-tree dataplane: one Linux bridge + one VXLAN device per tree
-//! this host carries, plus a source-scoped MASQUERADE rule that NATs
-//! the tree's CIDR out the uplink.
+//! Per-cluster dataplane: one Linux bridge + one VXLAN device per
+//! cluster this host carries, plus a source-scoped MASQUERADE rule
+//! that NATs the cluster's CIDR out the uplink.
 //!
 //! Naming derives from the VNI:
-//!   * bridge: `brt<vni>`
-//!   * VXLAN:  `vxt<vni>`
+//!   * bridge: `brc<vni>`
+//!   * VXLAN:  `vxc<vni>`
 //!
-//! `ReconcileHostCommand.trees` from the controller is authoritative —
-//! bridges + FDBs converge on it. VXLAN has learning disabled so a
-//! misbehaving guest can't poison another host's forwarding table;
-//! BUM entries come exclusively from the controller's peer list.
+//! `ReconcileHostCommand.clusters` from the controller is
+//! authoritative — bridges + FDBs converge on it. VXLAN has learning
+//! disabled so a misbehaving guest can't poison another host's
+//! forwarding table; BUM entries come exclusively from the
+//! controller's peer list.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use basis_proto::TreeState;
+use basis_proto::ClusterState;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use super::{
-    ensure_tap_on_bridge, ensure_tree_masquerade, primary_tap_name, remove_tree_masquerade,
+    ensure_cluster_masquerade, ensure_tap_on_bridge, primary_tap_name, remove_cluster_masquerade,
     run_cmd, NetworkError, VXLAN_OVERHEAD,
 };
 
-const BRIDGE_PREFIX: &str = "brt";
-const VXLAN_PREFIX: &str = "vxt";
+const BRIDGE_PREFIX: &str = "brc";
+const VXLAN_PREFIX: &str = "vxc";
 const VXLAN_PORT: u16 = 4789;
 
 pub fn bridge_name(vni: u32) -> String {
@@ -35,10 +36,10 @@ pub fn vxlan_name(vni: u32) -> String {
     format!("{VXLAN_PREFIX}{vni}")
 }
 
-/// What this host has materialised for a given tree. Tracked so that
-/// reconciles can diff and reclaim three kernel resources:
+/// What this host has materialised for a given cluster. Tracked so
+/// that reconciles can diff and reclaim three kernel resources:
 ///
-///   * the tree's MASQUERADE rule (keyed on `cidr`)
+///   * the cluster's MASQUERADE rule (keyed on `cidr`)
 ///   * one IP route per externally-advertised prefix (apiserver VIPs
 ///     are /32, Cilium Service blocks are /N where N<32)
 ///   * one proxy-ARP entry per *host address* in those prefixes, so
@@ -49,13 +50,13 @@ pub fn vxlan_name(vni: u32) -> String {
 /// address) — when a cluster's Service block grows from /28 to /27,
 /// the route swap is one op but proxy-ARP needs 16 new entries.
 #[derive(Debug, Default)]
-struct TreeLive {
-    /// Tree CIDR a MASQUERADE rule was installed for, if any. `None`
-    /// means bootstrap-only (cold-boot before reconcile landed).
+struct ClusterLive {
+    /// Cluster CIDR a MASQUERADE rule was installed for, if any.
+    /// `None` means bootstrap-only (cold-boot before reconcile landed).
     cidr: Option<String>,
     /// Externally-advertised prefixes (`<addr>/<prefix>` strings,
     /// `<prefix>` ∈ [0..32]) for which we've installed an
-    /// `ip route ... dev brt<vni>` override. The override is required
+    /// `ip route ... dev brc<vni>` override. The override is required
     /// because the prefix lives on a LAN pool — without a
     /// more-specific route the kernel treats it as connected on the
     /// underlay and ARP times out.
@@ -67,20 +68,20 @@ struct TreeLive {
     proxy_arp_addrs: BTreeSet<String>,
 }
 
-pub struct TreeManager {
+pub struct ClusterManager {
     vtep_address: String,
     uplink_mtu: u32,
     /// Name of the uplink bridge used as the `-o` interface in the
-    /// per-tree MASQUERADE rules installed by [`ensure_tree_inner`].
+    /// per-cluster MASQUERADE rules installed by [`Self::ensure_cluster_inner`].
     uplink_bridge: String,
-    /// VNIs currently materialised on this host plus the per-tree
+    /// VNIs currently materialised on this host plus the per-cluster
     /// state we've programmed (CIDR for MASQUERADE, VIP routes for
     /// LAN ingress). `reconcile` diffs keys against the desired set
     /// for teardown.
-    live: Mutex<HashMap<u32, TreeLive>>,
+    live: Mutex<HashMap<u32, ClusterLive>>,
 }
 
-impl TreeManager {
+impl ClusterManager {
     pub fn new(vtep_address: String, uplink_mtu: u32, uplink_bridge: String) -> Self {
         Self {
             vtep_address,
@@ -94,43 +95,32 @@ impl TreeManager {
         self.uplink_mtu - VXLAN_OVERHEAD
     }
 
-    /// Apply the controller's authoritative tree list. After this
-    /// returns, every tree in `desired` has a bridge + VXLAN +
+    /// Apply the controller's authoritative cluster list. After this
+    /// returns, every cluster in `desired` has a bridge + VXLAN +
     /// matching FDB + MASQUERADE rule, and no extras exist.
-    pub async fn reconcile(&self, desired: &[TreeState]) -> Result<(), NetworkError> {
+    pub async fn reconcile(&self, desired: &[ClusterState]) -> Result<(), NetworkError> {
         let mut live = self.live.lock().await;
 
-        let desired_vnis: HashSet<u32> = desired.iter().map(|t| t.vni).collect();
+        let desired_vnis: HashSet<u32> = desired.iter().map(|c| c.vni).collect();
 
-        for tree in desired {
-            self.ensure_tree_inner(tree).await?;
-            let cidr = if tree.cidr.is_empty() {
+        for cluster in desired {
+            self.ensure_cluster_inner(cluster).await?;
+            let cidr = if cluster.cidr.is_empty() {
                 None
             } else {
-                Some(tree.cidr.clone())
+                Some(cluster.cidr.clone())
             };
-            // Reconcile externally-routable cluster prefixes. Two
-            // kernel resources, two diffs:
-            //   1. `ip route replace <prefix> dev brt<vni>` per prefix
-            //      — so LAN-incoming packets for any IP in the prefix
-            //      get forwarded onto the tree bridge.
-            //   2. `ip neigh replace proxy <addr> dev <uplink>` per
-            //      host address in the prefix — so LAN clients ARPing
-            //      get this host's MAC. With multiple hosts carrying
-            //      the tree, all proxy-ARP and the LAN naturally
-            //      spreads ingress across them.
-            // Both ops are idempotent on `replace`.
-            let bridge = bridge_name(tree.vni);
-            let (desired_prefixes, desired_addrs) = expand_prefixes(&tree.cluster_vips);
-            let prev = live.entry(tree.vni).or_default();
+            let bridge = bridge_name(cluster.vni);
+            let (desired_prefixes, desired_addrs) = expand_prefixes(&cluster.cluster_vips);
+            let prev = live.entry(cluster.vni).or_default();
             for stale in prev.external_prefixes.difference(&desired_prefixes) {
                 if let Err(e) = del_prefix_route(stale, &bridge).await {
-                    warn!(prefix = %stale, vni = tree.vni, error = %e, "prefix route del");
+                    warn!(prefix = %stale, vni = cluster.vni, error = %e, "prefix route del");
                 }
             }
             for stale in prev.proxy_arp_addrs.difference(&desired_addrs) {
                 if let Err(e) = del_proxy_arp(stale, &self.uplink_bridge).await {
-                    warn!(addr = %stale, vni = tree.vni, error = %e, "proxy-arp del");
+                    warn!(addr = %stale, vni = cluster.vni, error = %e, "proxy-arp del");
                 }
             }
             for new in desired_prefixes.difference(&prev.external_prefixes) {
@@ -143,13 +133,13 @@ impl TreeManager {
             prev.external_prefixes = desired_prefixes;
             prev.proxy_arp_addrs = desired_addrs;
         }
-        let stale: Vec<(u32, TreeLive)> = live
+        let stale: Vec<(u32, ClusterLive)> = live
             .iter()
             .filter(|(vni, _)| !desired_vnis.contains(vni))
             .map(|(vni, l)| {
                 (
                     *vni,
-                    TreeLive {
+                    ClusterLive {
                         cidr: l.cidr.clone(),
                         external_prefixes: l.external_prefixes.clone(),
                         proxy_arp_addrs: l.proxy_arp_addrs.clone(),
@@ -158,19 +148,20 @@ impl TreeManager {
             })
             .collect();
         for (vni, l) in stale {
-            self.remove_tree(vni, &l).await;
+            self.remove_cluster(vni, &l).await;
             live.remove(&vni);
         }
         Ok(())
     }
 
-    /// Attach a VM's primary TAP to its tree's bridge. Also ensures
-    /// the bridge + VXLAN exist — handles the narrow race where a
-    /// fresh host receives `CreateVmCommand` before (or concurrently
-    /// with) the controller's first `ReconcileHostCommand` that
-    /// would otherwise be the one to create the bridge. Bootstrap is
-    /// idempotent; the reconcile will still land afterward and fill
-    /// in gateway IP, MASQUERADE rule, and peer FDB.
+    /// Attach a VM's primary TAP to its cluster's bridge. Also
+    /// ensures the bridge + VXLAN exist — handles the narrow race
+    /// where a fresh host receives `CreateVmCommand` before (or
+    /// concurrently with) the controller's first
+    /// `ReconcileHostCommand` that would otherwise be the one to
+    /// create the bridge. Bootstrap is idempotent; the reconcile will
+    /// still land afterward and fill in gateway IP, MASQUERADE rule,
+    /// and peer FDB.
     pub async fn attach_vm_primary(&self, vm_id: &str, vni: u32) -> Result<String, NetworkError> {
         self.ensure_bootstrap(vni).await?;
         let tap = primary_tap_name(vm_id);
@@ -178,12 +169,13 @@ impl TreeManager {
         Ok(tap)
     }
 
-    /// Cold-boot: ensure the tree's bridge + VXLAN exist with empty
+    /// Cold-boot: ensure the cluster's bridge + VXLAN exist with empty
     /// peer FDB so persisted VMs can re-attach their TAPs before the
     /// controller reconcile lands. Gateway IP, MASQUERADE rule, and
     /// VIP routes arrive with the first reconcile.
     pub async fn ensure_bootstrap(&self, vni: u32) -> Result<(), NetworkError> {
-        self.ensure_tree_inner(&TreeState {
+        self.ensure_cluster_inner(&ClusterState {
+            cluster_id: String::new(),
             vni,
             gateway_ip: String::new(),
             prefix_len: 0,
@@ -196,9 +188,9 @@ impl TreeManager {
         Ok(())
     }
 
-    async fn ensure_tree_inner(&self, tree: &TreeState) -> Result<(), NetworkError> {
-        let bridge = bridge_name(tree.vni);
-        let vxlan = vxlan_name(tree.vni);
+    async fn ensure_cluster_inner(&self, cluster: &ClusterState) -> Result<(), NetworkError> {
+        let bridge = bridge_name(cluster.vni);
+        let vxlan = vxlan_name(cluster.vni);
         let inner_mtu = self.inner_mtu();
 
         if !link_exists(&bridge).await? {
@@ -210,11 +202,11 @@ impl TreeManager {
         if !link_exists(&vxlan).await? {
             // Learning enabled so peer hosts pick up Cilium's leader
             // gARP via BUM flood — bridges across all hosts in the
-            // tree end up with the same VIP→VTEP FDB entry without
+            // cluster end up with the same VIP→VTEP FDB entry without
             // basis having to track per-cluster leader state. Safe
             // because the FORWARD-chain UDP/4789 drop in
             // `ensure_vxlan_spoof_guard` blocks tenant VMs from
-            // forging cross-tree VXLAN frames.
+            // forging cross-cluster VXLAN frames.
             run_cmd(
                 "ip",
                 &[
@@ -224,7 +216,7 @@ impl TreeManager {
                     "type",
                     "vxlan",
                     "id",
-                    &tree.vni.to_string(),
+                    &cluster.vni.to_string(),
                     "dstport",
                     &VXLAN_PORT.to_string(),
                     "local",
@@ -238,29 +230,30 @@ impl TreeManager {
         run_cmd("ip", &["link", "set", &vxlan, "up"]).await?;
 
         // Assign this host's unique bridge IP so the kernel acquires
-        // `<tree_cidr> dev brt<vni>` in its routing table — VMs use it
-        // as default gateway and `ping <vm_ip>` from the host works.
-        // Uniqueness-across-hosts (carved from `bridge_range` by the
-        // controller) is what makes cross-host host→VM replies land on
-        // the sender and not whichever host happens to be replying.
-        if !tree.gateway_ip.is_empty() && tree.prefix_len > 0 {
-            ensure_bridge_address(&bridge, &tree.gateway_ip, tree.prefix_len).await?;
+        // `<cluster_cidr> dev brc<vni>` in its routing table — VMs
+        // use it as default gateway and `ping <vm_ip>` from the host
+        // works. Uniqueness across hosts (carved from `bridge_range`
+        // by the controller) is what makes cross-host host→VM replies
+        // land on the sender and not whichever host happens to be
+        // replying.
+        if !cluster.gateway_ip.is_empty() && cluster.prefix_len > 0 {
+            ensure_bridge_address(&bridge, &cluster.gateway_ip, cluster.prefix_len).await?;
         }
 
-        if !tree.cidr.is_empty() {
-            ensure_tree_masquerade(&tree.cidr, &self.uplink_bridge).await?;
+        if !cluster.cidr.is_empty() {
+            ensure_cluster_masquerade(&cluster.cidr, &self.uplink_bridge).await?;
         }
 
-        self.reconcile_fdb(&vxlan, &tree.vtep_addresses).await
+        self.reconcile_fdb(&vxlan, &cluster.vtep_addresses).await
     }
 
-    /// Best-effort teardown of the tree's dataplane. Drop the VIP /32
-    /// routes (kernel auto-removes them when the bridge link goes, but
-    /// be explicit so the live-map state matches), remove the
+    /// Best-effort teardown of the cluster's dataplane. Drop the VIP
+    /// routes (kernel auto-removes them when the bridge link goes,
+    /// but be explicit so the live-map state matches), remove the
     /// MASQUERADE rule if we installed one, then delete the VXLAN +
     /// bridge. Missing devices are the desired state — we log and
     /// move on.
-    async fn remove_tree(&self, vni: u32, prev: &TreeLive) {
+    async fn remove_cluster(&self, vni: u32, prev: &ClusterLive) {
         let bridge = bridge_name(vni);
         for prefix in &prev.external_prefixes {
             if let Err(e) = del_prefix_route(prefix, &bridge).await {
@@ -273,7 +266,7 @@ impl TreeManager {
             }
         }
         if let Some(cidr) = prev.cidr.as_deref() {
-            remove_tree_masquerade(cidr, &self.uplink_bridge).await;
+            remove_cluster_masquerade(cidr, &self.uplink_bridge).await;
         }
         if let Err(e) = run_cmd("ip", &["link", "delete", &vxlan_name(vni)]).await {
             warn!(vni, error = %e, "vxlan delete");
@@ -297,13 +290,7 @@ impl TreeManager {
             let _ = run_cmd(
                 "bridge",
                 &[
-                    "fdb",
-                    "del",
-                    "00:00:00:00:00:00",
-                    "dev",
-                    vxlan,
-                    "dst",
-                    stale,
+                    "fdb", "del", "00:00:00:00:00:00", "dev", vxlan, "dst", stale,
                 ],
             )
             .await;
@@ -312,13 +299,7 @@ impl TreeManager {
             run_cmd(
                 "bridge",
                 &[
-                    "fdb",
-                    "append",
-                    "00:00:00:00:00:00",
-                    "dev",
-                    vxlan,
-                    "dst",
-                    new,
+                    "fdb", "append", "00:00:00:00:00:00", "dev", vxlan, "dst", new,
                 ],
             )
             .await?;
@@ -379,7 +360,7 @@ fn expand_prefixes(prefixes: &[String]) -> (BTreeSet<String>, BTreeSet<String>) 
 
 /// Install a more-specific `<prefix> dev <bridge>` route so the
 /// kernel forwards LAN-incoming packets for any address in the
-/// prefix onto the tree bridge (where the FDB — populated by
+/// prefix onto the cluster bridge (where the FDB — populated by
 /// kube-vip / Cilium gratuitous ARP — delivers them to the right VM)
 /// instead of treating the destination as connected on the underlay.
 async fn add_prefix_route(prefix: &str, bridge: &str) -> Result<(), NetworkError> {

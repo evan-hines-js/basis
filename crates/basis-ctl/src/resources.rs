@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use basis_client::MachineRequest;
+use basis_proto::ApiserverVisibility;
 use serde::Deserialize;
 
 pub const API_VERSION: &str = "basis.dev/v1";
@@ -21,17 +22,11 @@ pub struct Metadata {
 
 #[derive(Debug, Deserialize)]
 pub struct ClusterSpec {
-    /// Name of another Cluster resource that should be this cluster's
-    /// parent in the tree / trust domain. Unset → this cluster is a
-    /// tree root and gets a fresh VNI + CIDR.
-    #[serde(default, rename = "parentCluster")]
-    pub parent_cluster: Option<String>,
-
-    /// Named LAN pool both the apiserver VIP and the LoadBalancer
-    /// Service block are carved from. Empty / unset → tree CIDR
-    /// (nested cluster, no LAN exposure). A pool name resolves to
-    /// a LAN pool in the controller's `network.pools[]`.
-    #[serde(default, rename = "externalIpPool")]
+    /// Named LAN pool the cluster's external IPs come from — the
+    /// LoadBalancer Service block always, and the apiserver VIP too
+    /// when `apiserverVisibility = Public`. Required: must match a
+    /// pool name in the controller's `network.pools[]`.
+    #[serde(rename = "externalIpPool")]
     pub external_ip_pool: String,
 
     /// Number of LoadBalancer Service IPs Cilium should be configured
@@ -39,6 +34,17 @@ pub struct ClusterSpec {
     /// Must be a power of two.
     #[serde(default, rename = "externalServiceIps")]
     pub external_service_ips: u32,
+
+    /// Where the apiserver VIP lives. `Public` (default) → from the
+    /// pool, BGP-advertised cell-wide; `Private` → cluster CIDR's
+    /// last usable, accessed via the parent cell's API proxy.
+    #[serde(default, rename = "apiserverVisibility")]
+    pub apiserver_visibility: ApiserverVisibility,
+
+    /// Trust-domain label, propagated to BGP communities in Phase 2.
+    /// Empty / unset = untagged.
+    #[serde(default, rename = "trustDomain")]
+    pub trust_domain: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -13,14 +13,12 @@ pub const API_VERSION: &str = "v1alpha1";
 
 /// Identifies a cluster that maps 1:1 to a Basis-side cluster.
 ///
-/// User input is just `credentialsRef` (how to reach the basis
-/// controller). The tree this cluster joins is *not* encoded here —
-/// it's implied by the basis-capi-provider instance doing the
-/// reconcile: every cluster the provider creates becomes a child of
-/// the cluster the provider itself runs in. See
-/// `ProviderContext.parent_cluster_id`.
+/// User input is `credentialsRef` (how to reach the basis controller),
+/// `externalIpPool` (where the LB Service block — and the apiserver
+/// VIP, if public — comes from), `apiserverVisibility` (cell-public
+/// vs cluster-private), and the optional `trustDomain` label.
 ///
-/// `controlPlaneEndpoint`, `treeId`, and `vni` are populated by the
+/// `controlPlaneEndpoint`, `vni`, and `cidr` are populated by the
 /// reconciler after basis allocates them — per CAPI convention, the
 /// infrastructure provider is authoritative for the endpoint and
 /// CAPI core propagates it onto `Cluster.spec.controlPlaneEndpoint`
@@ -45,22 +43,31 @@ pub struct BasisClusterSpec {
     /// basis-controller connection material.
     pub credentials_ref: CredentialsRef,
 
-    /// Named LAN pool the cluster's external IPs (apiserver VIP and
-    /// LoadBalancer Service block) are carved from. Empty / unset →
-    /// the cluster's tree CIDR (nested cluster, no LAN exposure;
-    /// reachable only from sibling clusters in the same tree). Any
-    /// non-empty name must match a pool in the basis controller's
-    /// `network.pools[]`; every host carrying the tree advertises
-    /// the allocations via the cell BGP reflector with itself as
-    /// next-hop, plus a proxy-ARP entry on the underlay so LAN
-    /// clients can reach them.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Named LAN pool the cluster's external IPs come from — the
+    /// LoadBalancer Service block always, and the apiserver VIP when
+    /// `apiserverVisibility = Public`. Required: must match a pool
+    /// in the basis controller's `network.pools[]`. Allocations are
+    /// BGP-advertised cell-wide.
     pub external_ip_pool: String,
 
     /// Number of LoadBalancer Service IPs Cilium gets configured
     /// with. Must be a power of two. 0 / unset → cell-wide default.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub external_service_ips: u32,
+
+    /// Where the apiserver VIP lives. `Public` (default) — from
+    /// `externalIpPool`, BGP-advertised cell-wide; safe for the root
+    /// mgmt cluster. `Private` — from the cluster's CIDR (last
+    /// usable), reachable only from inside the cluster's bridge.
+    #[serde(default)]
+    pub apiserver_visibility: ApiserverVisibility,
+
+    /// Trust-domain label, propagated to BGP communities in Phase 2
+    /// of the network design so VIPs are only installed on hosts
+    /// whose local clusters subscribe to the same trust domain.
+    /// Empty / unset = untagged (cell-wide propagation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_domain: Option<String>,
 
     /// Populated by the reconciler after `Basis.CreateCluster` returns.
     /// Never set by the user — if present on first apply, the
@@ -75,6 +82,30 @@ pub struct BasisClusterSpec {
     /// 0 service IPs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service_block_cidr: String,
+}
+
+/// Where the apiserver VIP for this cluster lives.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum ApiserverVisibility {
+    /// Apiserver VIP from `externalIpPool`, BGP-advertised cell-wide.
+    /// Required for the root mgmt cluster (operator's `lattice
+    /// install` needs direct LAN reachability).
+    #[default]
+    Public,
+    /// Apiserver VIP at the last usable address of the cluster's
+    /// CIDR; never advertised. CAPI access goes through the parent
+    /// cell's lattice-operator API proxy over the agent's
+    /// reverse-tunneled gRPC stream.
+    Private,
+}
+
+impl From<ApiserverVisibility> for basis_proto::ApiserverVisibility {
+    fn from(v: ApiserverVisibility) -> Self {
+        match v {
+            ApiserverVisibility::Public => Self::ApiserverPublic,
+            ApiserverVisibility::Private => Self::ApiserverPrivate,
+        }
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -107,15 +138,16 @@ pub struct BasisClusterStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis_cluster_id: Option<String>,
 
-    /// Tree (trust domain) this cluster belongs to. Observability-only
-    /// on the K8s side — consumers that care (Lattice) read it here
-    /// to sibling-check across the fleet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tree_id: Option<String>,
-
-    /// VXLAN Network Identifier of the tree. Same purpose as `treeId`.
+    /// VXLAN Network Identifier of the cluster's overlay.
+    /// Observability — Lattice reads this to render dashboards and
+    /// reason about the fabric.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vni: Option<u32>,
+
+    /// CIDR of the cluster's overlay (e.g. `10.42.0.0/24`). Same
+    /// observability use as `vni`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initialization: Option<InitializationStatus>,

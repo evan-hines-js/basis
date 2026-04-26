@@ -85,8 +85,13 @@ impl ClientError {
 pub struct Cluster {
     pub cluster_id: String,
     pub control_plane_endpoint: String,
-    pub tree_id: String,
     pub vni: u32,
+    /// CIDR of the cluster's overlay (e.g. `10.42.0.0/24`). The
+    /// bottom `bridgeReserve` addresses are reserved for per-host
+    /// gateway IPs (assigned by the controller as VMs land); the
+    /// rest are VM IPs (less the apiserver VIP slot when the cluster
+    /// opted into a private apiserver).
+    pub cidr: String,
     /// CIDR of the cluster's LoadBalancer Service block (e.g.
     /// `10.0.0.224/28`). Empty when the cluster requested 0 service IPs.
     pub service_block_cidr: String,
@@ -117,15 +122,12 @@ pub struct MachineRequest {
     pub extra_disk_gibs: Vec<u32>,
 }
 
-/// Inputs to `create_cluster`. Roots (new trees) pass
-/// `parent_cluster_id: None`; children pass the parent's id.
+/// Inputs to `create_cluster`.
 pub struct ClusterRequest {
     pub name: String,
-    pub parent_cluster_id: Option<String>,
-    /// Named LAN pool both the apiserver VIP and the LoadBalancer
-    /// Service block are carved from. Empty selects the cluster's own
-    /// tree CIDR (nested cluster, no LAN exposure; reachable only
-    /// from sibling clusters in the same tree). Any non-empty name
+    /// Named LAN pool the cluster's external IPs are carved from —
+    /// always the LoadBalancer Service block, and the apiserver VIP
+    /// too when `apiserver_visibility = ApiserverPublic`. Required:
     /// must match an entry in the controller's `network.pools[]`.
     pub external_ip_pool: String,
     /// Number of LoadBalancer Service IPs this cluster gets, exposed
@@ -133,6 +135,15 @@ pub struct ClusterRequest {
     /// two so the controller can carve an aligned /N out of the pool.
     /// 0 falls back to the cell-wide default.
     pub external_service_ips: u32,
+    /// Where the apiserver VIP lives. `ApiserverPublic` (default) —
+    /// from `external_ip_pool`, BGP-advertised cell-wide; safe for
+    /// the root mgmt cluster. `ApiserverPrivate` — from the cluster's
+    /// CIDR (last usable), reachable only from inside the cluster's
+    /// bridge; CAPI access goes through the parent cell's API proxy.
+    pub apiserver_visibility: basis_proto::ApiserverVisibility,
+    /// Trust-domain label, propagated to BGP communities in Phase 2
+    /// of the network design. Empty (default) means untagged.
+    pub trust_domain: String,
 }
 
 pub struct BasisClient {
@@ -229,9 +240,10 @@ impl BasisClient {
     pub async fn create_cluster(&self, req: ClusterRequest) -> Result<Cluster, ClientError> {
         let request = CreateClusterRequest {
             name: req.name,
-            parent_cluster_id: req.parent_cluster_id.unwrap_or_default(),
             external_ip_pool: req.external_ip_pool,
             external_service_ips: req.external_service_ips,
+            apiserver_visibility: req.apiserver_visibility as i32,
+            trust_domain: req.trust_domain,
         };
         let resp = self
             .call(|mut c| {
@@ -242,8 +254,8 @@ impl BasisClient {
         Ok(Cluster {
             cluster_id: resp.cluster_id,
             control_plane_endpoint: resp.control_plane_endpoint,
-            tree_id: resp.tree_id,
             vni: resp.vni,
+            cidr: resp.cidr,
             service_block_cidr: resp.service_block_cidr,
         })
     }
@@ -269,8 +281,8 @@ impl BasisClient {
         Ok(Cluster {
             cluster_id: resp.cluster_id,
             control_plane_endpoint: resp.control_plane_endpoint,
-            tree_id: resp.tree_id,
             vni: resp.vni,
+            cidr: resp.cidr,
             service_block_cidr: resp.service_block_cidr,
         })
     }

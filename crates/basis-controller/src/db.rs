@@ -132,70 +132,63 @@ impl Db {
         .execute(&self.writer)
         .await?;
 
+        // Per-cluster network identity:
+        //   * `vni` — VXLAN Network Identifier, unique cell-wide.
+        //   * `cidr` — overlay CIDR carved from `network.clusterSupernet`.
+        //     First usable = anycast gateway, last usable = apiserver VIP
+        //     (when private), the rest = VM IPs.
+        //   * `external_pool` — LAN-routable pool the LB Service block
+        //     (and the apiserver VIP, if `apiserver_visibility = PUBLIC`)
+        //     are allocated from.
+        //   * `service_block_cidr` — LoadBalancer Service block CIDR
+        //     (e.g. `10.0.0.224/28`). Empty when the cluster requested
+        //     zero service IPs.
+        //   * `apiserver_visibility` — `0` = PUBLIC (apiserver VIP from
+        //     the pool, BGP-advertised cell-wide), `1` = PRIVATE
+        //     (apiserver VIP from `cidr`, never advertised). Stored as
+        //     i64 to match the proto enum.
+        //   * `trust_domain` — Phase-2 BGP-community label. Empty
+        //     means untagged (cell-wide propagation, today's behavior).
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS trees (
+            "CREATE TABLE IF NOT EXISTS clusters (
                 id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
                 vni INTEGER NOT NULL UNIQUE,
                 cidr TEXT NOT NULL,
                 bridge_range_start TEXT NOT NULL,
                 bridge_range_end TEXT NOT NULL,
                 vm_range_start TEXT NOT NULL,
                 vm_range_end TEXT NOT NULL,
-                vip_range_start TEXT NOT NULL,
-                vip_range_end TEXT NOT NULL,
                 prefix_len INTEGER NOT NULL,
+                control_plane_endpoint TEXT NOT NULL,
+                apiserver_visibility INTEGER NOT NULL DEFAULT 0,
+                external_pool TEXT NOT NULL,
+                service_block_cidr TEXT NOT NULL DEFAULT '',
+                trust_domain TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             )",
         )
         .execute(&self.writer)
         .await?;
 
-        // Per-(tree, host) gateway IP. Every hypervisor carrying a VM
-        // in a tree owns a unique address from the tree's bridge_range
-        // and assigns it to its local `brt<vni>`. VMs use their own
-        // host's bridge IP as default gateway so cross-host replies
-        // routing back through the gateway land on the correct
-        // hypervisor — a single shared gateway IP gets hijacked by
-        // whichever host happens to be the reply's source.
+        // Per-(cluster, host) bridge IP. Every hypervisor carrying a
+        // VM in a cluster owns a unique address from the cluster's
+        // `bridge_range` and assigns it to its local `brc<vni>`. VMs
+        // use their own host's bridge IP as default gateway so
+        // cross-host replies routing back through the gateway land on
+        // the originating hypervisor — anycast on a shared IP would
+        // require EVPN-style ARP suppression we don't have yet.
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS tree_host_bridges (
-                tree_id TEXT NOT NULL REFERENCES trees(id),
+            "CREATE TABLE IF NOT EXISTS cluster_host_bridges (
+                cluster_id TEXT NOT NULL REFERENCES clusters(id),
                 host_id TEXT NOT NULL,
                 ip_address TEXT NOT NULL,
-                PRIMARY KEY (tree_id, host_id),
-                UNIQUE (tree_id, ip_address)
+                PRIMARY KEY (cluster_id, host_id),
+                UNIQUE (cluster_id, ip_address)
             )",
         )
         .execute(&self.writer)
         .await?;
-
-        // `external_pool` is the pool name chosen at CreateCluster.
-        // Empty means LAN exposure is off — both the apiserver VIP and
-        // the Service block (if any) were carved from the tree's
-        // top-of-CIDR vip_reserve, reachable only from sibling clusters
-        // in the same tree.
-        //
-        // `service_block_cidr` records the LoadBalancer Service block
-        // allocated to this cluster (e.g. `10.0.0.224/28`). Empty means
-        // the cluster requested 0 service IPs.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS clusters (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                tree_id TEXT NOT NULL REFERENCES trees(id),
-                parent_cluster_id TEXT REFERENCES clusters(id),
-                control_plane_endpoint TEXT NOT NULL,
-                external_pool TEXT NOT NULL DEFAULT '',
-                service_block_cidr TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&self.writer)
-        .await?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_clusters_tree ON clusters(tree_id)")
-            .execute(&self.writer)
-            .await?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS vms (
@@ -297,14 +290,23 @@ impl Db {
         Ok(())
     }
 
-    // --- Trees ---
+    // --- Cluster network allocation ---
 
-    /// Atomically allocate a new tree: pick the next free VNI and carve
-    /// the next free sub-CIDR out of `net.tree_supernet`.
-    pub async fn allocate_tree(&self, net: &NetworkConfig) -> Result<TreeRow, DbError> {
+    /// Atomically allocate a fresh `(vni, cidr)` pair for a new
+    /// cluster: pick the next free VNI from the configured range and
+    /// carve the next free `/cluster_prefix` slice out of
+    /// `network.clusterSupernet`, plus the bridge_range (low end of
+    /// the CIDR for per-host bridge IPs) and vm_range (the rest, less
+    /// the broadcast). Returned struct is the cluster's network
+    /// identity; the caller writes the cluster row via
+    /// `insert_cluster`.
+    pub async fn allocate_cluster_network(
+        &self,
+        net: &NetworkConfig,
+    ) -> Result<ClusterNetwork, DbError> {
         let mut tx = self.writer.begin().await?;
 
-        let taken: Vec<(i64, String)> = sqlx::query_as("SELECT vni, cidr FROM trees")
+        let taken: Vec<(i64, String)> = sqlx::query_as("SELECT vni, cidr FROM clusters")
             .fetch_all(&mut *tx)
             .await?;
         let used_vnis: HashSet<u32> = taken.iter().map(|(v, _)| *v as u32).collect();
@@ -312,7 +314,7 @@ impl Db {
         for (_, c) in &taken {
             used_cidrs.push(
                 c.parse()
-                    .map_err(|e| DbError::Malformed(format!("trees.cidr '{c}': {e}")))?,
+                    .map_err(|e| DbError::Malformed(format!("clusters.cidr '{c}': {e}")))?,
             );
         }
 
@@ -326,106 +328,118 @@ impl Db {
             })?;
 
         let supernet: ipnet::Ipv4Net = net
-            .tree_supernet
+            .cluster_supernet
             .parse()
-            .map_err(|e| DbError::Malformed(format!("tree_supernet: {e}")))?;
+            .map_err(|e| DbError::Malformed(format!("cluster_supernet: {e}")))?;
         let candidate = supernet
-            .subnets(net.tree_prefix)
-            .map_err(|e| DbError::Malformed(format!("tree_prefix: {e}")))?
+            .subnets(net.cluster_prefix)
+            .map_err(|e| DbError::Malformed(format!("cluster_prefix: {e}")))?
             .find(|c| !used_cidrs.iter().any(|u| cidrs_overlap(u, c)))
             .ok_or_else(|| {
                 DbError::Exhausted(format!(
-                    "tree supernet {} fully carved into /{} slices",
-                    net.tree_supernet, net.tree_prefix
+                    "cluster supernet {} fully carved into /{} slices",
+                    net.cluster_supernet, net.cluster_prefix
                 ))
             })?;
 
-        let layout = TreeLayout::carve(&candidate, net.bridge_reserve, net.vip_reserve);
+        // Commit happens implicitly when the caller's `insert_cluster`
+        // runs against the writer pool — they'll either succeed and
+        // race-protect the (vni, cidr) pair via the UNIQUE constraint
+        // on `clusters.vni`, or fail and leave nothing behind.
+        tx.commit().await?;
 
-        let id = uuid::Uuid::new_v4().to_string();
-        let created_at = basis_common::time::now_rfc3339();
+        Ok(ClusterNetwork::carve(
+            vni,
+            candidate,
+            net.cluster_prefix,
+            net.bridge_reserve,
+        ))
+    }
+
+    /// Allocate the next free address from a named pool for a
+    /// cluster's apiserver VIP. Pool /32s are advertised by the host
+    /// running the VIP-claiming VM via the cell's BGP reflector.
+    pub async fn allocate_pool_vip(
+        &self,
+        pool: &Pool,
+        cluster_id: &str,
+    ) -> Result<String, DbError> {
+        let range = ParsedRange::parse_pool_range(pool)?;
+        self.allocate_from_range(&pool.name, &range, None, Some(cluster_id))
+            .await
+    }
+
+    /// Allocate the next free VM IP from the cluster's overlay CIDR.
+    /// VMs come out of `vm_range` (above the bridge reserve, below
+    /// the apiserver VIP if private). The apiserver VIP, when
+    /// private, is recorded in `ip_allocations` at cluster create
+    /// time so this allocator's "skip already-taken" path avoids it.
+    pub async fn allocate_cluster_vm_ip(
+        &self,
+        cluster: &ClusterRow,
+        vm_id: &str,
+    ) -> Result<String, DbError> {
+        let range = cluster.vm_range()?;
+        let scope = format!("cluster:{}", cluster.id);
+        self.allocate_from_range(&scope, &range, Some(vm_id), None)
+            .await
+    }
+
+    /// Reserve a specific IP under `scope`, attributed to either a VM
+    /// or a cluster. Used for the private apiserver VIP at cluster
+    /// create — the IP is deterministic (last usable in cluster CIDR),
+    /// so we can't go through the find-next-free allocator. Fails
+    /// with `Conflict` if the address is already taken.
+    pub async fn reserve_specific_ip(
+        &self,
+        scope: &str,
+        ip: &str,
+        vm_id: Option<&str>,
+        cluster_id: Option<&str>,
+    ) -> Result<(), DbError> {
+        debug_assert!(
+            vm_id.is_some() != cluster_id.is_some(),
+            "exactly one of vm_id / cluster_id must be set",
+        );
         sqlx::query(
-            "INSERT INTO trees (
-                id, vni, cidr,
-                bridge_range_start, bridge_range_end,
-                vm_range_start, vm_range_end,
-                vip_range_start, vip_range_end,
-                prefix_len,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO ip_allocations (ip_address, scope, vm_id, cluster_id) \
+             VALUES (?, ?, ?, ?)",
         )
-        .bind(&id)
-        .bind(vni as i64)
-        .bind(candidate.to_string())
-        .bind(layout.bridge_start.to_string())
-        .bind(layout.bridge_end.to_string())
-        .bind(layout.vm_start.to_string())
-        .bind(layout.vm_end.to_string())
-        .bind(layout.vip_start.to_string())
-        .bind(layout.vip_end.to_string())
-        .bind(net.tree_prefix as i64)
-        .bind(&created_at)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(TreeRow {
-            id,
-            vni: vni as i64,
-            cidr: candidate.to_string(),
-            bridge_range_start: layout.bridge_start.to_string(),
-            bridge_range_end: layout.bridge_end.to_string(),
-            vm_range_start: layout.vm_start.to_string(),
-            vm_range_end: layout.vm_end.to_string(),
-            vip_range_start: layout.vip_start.to_string(),
-            vip_range_end: layout.vip_end.to_string(),
-            prefix_len: net.tree_prefix as i64,
-            created_at,
-        })
-    }
-
-    pub async fn get_tree(&self, id: &str) -> Result<TreeRow, DbError> {
-        sqlx::query_as::<_, TreeRow>("SELECT * FROM trees WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.reader)
-            .await?
-            .ok_or_else(|| DbError::NotFound(format!("tree '{id}'")))
-    }
-
-    pub async fn delete_tree(&self, id: &str) -> Result<(), DbError> {
-        let mut tx = self.writer.begin().await?;
-        sqlx::query("DELETE FROM tree_host_bridges WHERE tree_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM trees WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        .bind(ip)
+        .bind(scope)
+        .bind(vm_id)
+        .bind(cluster_id)
+        .execute(&self.writer)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+                DbError::Conflict(format!("ip {ip} already allocated in scope '{scope}'"))
+            }
+            other => DbError::Sqlx(other),
+        })?;
         Ok(())
     }
 
-    // --- Per-host bridge IPs ---
+    // --- Per-(cluster, host) bridge IPs ---
 
-    /// Find-or-allocate the bridge IP this host uses for VMs in `tree`.
-    /// Idempotent: repeat calls for the same (tree, host) return the
-    /// same IP. On first call for the pair, picks the lowest free
-    /// address in the tree's `bridge_range` and inserts the mapping.
+    /// Find-or-allocate the bridge IP this host uses for VMs in
+    /// `cluster`. Idempotent: repeat calls for the same (cluster,
+    /// host) return the same IP. On first call for the pair, picks
+    /// the lowest free address in the cluster's `bridge_range` and
+    /// inserts the mapping.
     pub async fn ensure_host_bridge_ip(
         &self,
-        tree: &TreeRow,
+        cluster: &ClusterRow,
         host_id: &str,
     ) -> Result<String, DbError> {
-        let range = tree.bridge_range()?;
+        let range = cluster.bridge_range()?;
         let mut tx = self.writer.begin().await?;
 
         if let Some((ip,)) = sqlx::query_as::<_, (String,)>(
-            "SELECT ip_address FROM tree_host_bridges \
-             WHERE tree_id = ? AND host_id = ?",
+            "SELECT ip_address FROM cluster_host_bridges \
+             WHERE cluster_id = ? AND host_id = ?",
         )
-        .bind(&tree.id)
+        .bind(&cluster.id)
         .bind(host_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -448,20 +462,20 @@ impl Db {
                   WHERE printf('%d.%d.%d.%d',
                                (n >> 24) & 255, (n >> 16) & 255,
                                (n >>  8) & 255,  n        & 255)
-                        NOT IN (SELECT ip_address FROM tree_host_bridges
-                                WHERE tree_id = ?)
+                        NOT IN (SELECT ip_address FROM cluster_host_bridges
+                                WHERE cluster_id = ?)
                   ORDER BY n
                   LIMIT 1
               )
-            INSERT INTO tree_host_bridges (tree_id, host_id, ip_address)
+            INSERT INTO cluster_host_bridges (cluster_id, host_id, ip_address)
             SELECT ?, ?, ip FROM picked
             RETURNING ip_address
             "#,
         )
         .bind(range.start as i64)
         .bind(range.end as i64)
-        .bind(&tree.id)
-        .bind(&tree.id)
+        .bind(&cluster.id)
+        .bind(&cluster.id)
         .bind(host_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -470,143 +484,58 @@ impl Db {
 
         allocated.ok_or_else(|| {
             DbError::Exhausted(format!(
-                "tree {} bridge_range [{}..={}] fully allocated",
-                tree.id,
+                "cluster {} bridge_range [{}..={}] fully allocated",
+                cluster.id,
                 Ipv4Addr::from(range.start),
                 Ipv4Addr::from(range.end),
             ))
         })
     }
 
-    /// Bridge IP this host uses for the given tree, if any. Called by
-    /// `build_reconcile_command` — a host should always have a bridge
-    /// IP for every tree it carries a VM in, but the lookup is tolerant
-    /// of the brief window between a VM delete and the mapping release.
+    /// Bridge IP this host uses for the given cluster, if any. Called
+    /// by `build_reconcile_command` — a host should always have a
+    /// bridge IP for every cluster it carries a VM in, but the lookup
+    /// is tolerant of the brief window between a VM delete and the
+    /// mapping release.
     pub async fn get_host_bridge_ip(
         &self,
-        tree_id: &str,
+        cluster_id: &str,
         host_id: &str,
     ) -> Result<Option<String>, DbError> {
         Ok(sqlx::query_scalar::<_, String>(
-            "SELECT ip_address FROM tree_host_bridges \
-             WHERE tree_id = ? AND host_id = ?",
+            "SELECT ip_address FROM cluster_host_bridges \
+             WHERE cluster_id = ? AND host_id = ?",
         )
-        .bind(tree_id)
+        .bind(cluster_id)
         .bind(host_id)
         .fetch_optional(&self.reader)
         .await?)
     }
 
-    /// Release the bridge IP for (tree, host) iff no VMs remain on that
-    /// host in that tree. Caller invokes this after every VM delete;
-    /// on the last VM for a (host, tree) the bridge mapping drops and
-    /// the address is available for reuse elsewhere in the tree.
+    /// Release the bridge IP for (cluster, host) iff no VMs remain on
+    /// that host in that cluster. Caller invokes this after every VM
+    /// delete; on the last VM for a (host, cluster) the bridge mapping
+    /// drops and the address is available for reuse.
     pub async fn release_host_bridge_ip_if_idle(
         &self,
-        tree_id: &str,
+        cluster_id: &str,
         host_id: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "DELETE FROM tree_host_bridges \
-             WHERE tree_id = ? AND host_id = ? \
+            "DELETE FROM cluster_host_bridges \
+             WHERE cluster_id = ? AND host_id = ? \
                AND NOT EXISTS (
-                   SELECT 1 FROM vms v
-                   JOIN clusters c ON v.cluster_id = c.id
-                   WHERE v.host_id = ? AND c.tree_id = ?
+                   SELECT 1 FROM vms
+                   WHERE host_id = ? AND cluster_id = ?
                )",
         )
-        .bind(tree_id)
+        .bind(cluster_id)
         .bind(host_id)
         .bind(host_id)
-        .bind(tree_id)
+        .bind(cluster_id)
         .execute(&self.writer)
         .await?;
         Ok(())
-    }
-
-    // --- Host↔tree queries (derived from vms JOIN clusters) ---
-
-    /// VTEP addresses of every host currently carrying a VM in this
-    /// tree. Drives the agent-side FDB reconcile.
-    pub async fn list_tree_vteps(&self, tree_id: &str) -> Result<Vec<String>, DbError> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT h.vtep_address
-             FROM vms v
-             JOIN clusters c ON v.cluster_id = c.id
-             JOIN hosts h ON v.host_id = h.id
-             WHERE c.tree_id = ? AND h.vtep_address != ''",
-        )
-        .bind(tree_id)
-        .fetch_all(&self.reader)
-        .await?;
-        Ok(rows.into_iter().map(|(v,)| v).collect())
-    }
-
-    /// Every tree this host currently carries.
-    pub async fn list_host_trees(&self, host_id: &str) -> Result<Vec<TreeRow>, DbError> {
-        Ok(sqlx::query_as::<_, TreeRow>(
-            "SELECT DISTINCT t.* FROM trees t
-             JOIN clusters c ON c.tree_id = t.id
-             JOIN vms v ON v.cluster_id = c.id
-             WHERE v.host_id = ?",
-        )
-        .bind(host_id)
-        .fetch_all(&self.reader)
-        .await?)
-    }
-
-    /// Host IDs currently carrying VMs in this tree.
-    pub async fn list_hosts_in_tree(&self, tree_id: &str) -> Result<Vec<String>, DbError> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT v.host_id
-             FROM vms v
-             JOIN clusters c ON v.cluster_id = c.id
-             WHERE c.tree_id = ?",
-        )
-        .bind(tree_id)
-        .fetch_all(&self.reader)
-        .await?;
-        Ok(rows.into_iter().map(|(h,)| h).collect())
-    }
-
-    // --- IP allocation ---
-
-    /// Allocate the next free tree-side IP for a VM.
-    pub async fn allocate_tree_vm_ip(
-        &self,
-        tree: &TreeRow,
-        vm_id: &str,
-    ) -> Result<String, DbError> {
-        let range = tree.vm_range()?;
-        self.allocate_from_range(&tree.id, &range, Some(vm_id), None)
-            .await
-    }
-
-    /// Allocate the next free tree-side VIP for a cluster. Used for
-    /// nested clusters whose apiserver VIP stays inside the tree
-    /// overlay; external callers reach it through a parent-cell
-    /// auth proxy.
-    pub async fn allocate_tree_vip(
-        &self,
-        tree: &TreeRow,
-        cluster_id: &str,
-    ) -> Result<String, DbError> {
-        let range = tree.vip_range()?;
-        self.allocate_from_range(&tree.id, &range, None, Some(cluster_id))
-            .await
-    }
-
-    /// Allocate the next free address from a named pool for a
-    /// cluster's apiserver VIP. Pool /32s are advertised by the host
-    /// running the VIP-claiming VM via the cell's BGP reflector.
-    pub async fn allocate_pool_vip(
-        &self,
-        pool: &Pool,
-        cluster_id: &str,
-    ) -> Result<String, DbError> {
-        let range = ParsedRange::parse_pool_range(pool)?;
-        self.allocate_from_range(&pool.name, &range, None, Some(cluster_id))
-            .await
     }
 
     /// Allocate an aligned `count`-sized block to a cluster from the
@@ -768,17 +697,29 @@ impl Db {
 
     pub async fn insert_cluster(&self, cluster: &ClusterRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO clusters (id, name, tree_id, parent_cluster_id, control_plane_endpoint,
-                                   external_pool, service_block_cidr, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO clusters (
+                id, name, vni, cidr,
+                bridge_range_start, bridge_range_end,
+                vm_range_start, vm_range_end,
+                prefix_len, control_plane_endpoint,
+                apiserver_visibility, external_pool,
+                service_block_cidr, trust_domain, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&cluster.id)
         .bind(&cluster.name)
-        .bind(&cluster.tree_id)
-        .bind(&cluster.parent_cluster_id)
+        .bind(cluster.vni)
+        .bind(&cluster.cidr)
+        .bind(&cluster.bridge_range_start)
+        .bind(&cluster.bridge_range_end)
+        .bind(&cluster.vm_range_start)
+        .bind(&cluster.vm_range_end)
+        .bind(cluster.prefix_len)
         .bind(&cluster.control_plane_endpoint)
+        .bind(cluster.apiserver_visibility)
         .bind(&cluster.external_pool)
         .bind(&cluster.service_block_cidr)
+        .bind(&cluster.trust_domain)
         .bind(&cluster.created_at)
         .execute(&self.writer)
         .await
@@ -809,10 +750,16 @@ impl Db {
     }
 
     pub async fn delete_cluster(&self, id: &str) -> Result<(), DbError> {
+        let mut tx = self.writer.begin().await?;
+        sqlx::query("DELETE FROM cluster_host_bridges WHERE cluster_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM clusters WHERE id = ?")
             .bind(id)
-            .execute(&self.writer)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -822,35 +769,43 @@ impl Db {
             .await?)
     }
 
-    /// Direct children of a cluster. Used by `DeleteCluster` to refuse
-    /// the delete if the cluster has live descendants.
-    pub async fn list_child_clusters(&self, parent_id: &str) -> Result<Vec<ClusterRow>, DbError> {
-        Ok(
-            sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters WHERE parent_cluster_id = ?")
-                .bind(parent_id)
-                .fetch_all(&self.reader)
-                .await?,
+    /// VTEP addresses of every host currently carrying a VM in this
+    /// cluster. Drives the agent-side FDB reconcile.
+    pub async fn list_cluster_vteps(&self, cluster_id: &str) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT h.vtep_address
+             FROM vms v JOIN hosts h ON v.host_id = h.id
+             WHERE v.cluster_id = ? AND h.vtep_address != ''",
         )
+        .bind(cluster_id)
+        .fetch_all(&self.reader)
+        .await?;
+        Ok(rows.into_iter().map(|(v,)| v).collect())
     }
 
-    /// Number of clusters still attached to a tree.
-    pub async fn count_clusters_in_tree(&self, tree_id: &str) -> Result<i64, DbError> {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM clusters WHERE tree_id = ?")
-            .bind(tree_id)
-            .fetch_one(&self.reader)
-            .await?;
-        Ok(n)
+    /// Every cluster this host currently carries (≥1 VM scheduled
+    /// here). Drives the per-host `ReconcileHostCommand.clusters`
+    /// list.
+    pub async fn list_host_clusters(&self, host_id: &str) -> Result<Vec<ClusterRow>, DbError> {
+        Ok(sqlx::query_as::<_, ClusterRow>(
+            "SELECT DISTINCT c.* FROM clusters c
+             JOIN vms v ON v.cluster_id = c.id
+             WHERE v.host_id = ?",
+        )
+        .bind(host_id)
+        .fetch_all(&self.reader)
+        .await?)
     }
 
-    /// Every cluster in the given tree. Used by the reconcile-command
-    /// builder to enumerate per-tree VIPs that hosts should advertise.
-    pub async fn list_clusters_in_tree(&self, tree_id: &str) -> Result<Vec<ClusterRow>, DbError> {
-        Ok(
-            sqlx::query_as::<_, ClusterRow>("SELECT * FROM clusters WHERE tree_id = ?")
-                .bind(tree_id)
-                .fetch_all(&self.reader)
-                .await?,
+    /// Host IDs currently carrying VMs in this cluster.
+    pub async fn list_hosts_in_cluster(&self, cluster_id: &str) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT host_id FROM vms WHERE cluster_id = ?",
         )
+        .bind(cluster_id)
+        .fetch_all(&self.reader)
+        .await?;
+        Ok(rows.into_iter().map(|(h,)| h).collect())
     }
 
     // --- Hosts ---
@@ -1263,42 +1218,55 @@ fn cidrs_overlap(a: &ipnet::Ipv4Net, b: &ipnet::Ipv4Net) -> bool {
     a.contains(&b.network()) || b.contains(&a.network())
 }
 
-/// Layout of a single tree's CIDR. Bottom `bridge_reserve` addresses
-/// hold per-host gateway IPs; top `vip_reserve` addresses hold
-/// tree-internal cluster VIPs (for nested clusters whose apiserver
-/// stays inside the tree); everything between is the VM range.
-/// Config validation guarantees every region has positive width.
-struct TreeLayout {
-    bridge_start: Ipv4Addr,
-    bridge_end: Ipv4Addr,
-    vm_start: Ipv4Addr,
-    vm_end: Ipv4Addr,
-    vip_start: Ipv4Addr,
-    vip_end: Ipv4Addr,
+// --- Row types ---
+
+/// Network identity assigned to a fresh cluster. Returned by
+/// [`Db::allocate_cluster_network`]; the caller writes the cluster
+/// row via `insert_cluster`. Derivative addresses (apiserver VIP when
+/// `APISERVER_PRIVATE`) come from `private_apiserver_ip`.
+#[derive(Debug, Clone, Copy)]
+pub struct ClusterNetwork {
+    pub vni: u32,
+    pub cidr: ipnet::Ipv4Net,
+    pub prefix_len: u8,
+    /// Per-host bridge IP range — the bottom slice of `cidr`,
+    /// `bridge_reserve` addresses wide.
+    pub bridge_start: Ipv4Addr,
+    pub bridge_end: Ipv4Addr,
+    /// VM IP range — everything between `bridge_end` and the broadcast
+    /// (less the apiserver VIP slot when `APISERVER_PRIVATE`, but the
+    /// allocator skips taken IPs at allocate time so the range itself
+    /// doesn't shrink).
+    pub vm_start: Ipv4Addr,
+    pub vm_end: Ipv4Addr,
 }
 
-impl TreeLayout {
-    fn carve(cidr: &ipnet::Ipv4Net, bridge_reserve: u32, vip_reserve: u32) -> Self {
+impl ClusterNetwork {
+    fn carve(vni: u32, cidr: ipnet::Ipv4Net, prefix_len: u8, bridge_reserve: u32) -> Self {
         let net = u32::from(cidr.network());
         let bcast = u32::from(cidr.broadcast());
         let bridge_start = net + 1;
         let bridge_end = net + bridge_reserve;
         let vm_start = bridge_end + 1;
-        let vip_end = bcast - 1;
-        let vip_start = vip_end - (vip_reserve - 1);
-        let vm_end = vip_start - 1;
+        let vm_end = bcast - 1;
         Self {
+            vni,
+            cidr,
+            prefix_len,
             bridge_start: Ipv4Addr::from(bridge_start),
             bridge_end: Ipv4Addr::from(bridge_end),
             vm_start: Ipv4Addr::from(vm_start),
             vm_end: Ipv4Addr::from(vm_end),
-            vip_start: Ipv4Addr::from(vip_start),
-            vip_end: Ipv4Addr::from(vip_end),
         }
     }
-}
 
-// --- Row types ---
+    /// Last usable address — the cluster's apiserver VIP when
+    /// `APISERVER_PRIVATE`. Sits at the very top of the CIDR (the VM
+    /// range stops one short, so vm + apiserver never collide).
+    pub fn private_apiserver_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.cidr.broadcast()) - 1)
+    }
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct HostRow {
@@ -1413,36 +1381,76 @@ pub struct HostUsage {
 pub struct ClusterRow {
     pub id: String,
     pub name: String,
-    pub tree_id: String,
-    pub parent_cluster_id: Option<String>,
-    pub control_plane_endpoint: String,
-    /// Pool name the cluster's external IPs (apiserver VIP and
-    /// Service block) were carved from at CreateCluster. Empty means
-    /// nested — the cluster has no LAN exposure and both allocations
-    /// came from the tree's `vip_range`.
-    pub external_pool: String,
-    /// CIDR of this cluster's LoadBalancer Service block. Empty when
-    /// the cluster asked for 0 service IPs.
-    pub service_block_cidr: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct TreeRow {
-    pub id: String,
     pub vni: i64,
     pub cidr: String,
     pub bridge_range_start: String,
     pub bridge_range_end: String,
     pub vm_range_start: String,
     pub vm_range_end: String,
-    pub vip_range_start: String,
-    pub vip_range_end: String,
     pub prefix_len: i64,
+    pub control_plane_endpoint: String,
+    /// `0` = `APISERVER_PUBLIC` (apiserver VIP from `external_pool`,
+    /// BGP-advertised cell-wide), `1` = `APISERVER_PRIVATE`
+    /// (apiserver VIP = last usable in `cidr`, never advertised).
+    /// Stored as i64 to mirror the proto enum; helpers convert at
+    /// the boundary.
+    pub apiserver_visibility: i64,
+    /// Pool name the cluster's external IPs were carved from at
+    /// CreateCluster. Always set — every cluster needs a pool for at
+    /// least its LB Service block; the apiserver VIP additionally
+    /// comes from this pool when `apiserver_visibility = PUBLIC`.
+    pub external_pool: String,
+    /// CIDR of this cluster's LoadBalancer Service block. Empty when
+    /// the cluster asked for 0 service IPs.
+    pub service_block_cidr: String,
+    /// Trust-domain label. Empty = untagged (today's behavior, VIPs
+    /// propagate cell-wide). Phase 2 will translate this to a BGP
+    /// community for VIP isolation.
+    pub trust_domain: String,
     pub created_at: String,
 }
 
-impl TreeRow {
+/// Identity + intent the caller has already settled on by the time
+/// `ClusterRow::from_network` runs. Bundling these into a struct
+/// keeps the constructor below from sprouting an unwieldy positional
+/// argument list (the same data still flows through, just grouped by
+/// "what the caller knows" vs "what the allocator allocated").
+pub struct ClusterIdentity {
+    pub id: String,
+    pub name: String,
+    pub control_plane_endpoint: String,
+    pub apiserver_visibility: i64,
+    pub external_pool: String,
+    pub service_block_cidr: String,
+    pub trust_domain: String,
+    pub created_at: String,
+}
+
+impl ClusterRow {
+    /// Build a row from the allocator's output and the caller's
+    /// pre-decided identity, ready to write via `insert_cluster`.
+    /// Centralises the conversion so server.rs doesn't reach into
+    /// the allocator's fields directly.
+    pub fn from_network(identity: ClusterIdentity, network: ClusterNetwork) -> Self {
+        Self {
+            id: identity.id,
+            name: identity.name,
+            vni: network.vni as i64,
+            cidr: network.cidr.to_string(),
+            bridge_range_start: network.bridge_start.to_string(),
+            bridge_range_end: network.bridge_end.to_string(),
+            vm_range_start: network.vm_start.to_string(),
+            vm_range_end: network.vm_end.to_string(),
+            prefix_len: network.prefix_len as i64,
+            control_plane_endpoint: identity.control_plane_endpoint,
+            apiserver_visibility: identity.apiserver_visibility,
+            external_pool: identity.external_pool,
+            service_block_cidr: identity.service_block_cidr,
+            trust_domain: identity.trust_domain,
+            created_at: identity.created_at,
+        }
+    }
+
     pub fn bridge_range(&self) -> Result<ParsedRange, DbError> {
         ParsedRange::parse(
             &self.bridge_range_start,
@@ -1455,10 +1463,6 @@ impl TreeRow {
     pub fn vm_range(&self) -> Result<ParsedRange, DbError> {
         ParsedRange::parse(&self.vm_range_start, &self.vm_range_end, &self.id, "vm")
     }
-
-    pub fn vip_range(&self) -> Result<ParsedRange, DbError> {
-        ParsedRange::parse(&self.vip_range_start, &self.vip_range_end, &self.id, "vip")
-    }
 }
 
 /// Inclusive IPv4 range expressed as host-order `u32`s.
@@ -1469,12 +1473,16 @@ pub struct ParsedRange {
 }
 
 impl ParsedRange {
-    fn parse(start: &str, end: &str, tree_id: &str, kind: &str) -> Result<Self, DbError> {
+    fn parse(start: &str, end: &str, cluster_id: &str, kind: &str) -> Result<Self, DbError> {
         let s: Ipv4Addr = start.parse().map_err(|e| {
-            DbError::Malformed(format!("tree {tree_id} {kind}_range_start '{start}': {e}"))
+            DbError::Malformed(format!(
+                "cluster {cluster_id} {kind}_range_start '{start}': {e}"
+            ))
         })?;
         let e: Ipv4Addr = end.parse().map_err(|e| {
-            DbError::Malformed(format!("tree {tree_id} {kind}_range_end '{end}': {e}"))
+            DbError::Malformed(format!(
+                "cluster {cluster_id} {kind}_range_end '{end}': {e}"
+            ))
         })?;
         Ok(Self {
             start: u32::from(s),
@@ -1510,10 +1518,9 @@ mod tests {
 
     fn make_net_config() -> NetworkConfig {
         NetworkConfig {
-            tree_supernet: "10.0.0.0/8".to_string(),
-            tree_prefix: 20,
+            cluster_supernet: "10.0.0.0/8".to_string(),
+            cluster_prefix: 24,
             bridge_reserve: 32,
-            vip_reserve: 32,
             default_external_service_ips: 16,
             vni_range: VniRange {
                 start: 10_000,
@@ -1545,17 +1552,23 @@ mod tests {
         }
     }
 
-    fn make_cluster(id: &str, name: &str, tree_id: &str, endpoint: &str) -> ClusterRow {
-        ClusterRow {
-            id: id.to_string(),
-            name: name.to_string(),
-            tree_id: tree_id.to_string(),
-            parent_cluster_id: None,
-            control_plane_endpoint: endpoint.to_string(),
-            external_pool: String::new(),
-            service_block_cidr: String::new(),
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        }
+    /// Build a `ClusterRow` from an allocated `ClusterNetwork`.
+    /// Default `apiserver_visibility = PUBLIC`; tests override when
+    /// they want to exercise the private path.
+    fn make_cluster(id: &str, name: &str, network: ClusterNetwork, endpoint: &str) -> ClusterRow {
+        ClusterRow::from_network(
+            ClusterIdentity {
+                id: id.to_string(),
+                name: name.to_string(),
+                control_plane_endpoint: endpoint.to_string(),
+                apiserver_visibility: 0,
+                external_pool: "cell-internal".to_string(),
+                service_block_cidr: String::new(),
+                trust_domain: String::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+            },
+            network,
+        )
     }
 
     fn make_vm(id: &str, host_id: &str, cluster_id: &str, ip: &str) -> VmRow {
@@ -1579,127 +1592,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocate_tree_picks_sequential_vni_and_cidr() {
+    async fn allocate_cluster_network_picks_sequential_vni_and_cidr() {
         let db = test_db().await;
         let net = make_net_config();
 
-        let t1 = db.allocate_tree(&net).await.unwrap();
-        let t2 = db.allocate_tree(&net).await.unwrap();
-        assert_eq!(t1.vni, 10_000);
-        assert_eq!(t2.vni, 10_001);
-        assert_ne!(t1.cidr, t2.cidr);
-        assert_eq!(t1.prefix_len, 20);
+        // Need actual cluster rows for the next allocation to see VNIs
+        // as taken — `allocate_cluster_network` reads from the
+        // `clusters` table, not a separate trees table.
+        let n1 = db.allocate_cluster_network(&net).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "c1", n1, "unused"))
+            .await
+            .unwrap();
+        let n2 = db.allocate_cluster_network(&net).await.unwrap();
+        db.insert_cluster(&make_cluster("c2", "c2", n2, "unused"))
+            .await
+            .unwrap();
+
+        assert_eq!(n1.vni, 10_000);
+        assert_eq!(n2.vni, 10_001);
+        assert_ne!(n1.cidr, n2.cidr);
+        assert_eq!(n1.prefix_len, 24);
     }
 
     #[tokio::test]
-    async fn tree_layout_is_sane() {
+    async fn cluster_network_carve_layout_is_sane() {
         let db = test_db().await;
         let net = make_net_config();
-        let t = db.allocate_tree(&net).await.unwrap();
-        let cidr: ipnet::Ipv4Net = t.cidr.parse().unwrap();
-        let bridge_start: Ipv4Addr = t.bridge_range_start.parse().unwrap();
-        let bridge_end: Ipv4Addr = t.bridge_range_end.parse().unwrap();
-        let vm_start: Ipv4Addr = t.vm_range_start.parse().unwrap();
-        let vm_end: Ipv4Addr = t.vm_range_end.parse().unwrap();
-        let vip_start: Ipv4Addr = t.vip_range_start.parse().unwrap();
-        let vip_end: Ipv4Addr = t.vip_range_end.parse().unwrap();
+        let n = db.allocate_cluster_network(&net).await.unwrap();
 
-        assert_eq!(u32::from(bridge_start), u32::from(cidr.network()) + 1);
+        // bridge_range = bottom `bridge_reserve` after the network
+        // address; vm_range = the rest minus the broadcast; private
+        // apiserver = last usable.
         assert_eq!(
-            u32::from(bridge_end) - u32::from(bridge_start),
+            u32::from(n.bridge_start),
+            u32::from(n.cidr.network()) + 1
+        );
+        assert_eq!(
+            u32::from(n.bridge_end) - u32::from(n.bridge_start),
             (net.bridge_reserve - 1) as u32
         );
-        assert_eq!(u32::from(vm_start), u32::from(bridge_end) + 1);
-        assert_eq!(u32::from(vm_end), u32::from(vip_start) - 1);
-        assert_eq!(u32::from(vip_end), u32::from(cidr.broadcast()) - 1);
+        assert_eq!(u32::from(n.vm_start), u32::from(n.bridge_end) + 1);
+        assert_eq!(u32::from(n.vm_end), u32::from(n.cidr.broadcast()) - 1);
         assert_eq!(
-            u32::from(vip_end) - u32::from(vip_start),
-            (net.vip_reserve - 1) as u32
+            n.private_apiserver_ip(),
+            Ipv4Addr::from(u32::from(n.cidr.broadcast()) - 1)
         );
     }
 
     #[tokio::test]
-    async fn deleting_tree_frees_its_vni() {
+    async fn deleting_cluster_frees_its_vni() {
         let db = test_db().await;
         let mut net = make_net_config();
         net.vni_range.end = 10_000; // single VNI
 
-        let t = db.allocate_tree(&net).await.unwrap();
-        assert!(db.allocate_tree(&net).await.is_err());
-        db.delete_tree(&t.id).await.unwrap();
-        let t2 = db.allocate_tree(&net).await.unwrap();
-        assert_eq!(t2.vni, 10_000);
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "c1", n, "unused"))
+            .await
+            .unwrap();
+
+        // Pool exhausted — VNI 10_000 already taken.
+        let next = db.allocate_cluster_network(&net).await;
+        assert!(matches!(next, Err(DbError::Exhausted(_))));
+
+        db.delete_cluster("c1").await.unwrap();
+        let n2 = db.allocate_cluster_network(&net).await.unwrap();
+        assert_eq!(n2.vni, 10_000);
     }
 
     #[tokio::test]
-    async fn allocate_tree_vm_ip_starts_at_vm_range_start() {
+    async fn allocate_cluster_vm_ip_starts_above_bridge_reserve() {
         let db = test_db().await;
         let net = make_net_config();
-        let t = db.allocate_tree(&net).await.unwrap();
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        let cluster = make_cluster("c1", "c1", n, "unused");
+        db.insert_cluster(&cluster).await.unwrap();
 
-        let ip = db.allocate_tree_vm_ip(&t, "vm1").await.unwrap();
-        assert_eq!(ip, t.vm_range_start);
+        // First VM IP = bridge_end + 1.
+        let ip = db.allocate_cluster_vm_ip(&cluster, "vm1").await.unwrap();
+        assert_eq!(ip, n.vm_start.to_string());
     }
 
     #[tokio::test]
-    async fn cluster_vip_pool_vs_tree_scopes() {
+    async fn host_bridge_ip_is_unique_and_idempotent() {
         let db = test_db().await;
         let net = make_net_config();
-        let t = db.allocate_tree(&net).await.unwrap();
-        let cidr: ipnet::Ipv4Net = t.cidr.parse().unwrap();
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        let cluster = make_cluster("c1", "c1", n, "unused");
+        db.insert_cluster(&cluster).await.unwrap();
 
-        db.insert_cluster(&make_cluster("pool-cluster", "pool", &t.id, "unused"))
-            .await
-            .unwrap();
-        db.insert_cluster(&make_cluster("tree-cluster", "tree", &t.id, "unused"))
-            .await
-            .unwrap();
+        let ip_h1 = db.ensure_host_bridge_ip(&cluster, "h1").await.unwrap();
+        let ip_h2 = db.ensure_host_bridge_ip(&cluster, "h2").await.unwrap();
+        assert_ne!(ip_h1, ip_h2);
+        assert_eq!(ip_h1, n.bridge_start.to_string());
 
-        // Pool-scoped VIP — host BGP advertises this /32 with self
-        // as next-hop, reachable from outside the tree.
-        let pool_vip = db
-            .allocate_pool_vip(pool(&net, "cell-internal"), "pool-cluster")
-            .await
-            .unwrap();
-        assert!(pool_vip.starts_with("192.168.100."));
-        assert!(
-            !cidr.contains(&pool_vip.parse::<Ipv4Addr>().unwrap()),
-            "pool VIP must land in the named pool, not the tree CIDR"
-        );
+        // Idempotent for the same host.
+        let ip_h1_again = db.ensure_host_bridge_ip(&cluster, "h1").await.unwrap();
+        assert_eq!(ip_h1, ip_h1_again);
 
-        // Tree-scoped VIP — VIP stays inside the overlay; only
-        // workers in the same tree can reach it.
-        let tree_vip = db.allocate_tree_vip(&t, "tree-cluster").await.unwrap();
-        assert!(
-            cidr.contains(&tree_vip.parse::<Ipv4Addr>().unwrap()),
-            "tree VIP must land inside the tree CIDR"
-        );
-        let vip_start: Ipv4Addr = t.vip_range_start.parse().unwrap();
         assert_eq!(
-            tree_vip,
-            vip_start.to_string(),
-            "first tree VIP should be the low end of vip_range"
+            db.get_host_bridge_ip("c1", "h1").await.unwrap(),
+            Some(ip_h1.clone()),
         );
+        assert_eq!(db.get_host_bridge_ip("c1", "missing").await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn vm_tree_ip_release_frees_for_reuse() {
+    async fn host_bridge_ip_release_only_when_idle() {
+        let db = test_db().await;
+        let mut host = make_host("h1", "node-1");
+        host.vtep_address = "10.100.0.1".to_string();
+        db.upsert_host(&host).await.unwrap();
+
+        let net = make_net_config();
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        let cluster = make_cluster("c1", "c1", n, "unused");
+        db.insert_cluster(&cluster).await.unwrap();
+
+        let ip = db.ensure_host_bridge_ip(&cluster, "h1").await.unwrap();
+        let vm_ip = db.allocate_cluster_vm_ip(&cluster, "v1").await.unwrap();
+        db.insert_vm(&make_vm("v1", "h1", "c1", &vm_ip), &[])
+            .await
+            .unwrap();
+
+        // Still has a VM → release is a no-op.
+        db.release_host_bridge_ip_if_idle("c1", "h1").await.unwrap();
+        assert_eq!(
+            db.get_host_bridge_ip("c1", "h1").await.unwrap(),
+            Some(ip.clone())
+        );
+
+        // Last VM gone → release drops the mapping, freeing the IP.
+        db.delete_vm("v1").await.unwrap();
+        db.release_host_bridge_ip_if_idle("c1", "h1").await.unwrap();
+        assert_eq!(db.get_host_bridge_ip("c1", "h1").await.unwrap(), None);
+
+        // A later host can reuse the address.
+        let mut h2 = make_host("h2", "node-2");
+        h2.vtep_address = "10.100.0.2".to_string();
+        db.upsert_host(&h2).await.unwrap();
+        let ip2 = db.ensure_host_bridge_ip(&cluster, "h2").await.unwrap();
+        assert_eq!(ip2, ip, "released IP must be reusable");
+    }
+
+    #[tokio::test]
+    async fn delete_cluster_cascades_bridge_mappings() {
         let db = test_db().await;
         let net = make_net_config();
-        let t = db.allocate_tree(&net).await.unwrap();
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        let cluster = make_cluster("c1", "c1", n, "unused");
+        db.insert_cluster(&cluster).await.unwrap();
+        db.ensure_host_bridge_ip(&cluster, "h1").await.unwrap();
+        db.delete_cluster("c1").await.unwrap();
+        assert_eq!(db.get_host_bridge_ip("c1", "h1").await.unwrap(), None);
+    }
 
-        let ip1 = db.allocate_tree_vm_ip(&t, "vm1").await.unwrap();
+    #[tokio::test]
+    async fn vm_ip_release_frees_for_reuse() {
+        let db = test_db().await;
+        let net = make_net_config();
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        let cluster = make_cluster("c1", "c1", n, "unused");
+        db.insert_cluster(&cluster).await.unwrap();
+
+        let ip1 = db.allocate_cluster_vm_ip(&cluster, "vm1").await.unwrap();
         db.release_vm_ips("vm1").await.unwrap();
-        let ip2 = db.allocate_tree_vm_ip(&t, "vm2").await.unwrap();
-        assert_eq!(ip1, ip2, "released tree IP must be reusable");
+        let ip2 = db.allocate_cluster_vm_ip(&cluster, "vm2").await.unwrap();
+        assert_eq!(ip1, ip2, "released VM IP must be reusable");
     }
 
     #[tokio::test]
-    async fn cluster_vip_released_by_explicit_call() {
+    async fn pool_vip_released_by_explicit_call() {
         let db = test_db().await;
         let net = make_net_config();
-        let t = db.allocate_tree(&net).await.unwrap();
-        db.insert_cluster(&make_cluster("c1", "c1", &t.id, "unused"))
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        db.insert_cluster(&make_cluster("c1", "c1", n, "unused"))
             .await
             .unwrap();
 
@@ -1712,7 +1778,8 @@ mod tests {
         db.release_cluster_ips("c1").await.unwrap();
         db.delete_cluster("c1").await.unwrap();
 
-        db.insert_cluster(&make_cluster("c2", "c2", &t.id, "unused"))
+        let n2 = db.allocate_cluster_network(&net).await.unwrap();
+        db.insert_cluster(&make_cluster("c2", "c2", n2, "unused"))
             .await
             .unwrap();
         let vip2 = db
@@ -1726,86 +1793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_bridge_ip_is_unique_and_idempotent() {
-        let db = test_db().await;
-        let net = make_net_config();
-        let tree = db.allocate_tree(&net).await.unwrap();
-
-        let ip_h1 = db.ensure_host_bridge_ip(&tree, "h1").await.unwrap();
-        let ip_h2 = db.ensure_host_bridge_ip(&tree, "h2").await.unwrap();
-        assert_ne!(ip_h1, ip_h2);
-        assert_eq!(ip_h1, tree.bridge_range_start);
-
-        // Idempotent for the same host.
-        let ip_h1_again = db.ensure_host_bridge_ip(&tree, "h1").await.unwrap();
-        assert_eq!(ip_h1, ip_h1_again);
-
-        // Read-only lookup agrees.
-        assert_eq!(
-            db.get_host_bridge_ip(&tree.id, "h1").await.unwrap(),
-            Some(ip_h1.clone()),
-        );
-        assert_eq!(
-            db.get_host_bridge_ip(&tree.id, "missing").await.unwrap(),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn host_bridge_ip_release_only_when_idle() {
-        let db = test_db().await;
-        let mut host = make_host("h1", "node-1");
-        host.vtep_address = "10.100.0.1".to_string();
-        db.upsert_host(&host).await.unwrap();
-
-        let net = make_net_config();
-        let tree = db.allocate_tree(&net).await.unwrap();
-        db.insert_cluster(&make_cluster("c1", "c1", &tree.id, "unused-endpoint"))
-            .await
-            .unwrap();
-
-        let ip = db.ensure_host_bridge_ip(&tree, "h1").await.unwrap();
-
-        db.insert_vm(&make_vm("v1", "h1", "c1", &tree.vm_range_start), &[])
-            .await
-            .unwrap();
-
-        // Still has a VM → release is a no-op.
-        db.release_host_bridge_ip_if_idle(&tree.id, "h1")
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_host_bridge_ip(&tree.id, "h1").await.unwrap(),
-            Some(ip.clone())
-        );
-
-        // Last VM gone → release drops the mapping, freeing the IP.
-        db.delete_vm("v1").await.unwrap();
-        db.release_host_bridge_ip_if_idle(&tree.id, "h1")
-            .await
-            .unwrap();
-        assert_eq!(db.get_host_bridge_ip(&tree.id, "h1").await.unwrap(), None);
-
-        // A later host can reuse the address.
-        let mut h2 = make_host("h2", "node-2");
-        h2.vtep_address = "10.100.0.2".to_string();
-        db.upsert_host(&h2).await.unwrap();
-        let ip2 = db.ensure_host_bridge_ip(&tree, "h2").await.unwrap();
-        assert_eq!(ip2, ip, "released IP must be reusable");
-    }
-
-    #[tokio::test]
-    async fn delete_tree_cascades_bridge_mappings() {
-        let db = test_db().await;
-        let net = make_net_config();
-        let tree = db.allocate_tree(&net).await.unwrap();
-        db.ensure_host_bridge_ip(&tree, "h1").await.unwrap();
-        db.delete_tree(&tree.id).await.unwrap();
-        assert_eq!(db.get_host_bridge_ip(&tree.id, "h1").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn list_tree_vteps_derives_from_vm_placements() {
+    async fn list_cluster_vteps_derives_from_vm_placements() {
         let db = test_db().await;
         let mut h1 = make_host("h1", "node-1");
         h1.vtep_address = "10.100.0.1".to_string();
@@ -1815,54 +1803,51 @@ mod tests {
         db.upsert_host(&h2).await.unwrap();
 
         let net = make_net_config();
-        let t = db.allocate_tree(&net).await.unwrap();
-        db.insert_cluster(&make_cluster("c1", "c1", &t.id, "unused-endpoint"))
-            .await
-            .unwrap();
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        let cluster = make_cluster("c1", "c1", n, "unused-endpoint");
+        db.insert_cluster(&cluster).await.unwrap();
 
-        // No VMs yet → no VTEPs.
-        assert!(db.list_tree_vteps(&t.id).await.unwrap().is_empty());
+        assert!(db.list_cluster_vteps("c1").await.unwrap().is_empty());
 
-        // One VM on h1 → one VTEP.
-        db.insert_vm(&make_vm("v1", "h1", "c1", &t.vm_range_start), &[])
+        let vm_ip_1 = db.allocate_cluster_vm_ip(&cluster, "v1").await.unwrap();
+        db.insert_vm(&make_vm("v1", "h1", "c1", &vm_ip_1), &[])
             .await
             .unwrap();
         assert_eq!(
-            db.list_tree_vteps(&t.id).await.unwrap(),
+            db.list_cluster_vteps("c1").await.unwrap(),
             vec!["10.100.0.1".to_string()]
         );
 
-        // Add a VM on h2 → both VTEPs.
-        db.insert_vm(&make_vm("v2", "h2", "c1", "10.0.0.3"), &[])
+        let vm_ip_2 = db.allocate_cluster_vm_ip(&cluster, "v2").await.unwrap();
+        db.insert_vm(&make_vm("v2", "h2", "c1", &vm_ip_2), &[])
             .await
             .unwrap();
-        let mut vteps = db.list_tree_vteps(&t.id).await.unwrap();
+        let mut vteps = db.list_cluster_vteps("c1").await.unwrap();
         vteps.sort();
         assert_eq!(
             vteps,
             vec!["10.100.0.1".to_string(), "10.100.0.2".to_string()]
         );
 
-        // Last VM on h1 gone → only h2's VTEP.
         db.delete_vm("v1").await.unwrap();
         assert_eq!(
-            db.list_tree_vteps(&t.id).await.unwrap(),
+            db.list_cluster_vteps("c1").await.unwrap(),
             vec!["10.100.0.2".to_string()]
         );
     }
 
-    /// Seed a `(host, tree, cluster)` trio the VM-race tests can
-    /// aim placements at. Extracted here so the three optimistic-
-    /// concurrency tests below don't repeat the same 10 lines.
-    async fn seed_single_host_cluster(db: &Db) -> (HostRow, ClusterRow, TreeRow) {
+    /// Seed a `(host, cluster)` pair the VM-race tests can aim
+    /// placements at. Extracted so the three optimistic-concurrency
+    /// tests below don't repeat the same 10 lines.
+    async fn seed_single_host_cluster(db: &Db) -> (HostRow, ClusterRow) {
         let mut host = make_host("h1", "node-1");
         host.vtep_address = "10.100.0.1".to_string();
         db.upsert_host(&host).await.unwrap();
         let net = make_net_config();
-        let tree = db.allocate_tree(&net).await.unwrap();
-        let cluster = make_cluster("c1", "c1", &tree.id, "unused-endpoint");
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        let cluster = make_cluster("c1", "c1", n, "unused-endpoint");
         db.insert_cluster(&cluster).await.unwrap();
-        (host, cluster, tree)
+        (host, cluster)
     }
 
     /// The atomic capacity gate in `insert_vm` refuses the second
@@ -1873,7 +1858,7 @@ mod tests {
     #[tokio::test]
     async fn insert_vm_rejects_cpu_capacity_race() {
         let db = test_db().await;
-        let (_, _, _) = seed_single_host_cluster(&db).await;
+        let (_, _) = seed_single_host_cluster(&db).await;
 
         let mut v1 = make_vm("v1", "h1", "c1", "10.0.0.9");
         v1.cpu = 10;

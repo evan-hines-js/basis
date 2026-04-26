@@ -31,20 +31,15 @@ async fn install_crypto_provider_once() {
     .await;
 }
 
-/// Small test-scale network: /24 per tree gives 256 addresses —
+/// Small test-scale network: /24 per cluster gives 256 addresses —
 /// bridge_reserve(8) + 2 sentinels = 10 reserved, leaving 246 VM IPs
 /// starting at 10.0.0.9. The single named pool stands in for the
-/// LAN-routable cluster VIP / edge NIC source; tree-internal VIPs
-/// come from the tree's own vip_range.
+/// LAN-routable cluster VIP / LB block source.
 fn test_network_config() -> basis_controller::config::NetworkConfig {
     basis_controller::config::NetworkConfig {
-        tree_supernet: "10.0.0.0/8".to_string(),
-        tree_prefix: 24,
+        cluster_supernet: "10.0.0.0/8".to_string(),
+        cluster_prefix: 24,
         bridge_reserve: 8,
-        // vip_reserve=16 + default_external_service_ips=4 keeps the
-        // tree-side allocations tight so per-tree assertions land on
-        // predictable addresses without over-reserving.
-        vip_reserve: 16,
         default_external_service_ips: 4,
         vni_range: basis_controller::config::VniRange {
             start: 10_000,
@@ -160,14 +155,17 @@ impl Drop for RunningController {
 }
 
 /// Create a cluster via the CAPI API and return its id + the VIP.
+/// Defaults to `APISERVER_PUBLIC` against the test pool so the VIP is
+/// LAN-routable and assertions can pin it to a known pool address.
 async fn create_cluster(running: &RunningController, name: &str) -> (String, String) {
     let mut capi = running.capi_client().await;
     let resp = capi
         .create_cluster(CreateClusterRequest {
             name: name.to_string(),
-            parent_cluster_id: String::new(),
-            external_ip_pool: String::new(),
+            external_ip_pool: "cell-internal".to_string(),
             external_service_ips: 0,
+            apiserver_visibility: ApiserverVisibility::ApiserverPublic as i32,
+            trust_domain: String::new(),
         })
         .await
         .unwrap()
@@ -348,16 +346,16 @@ async fn report_vm_state(
 }
 
 #[tokio::test]
-async fn test_create_cluster_reserves_vip() {
+async fn test_create_cluster_public_apiserver_lands_in_pool() {
     let (running, _db) = RunningController::start().await;
     let (cluster_id, vip) = create_cluster(&running, "my-cluster").await;
 
     assert!(!cluster_id.is_empty());
-    // The `create_cluster` helper leaves `external_ip_pool` empty,
-    // so the VIP comes from the tree's top-of-CIDR vip_range — the
-    // nested-cluster path. For the /24 tree with vip_reserve=16, the
-    // first VIP is broadcast(10.0.0.255) - 1 - (16-1) = 10.0.0.239.
-    assert_eq!(vip, "10.0.0.239");
+    // `create_cluster` defaults to APISERVER_PUBLIC against the
+    // test pool. Pool is 192.168.100.0/27 → allocatable [.1, .30].
+    // First apiserver VIP gets .1, and with default_external_service_ips=4
+    // (a /30) the Service block lands at the next aligned /30 (.4/30).
+    assert_eq!(vip, "192.168.100.1");
 
     let mut capi = running.capi_client().await;
     let got = capi
@@ -370,68 +368,43 @@ async fn test_create_cluster_reserves_vip() {
     assert_eq!(got.cluster_id, cluster_id);
     assert_eq!(got.control_plane_endpoint, vip);
     assert_eq!(got.name, "my-cluster");
-    assert!(got.parent_cluster_id.is_empty(), "tree root has no parent");
-    assert_ne!(got.tree_id, "");
+    assert_eq!(got.cidr, "10.0.0.0/24", "first cluster carves the low /24");
     assert_eq!(
         got.vni, 10_000,
-        "first tree gets the low end of the VNI range"
+        "first cluster gets the low end of the VNI range"
+    );
+    assert_eq!(
+        got.service_block_cidr, "192.168.100.4/30",
+        "service block is the next aligned /30 above the apiserver VIP"
     );
 }
 
 #[tokio::test]
-async fn test_external_ip_pool_routes_to_named_pool() {
-    // Root/management clusters name a LAN pool so the cluster's
-    // external IPs are routable. The pool is 192.168.100.0/27, so
-    // the allocatable range is [.1, .30] — apiserver VIP gets .1, and
-    // with `default_external_service_ips=4` (a /30) the Service block
-    // lands at the next aligned /30 (.4/30).
+async fn test_create_cluster_private_apiserver_lands_at_top_of_cidr() {
+    // APISERVER_PRIVATE puts the apiserver VIP at the last usable
+    // address of the cluster CIDR, never advertised cell-wide. The
+    // LB block still comes from the named pool.
     let (running, _db) = RunningController::start().await;
     let mut capi = running.capi_client().await;
     let resp = capi
         .create_cluster(CreateClusterRequest {
-            name: "lan-root".to_string(),
-            parent_cluster_id: String::new(),
+            name: "private-cp".to_string(),
             external_ip_pool: "cell-internal".to_string(),
             external_service_ips: 0,
+            apiserver_visibility: ApiserverVisibility::ApiserverPrivate as i32,
+            trust_domain: String::new(),
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.control_plane_endpoint, "192.168.100.1");
+    assert_eq!(resp.cidr, "10.0.0.0/24");
+    // Last usable in 10.0.0.0/24 is .254 (broadcast - 1).
+    assert_eq!(resp.control_plane_endpoint, "10.0.0.254");
+    // LB block lands at the first aligned /30 above .1 (network).
+    // Pool is .0/27, allocatable [.1, .30]; aligning .1 up to a /30
+    // boundary gives .4 — same as the public test even though no
+    // apiserver VIP took a pool slot.
     assert_eq!(resp.service_block_cidr, "192.168.100.4/30");
-}
-
-#[tokio::test]
-async fn test_child_cluster_inherits_parent_tree() {
-    let (running, _db) = RunningController::start().await;
-    let mut capi = running.capi_client().await;
-    let root = capi
-        .create_cluster(CreateClusterRequest {
-            name: "root".to_string(),
-            parent_cluster_id: String::new(),
-            external_ip_pool: String::new(),
-            external_service_ips: 0,
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    let child = capi
-        .create_cluster(CreateClusterRequest {
-            name: "child".to_string(),
-            parent_cluster_id: root.cluster_id.clone(),
-            external_ip_pool: String::new(),
-            external_service_ips: 0,
-        })
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert_eq!(child.tree_id, root.tree_id, "child shares parent's tree");
-    assert_eq!(child.vni, root.vni, "child shares parent's VNI");
-    assert_ne!(
-        child.control_plane_endpoint, root.control_plane_endpoint,
-        "each cluster gets its own VIP"
-    );
 }
 
 #[tokio::test]
@@ -443,9 +416,10 @@ async fn test_create_cluster_is_idempotent_by_name() {
     let resp = capi
         .create_cluster(CreateClusterRequest {
             name: "dup".to_string(),
-            parent_cluster_id: String::new(),
-            external_ip_pool: String::new(),
+            external_ip_pool: "cell-internal".to_string(),
             external_service_ips: 0,
+            apiserver_visibility: ApiserverVisibility::ApiserverPublic as i32,
+            trust_domain: String::new(),
         })
         .await
         .unwrap()
@@ -551,9 +525,10 @@ async fn test_delete_cluster_cascades_machine_deletes() {
     let resp = capi
         .create_cluster(CreateClusterRequest {
             name: "after-delete".to_string(),
-            parent_cluster_id: String::new(),
-            external_ip_pool: String::new(),
+            external_ip_pool: "cell-internal".to_string(),
             external_service_ips: 0,
+            apiserver_visibility: ApiserverVisibility::ApiserverPublic as i32,
+            trust_domain: String::new(),
         })
         .await
         .unwrap()
@@ -743,20 +718,20 @@ async fn test_controller_pushes_periodic_reconcile() {
     match cmd.command {
         Some(controller_command::Command::ReconcileHost(r)) => {
             assert!(r.expected_vm_ids.is_empty());
-            assert!(r.trees.is_empty(), "no VMs → no tree membership");
+            assert!(r.clusters.is_empty(), "no VMs → no cluster membership");
         }
         other => panic!("expected ReconcileHost, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn test_reconnect_reports_expected_vm_ids_and_trees() {
+async fn test_reconnect_reports_expected_vm_ids_and_clusters() {
     let (running, _db) = RunningController::start().await;
     let (cluster_id, _vip) = create_cluster(&running, "reconnect-cluster").await;
     let (agent_tx, mut inbound, host_id, initial1) =
         register_agent(&running, "reconnect-host").await;
     assert!(initial1.expected_vm_ids.is_empty());
-    assert!(initial1.trees.is_empty());
+    assert!(initial1.clusters.is_empty());
 
     let mut capi = running.capi_client().await;
     let resp = drive_create_to_running(
@@ -773,12 +748,19 @@ async fn test_reconnect_reports_expected_vm_ids_and_trees() {
     let (_tx2, _inbound2, host_id2, initial2) = register_agent(&running, "reconnect-host").await;
     assert_eq!(host_id2, host_id);
     assert_eq!(initial2.expected_vm_ids, vec![resp.id]);
-    assert_eq!(initial2.trees.len(), 1, "host has one tree's worth of VMs");
-    let tree_state = &initial2.trees[0];
-    assert_eq!(tree_state.vni, 10_000);
+    assert_eq!(
+        initial2.clusters.len(),
+        1,
+        "host has one cluster's worth of VMs"
+    );
+    let cluster_state = &initial2.clusters[0];
+    assert_eq!(cluster_state.vni, 10_000);
     // VTEP peer list contains this host's own address. (The agent
     // filters itself out client-side before building FDB entries.)
-    assert_eq!(tree_state.vtep_addresses, vec!["10.100.0.1".to_string()]);
+    assert_eq!(
+        cluster_state.vtep_addresses,
+        vec!["10.100.0.1".to_string()]
+    );
 }
 
 /// End-to-end verification of the optimistic-concurrency contract:

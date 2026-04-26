@@ -511,7 +511,7 @@ async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRespon
 mod tests {
     use super::*;
     use crate::config::{NetworkConfig, Pool, VniRange};
-    use crate::db::{ClusterRow, HostRow, VmRow};
+    use crate::db::{ClusterIdentity, ClusterRow, HostRow, VmRow};
 
     fn make_host(id: &str, hostname: &str, total_cpu: i64, healthy: bool) -> HostRow {
         HostRow {
@@ -549,10 +549,9 @@ mod tests {
 
     fn net_config() -> NetworkConfig {
         NetworkConfig {
-            tree_supernet: "10.0.0.0/8".to_string(),
-            tree_prefix: 20,
+            cluster_supernet: "10.0.0.0/8".to_string(),
+            cluster_prefix: 24,
             bridge_reserve: 32,
-            vip_reserve: 32,
             default_external_service_ips: 16,
             vni_range: VniRange {
                 start: 10_000,
@@ -565,22 +564,24 @@ mod tests {
         }
     }
 
-    /// Allocate a tree and insert a cluster into it. The FK from
-    /// `clusters.tree_id` to `trees.id` means tests that want to pre-
-    /// populate a cluster must materialize a tree first; this helper
-    /// keeps that boilerplate in one place.
+    /// Allocate a fresh cluster network and insert the row. Tests that
+    /// just need *a* cluster to dangle VMs off of go through this
+    /// rather than reaching into the allocator directly.
     async fn seed_cluster(db: &Db, id: &str) -> ClusterRow {
-        let tree = db.allocate_tree(&net_config()).await.unwrap();
-        let row = ClusterRow {
-            id: id.to_string(),
-            name: format!("cluster-{id}"),
-            tree_id: tree.id,
-            parent_cluster_id: None,
-            control_plane_endpoint: "unused-endpoint".to_string(),
-            external_pool: String::new(),
-            service_block_cidr: String::new(),
-            created_at: basis_common::time::now_rfc3339(),
-        };
+        let network = db.allocate_cluster_network(&net_config()).await.unwrap();
+        let row = ClusterRow::from_network(
+            ClusterIdentity {
+                id: id.to_string(),
+                name: format!("cluster-{id}"),
+                control_plane_endpoint: "unused-endpoint".to_string(),
+                apiserver_visibility: 0,
+                external_pool: "cell-internal".to_string(),
+                service_block_cidr: String::new(),
+                trust_domain: String::new(),
+                created_at: basis_common::time::now_rfc3339(),
+            },
+            network,
+        );
         db.insert_cluster(&row).await.unwrap();
         row
     }

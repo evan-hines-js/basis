@@ -106,24 +106,21 @@ async fn apply(client: &BasisClient, file: &Path) -> Result<()> {
     for resource in load_file(file)? {
         match resource {
             Resource::Cluster(c) => {
-                let parent_cluster_id = match c.spec.parent_cluster.as_deref() {
-                    Some(name) => Some(find_cluster_id(client, name).await?),
-                    None => None,
-                };
                 let created = client
                     .create_cluster(basis_client::ClusterRequest {
                         name: c.metadata.name.clone(),
-                        parent_cluster_id,
                         external_ip_pool: c.spec.external_ip_pool.clone(),
                         external_service_ips: c.spec.external_service_ips,
+                        apiserver_visibility: c.spec.apiserver_visibility,
+                        trust_domain: c.spec.trust_domain.clone().unwrap_or_default(),
                     })
                     .await?;
                 println!(
-                    "cluster  {name:30}  id={id}  tree={tree}  vni={vni}  endpoint={ep}  services={svc}",
+                    "cluster  {name:30}  id={id}  vni={vni}  cidr={cidr}  endpoint={ep}  services={svc}",
                     name = c.metadata.name,
                     id = created.cluster_id,
-                    tree = created.tree_id,
                     vni = created.vni,
+                    cidr = created.cidr,
                     ep = created.control_plane_endpoint,
                     svc = if created.service_block_cidr.is_empty() {
                         "none".to_string()

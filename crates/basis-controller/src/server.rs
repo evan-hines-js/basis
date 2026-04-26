@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +18,7 @@ use basis_common::time::now_rfc3339;
 use basis_common::tls;
 
 use crate::config::{BgpConfig, NetworkConfig, Pool};
-use crate::db::{ClusterRow, Db, DbError, GpuAssignment, TreeRow, VmRow};
+use crate::db::{ClusterIdentity, ClusterRow, Db, DbError, GpuAssignment, VmRow};
 use crate::metrics::Metrics;
 use crate::scheduler::{self, ScheduleRequest, SchedulerError};
 
@@ -234,58 +233,54 @@ impl SharedCtx {
         host_id: &str,
     ) -> Result<ReconcileHostCommand, DbError> {
         let expected_vm_ids = self.db.list_vm_ids_on_host(host_id).await?;
-        let trees = self.db.list_host_trees(host_id).await?;
-        let mut tree_states = Vec::with_capacity(trees.len());
-        for tree in trees {
-            // A host carries a tree only when it has ≥1 VM in it, and
-            // `ensure_host_bridge_ip` runs before `insert_vm` — so the
-            // mapping must exist. Treat its absence as DB corruption.
+        let clusters = self.db.list_host_clusters(host_id).await?;
+        let mut cluster_states = Vec::with_capacity(clusters.len());
+        for cluster in clusters {
+            // A host carries a cluster only when it has ≥1 VM in it,
+            // and `ensure_host_bridge_ip` runs before `insert_vm` —
+            // so the mapping must exist. Treat its absence as DB
+            // corruption.
             let gateway_ip = self
                 .db
-                .get_host_bridge_ip(&tree.id, host_id)
+                .get_host_bridge_ip(&cluster.id, host_id)
                 .await?
                 .ok_or_else(|| {
                     DbError::Malformed(format!(
-                        "tree {} host {host_id} has VMs but no bridge IP mapping",
-                        tree.id
+                        "cluster {} host {host_id} has VMs but no bridge IP mapping",
+                        cluster.id
                     ))
                 })?;
-            // External cluster allocations (apiserver VIP and Service
-            // block) need explicit per-prefix advertisement by every
-            // host carrying the tree. Tree-scoped allocations sit inside
-            // `tree.cidr` and are reachable via that one advertisement,
-            // so they're filtered out — only LAN-pool entries make it in.
-            let tree_net: ipnet::Ipv4Net = tree.cidr.parse().map_err(|e| {
-                DbError::Malformed(format!("tree {} cidr '{}': {e}", tree.id, tree.cidr))
-            })?;
-            let clusters = self.db.list_clusters_in_tree(&tree.id).await?;
-            let mut cluster_vips: Vec<String> = Vec::with_capacity(clusters.len() * 2);
-            for c in clusters {
-                if let Ok(vip) = c.control_plane_endpoint.parse::<std::net::Ipv4Addr>() {
-                    if !tree_net.contains(&vip) {
-                        cluster_vips.push(format!("{vip}/32"));
-                    }
-                }
-                if !c.service_block_cidr.is_empty() {
-                    if let Ok(block) = c.service_block_cidr.parse::<ipnet::Ipv4Net>() {
-                        if !tree_net.contains(&block.network()) {
-                            cluster_vips.push(c.service_block_cidr.clone());
-                        }
-                    }
+            // External (pool-allocated) allocations — the LB Service
+            // block and, when `apiserver_visibility = PUBLIC`, the
+            // apiserver VIP — need explicit BGP advertisement by every
+            // host carrying the cluster. The cluster's overlay CIDR
+            // itself is intentionally NOT advertised: VM IPs are
+            // private to the cluster's bridge, no inter-cluster L3.
+            let mut cluster_vips: Vec<String> = Vec::with_capacity(2);
+            if cluster.apiserver_visibility == 0 {
+                if let Ok(vip) = cluster
+                    .control_plane_endpoint
+                    .parse::<std::net::Ipv4Addr>()
+                {
+                    cluster_vips.push(format!("{vip}/32"));
                 }
             }
-            tree_states.push(TreeState {
-                vni: tree.vni as u32,
+            if !cluster.service_block_cidr.is_empty() {
+                cluster_vips.push(cluster.service_block_cidr.clone());
+            }
+            cluster_states.push(ClusterState {
+                cluster_id: cluster.id.clone(),
+                vni: cluster.vni as u32,
+                cidr: cluster.cidr.clone(),
                 gateway_ip,
-                prefix_len: tree.prefix_len as u32,
-                vtep_addresses: self.db.list_tree_vteps(&tree.id).await?,
-                cidr: tree.cidr,
+                prefix_len: cluster.prefix_len as u32,
+                vtep_addresses: self.db.list_cluster_vteps(&cluster.id).await?,
                 cluster_vips,
             });
         }
         Ok(ReconcileHostCommand {
             expected_vm_ids,
-            trees: tree_states,
+            clusters: cluster_states,
         })
     }
 
@@ -312,13 +307,13 @@ impl SharedCtx {
     }
 
     /// Re-broadcast reconcile to every host currently carrying the
-    /// given tree. Called after a VM create/delete that shifts the
-    /// peer VTEP set.
-    async fn broadcast_tree(&self, tree_id: &str) {
-        let hosts = match self.db.list_hosts_in_tree(tree_id).await {
+    /// given cluster. Called after a VM create/delete that shifts the
+    /// peer VTEP set for that cluster's overlay.
+    async fn broadcast_cluster(&self, cluster_id: &str) {
+        let hosts = match self.db.list_hosts_in_cluster(cluster_id).await {
             Ok(h) => h,
             Err(e) => {
-                warn!(tree_id, error = %e, "broadcast_tree: list hosts failed");
+                warn!(cluster_id, error = %e, "broadcast_cluster: list hosts failed");
                 return;
             }
         };
@@ -337,77 +332,75 @@ struct BasisApiService {
 
 impl BasisApiService {
     /// Resolve an `external_ip_pool` name against the controller
-    /// config. Empty string = nested (returns `Ok(None)`); any other
-    /// name must match an entry in `network.pools[]`.
-    fn resolve_pool(&self, name: &str) -> Result<Option<&Pool>, Status> {
+    /// config. Required (empty rejected): every cluster needs a pool
+    /// for at least its LB Service block.
+    fn resolve_pool(&self, name: &str) -> Result<&Pool, Status> {
         if name.is_empty() {
-            return Ok(None);
+            return Err(Status::invalid_argument(
+                "externalIpPool is required (the LB Service block always comes from a named pool)",
+            ));
         }
-        self.shared
-            .network
-            .pool_by_name(name)
-            .map(Some)
-            .ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "pool '{name}' is not defined in the controller's network.pools"
-                ))
-            })
+        self.shared.network.pool_by_name(name).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "pool '{name}' is not defined in the controller's network.pools"
+            ))
+        })
     }
 
-    /// Allocate the apiserver VIP for a cluster. `None` external pool
-    /// → tree vip_range; named pool → one /32 from that pool.
+    /// Allocate the apiserver VIP for a cluster.
+    /// `APISERVER_PUBLIC` → one /32 from `external_pool`,
+    /// BGP-advertised cell-wide. `APISERVER_PRIVATE` → last usable in
+    /// the cluster's CIDR, never advertised; recorded in
+    /// `ip_allocations` under `cluster:<id>` scope so
+    /// `allocate_cluster_vm_ip` won't hand it out as a VM IP.
     async fn allocate_apiserver_vip(
         &self,
-        external_pool: Option<&Pool>,
-        tree: &TreeRow,
+        visibility: ApiserverVisibility,
+        pool: &Pool,
+        cluster_network: &crate::db::ClusterNetwork,
         cluster_id: &str,
     ) -> Result<String, Status> {
-        match external_pool {
-            None => self
-                .shared
-                .db
-                .allocate_tree_vip(tree, cluster_id)
-                .await
-                .map_err(db_status),
-            Some(pool) => self
+        match visibility {
+            ApiserverVisibility::ApiserverPublic => self
                 .shared
                 .db
                 .allocate_pool_vip(pool, cluster_id)
                 .await
                 .map_err(db_status),
+            ApiserverVisibility::ApiserverPrivate => {
+                let ip = cluster_network.private_apiserver_ip().to_string();
+                let scope = format!("cluster:{cluster_id}");
+                self.shared
+                    .db
+                    .reserve_specific_ip(&scope, &ip, None, Some(cluster_id))
+                    .await
+                    .map_err(db_status)?;
+                Ok(ip)
+            }
         }
     }
 
-    /// Allocate the cluster's LoadBalancer Service block. Returns the
-    /// CIDR (or empty string when the cluster requested 0 service IPs,
-    /// which is the only path that doesn't allocate). The same scope
-    /// key is used as the apiserver VIP allocator so the two share
-    /// allocation state in `ip_allocations` and never collide.
+    /// Allocate the cluster's LoadBalancer Service block from the
+    /// named pool. Returns the CIDR (or empty string when the cluster
+    /// requested 0 service IPs).
     async fn allocate_service_block(
         &self,
-        external_pool: Option<&Pool>,
-        tree: &TreeRow,
+        pool: &Pool,
         cluster_id: &str,
         count: u32,
     ) -> Result<String, Status> {
         if count == 0 {
             return Ok(String::new());
         }
-        let (scope, range) = match external_pool {
-            None => (tree.id.clone(), tree.vip_range().map_err(db_status)?),
-            Some(pool) => (
-                pool.name.clone(),
-                crate::db::ParsedRange::parse_pool_range(pool).map_err(db_status)?,
-            ),
-        };
+        let range = crate::db::ParsedRange::parse_pool_range(pool).map_err(db_status)?;
         self.shared
             .db
-            .allocate_service_block(&scope, &range, cluster_id, count)
+            .allocate_service_block(&pool.name, &range, cluster_id, count)
             .await
             .map_err(db_status)
     }
 
-    async fn cleanup_failed_vm(&self, vm_id: &str, tree_id: &str, host_id: &str) {
+    async fn cleanup_failed_vm(&self, vm_id: &str, cluster_id: &str, host_id: &str) {
         if let Err(e) = self.shared.db.release_vm_ips(vm_id).await {
             warn!(vm_id, error = %e, "cleanup: release IPs");
         }
@@ -417,15 +410,16 @@ impl BasisApiService {
         if let Err(e) = self
             .shared
             .db
-            .release_host_bridge_ip_if_idle(tree_id, host_id)
+            .release_host_bridge_ip_if_idle(cluster_id, host_id)
             .await
         {
-            warn!(vm_id, tree_id, host_id, error = %e, "cleanup: release host bridge IP");
+            warn!(vm_id, cluster_id, host_id, error = %e, "cleanup: release host bridge IP");
         }
-        self.shared.broadcast_tree(tree_id).await;
-        // If this failure left the host without any VM in the tree,
-        // `broadcast_tree` won't reach it — push directly so its bridge
-        // comes down before another host claims the freed bridge IP.
+        self.shared.broadcast_cluster(cluster_id).await;
+        // If this failure left the host without any VM in the cluster,
+        // `broadcast_cluster` won't reach it — push directly so the
+        // host tears the cluster's bridge/VXLAN down and frees its
+        // bridge IP before the next periodic reconcile tick.
         self.shared.push_reconcile(host_id).await;
     }
 
@@ -482,16 +476,7 @@ impl BasisApiService {
         }
         drop(agent);
 
-        // Cluster row is the source of truth for tree membership; look
-        // it up before the DELETE so we can broadcast to the right
-        // tree after cleanup.
-        let tree_id = self
-            .shared
-            .db
-            .get_cluster(&vm.cluster_id)
-            .await
-            .ok()
-            .map(|c| c.tree_id);
+        let cluster_id = vm.cluster_id.clone();
 
         match tokio::time::timeout(DELETE_MACHINE_TIMEOUT, wait_rx).await {
             Ok(Ok(Ok(()))) => {
@@ -499,27 +484,25 @@ impl BasisApiService {
                     warn!(vm_id = %vm.id, error = %e, "failed to release VM IPs during teardown");
                 }
                 self.shared.db.delete_vm(&vm.id).await.map_err(db_status)?;
-                if let Some(tid) = tree_id {
-                    if let Err(e) = self
-                        .shared
-                        .db
-                        .release_host_bridge_ip_if_idle(&tid, &vm.host_id)
-                        .await
-                    {
-                        warn!(vm_id = %vm.id, tree_id = %tid, host_id = %vm.host_id, error = %e,
-                            "failed to release host bridge IP during teardown");
-                    }
-                    self.shared.broadcast_tree(&tid).await;
-                    // `broadcast_tree` only reaches hosts that still
-                    // carry a VM in this tree. If this delete was the
-                    // last VM for (host, tree), the host itself is no
-                    // longer in that list — push directly so it tears
-                    // the bridge down and frees its bridge IP before
-                    // the next periodic reconcile tick. Without this,
-                    // the stale bridge can race a newly-allocated peer
-                    // claiming the same IP on another host.
-                    self.shared.push_reconcile(&vm.host_id).await;
+                if let Err(e) = self
+                    .shared
+                    .db
+                    .release_host_bridge_ip_if_idle(&cluster_id, &vm.host_id)
+                    .await
+                {
+                    warn!(
+                        vm_id = %vm.id, cluster_id = %cluster_id, host_id = %vm.host_id, error = %e,
+                        "failed to release host bridge IP during teardown"
+                    );
                 }
+                self.shared.broadcast_cluster(&cluster_id).await;
+                // `broadcast_cluster` only reaches hosts that still
+                // carry a VM in this cluster. If this delete was the
+                // last VM for (host, cluster), the host itself is no
+                // longer in that list — push directly so it tears the
+                // cluster's bridge/VXLAN down and frees its bridge IP
+                // before the next periodic reconcile tick.
+                self.shared.push_reconcile(&vm.host_id).await;
                 info!(vm_id = %vm.id, host_id = %vm.host_id, "DeleteMachine: agent confirmed STOPPED");
                 Ok(())
             }
@@ -624,16 +607,16 @@ impl BasisApiService {
     }
 
     /// One optimistic-scheduling attempt: pick a host off a fresh
-    /// snapshot, allocate the VM's tree IP, then commit the row via
-    /// `Db::insert_vm`. The writer's capacity gate + the `vm_gpus`
-    /// unique constraint serve as the commit check; if we lose either
-    /// race we roll back the IP allocation and return a classified
-    /// error so the outer loop can retry.
+    /// snapshot, allocate the VM's cluster IP, then commit the row
+    /// via `Db::insert_vm`. The writer's capacity gate + the
+    /// `vm_gpus` unique constraint serve as the commit check; if we
+    /// lose either race we roll back the IP allocation and return a
+    /// classified error so the outer loop can retry.
     async fn try_place_vm(
         &self,
         req: &CreateMachineRequest,
         vm_id: &str,
-        tree: &TreeRow,
+        cluster: &ClusterRow,
         now: &str,
     ) -> Result<Placement, PlaceError> {
         let (host_id, gpus) = self.pick_host(req).await.map_err(|s| {
@@ -647,7 +630,7 @@ impl BasisApiService {
         let ip_address = self
             .shared
             .db
-            .allocate_tree_vm_ip(tree, vm_id)
+            .allocate_cluster_vm_ip(cluster, vm_id)
             .await
             .map_err(|e| PlaceError::Internal(db_status(e)))?;
 
@@ -786,11 +769,14 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<CreateClusterResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
+        let visibility = ApiserverVisibility::try_from(req.apiserver_visibility)
+            .unwrap_or(ApiserverVisibility::ApiserverPublic);
         info!(
             name = %req.name,
-            parent = %req.parent_cluster_id,
             external_pool = %req.external_ip_pool,
             external_service_ips = req.external_service_ips,
+            apiserver_visibility = ?visibility,
+            trust_domain = %req.trust_domain,
             "CreateCluster received"
         );
         if req.name.is_empty() {
@@ -812,7 +798,7 @@ impl basis_server::Basis for BasisApiService {
         }
 
         // Fail fast on a bad pool name before allocating anything.
-        let external_pool = self.resolve_pool(&req.external_ip_pool)?;
+        let pool = self.resolve_pool(&req.external_ip_pool)?;
 
         // Idempotent by name.
         if let Some(existing) = self
@@ -822,107 +808,71 @@ impl basis_server::Basis for BasisApiService {
             .await
             .map_err(db_status)?
         {
-            let tree = self
-                .shared
-                .db
-                .get_tree(&existing.tree_id)
-                .await
-                .map_err(db_status)?;
             info!(cluster_id = %existing.id, name = %req.name, "CreateCluster idempotent return");
-            return Ok(Response::new(create_cluster_response(&existing, &tree)));
+            return Ok(Response::new(create_cluster_response(&existing)));
         }
 
-        // Resolve or allocate the tree. `tree_is_fresh` flags the
-        // root-cluster path so we can roll the tree back if any
-        // downstream step fails — without this, every transient
-        // failure (bad pool name, /N too tight, name conflict)
-        // leaks one /N tree slice and slowly exhausts the supernet.
-        // Child clusters reuse the parent's tree, so no rollback
-        // needed on that path.
-        let (tree, tree_is_fresh) = if req.parent_cluster_id.is_empty() {
-            let t = self
-                .shared
-                .db
-                .allocate_tree(&self.shared.network)
-                .await
-                .map_err(db_status)?;
-            (t, true)
-        } else {
-            let parent = self
-                .shared
-                .db
-                .get_cluster(&req.parent_cluster_id)
-                .await
-                .map_err(|e| match e {
-                    DbError::NotFound(_) => Status::not_found(format!(
-                        "parent cluster '{}' not found",
-                        req.parent_cluster_id
-                    )),
-                    other => db_status(other),
-                })?;
-            let t = self
-                .shared
-                .db
-                .get_tree(&parent.tree_id)
-                .await
-                .map_err(db_status)?;
-            (t, false)
-        };
-
-        // Helper closure: drop everything we allocated for this
-        // pending cluster — tree-side IPs (apiserver VIP and Service
-        // block both cleared by `release_cluster_ips`) and, if we
-        // just minted the tree, the tree row itself. Used by every
-        // failure-rollback site below so leaks can't accumulate.
-        let rollback = async |cluster_id: &str, tree_id: &str, label: &str| {
-            if let Err(e) = self.shared.db.release_cluster_ips(cluster_id).await {
-                warn!(cluster_id, error = %e, label, "rollback: release_cluster_ips");
-            }
-            if tree_is_fresh {
-                if let Err(e) = self.shared.db.delete_tree(tree_id).await {
-                    warn!(tree_id, error = %e, label, "rollback: delete_tree");
-                }
-            }
-        };
+        // Allocate this cluster's network identity (vni + cidr). Held
+        // by-value until insert_cluster commits the row — the row's
+        // UNIQUE (vni) constraint protects against concurrent creates
+        // racing on the same VNI, and any rollback path before the
+        // insert just discards the value (no separate trees table to
+        // clean up).
+        let cluster_network = self
+            .shared
+            .db
+            .allocate_cluster_network(&self.shared.network)
+            .await
+            .map_err(db_status)?;
 
         let cluster_id = uuid::Uuid::new_v4().to_string();
+
+        // Helper: drop every IP we allocated for this pending cluster
+        // (apiserver VIP if from pool, service block, private apiserver
+        // reservation). Used by every failure-rollback site below so
+        // leaks can't accumulate.
+        let rollback = async |label: &str| {
+            if let Err(e) = self.shared.db.release_cluster_ips(&cluster_id).await {
+                warn!(cluster_id, error = %e, label, "rollback: release_cluster_ips");
+            }
+        };
+
         let endpoint = match self
-            .allocate_apiserver_vip(external_pool, &tree, &cluster_id)
+            .allocate_apiserver_vip(visibility, pool, &cluster_network, &cluster_id)
             .await
         {
             Ok(ep) => ep,
             Err(status) => {
-                rollback(&cluster_id, &tree.id, "allocate_apiserver_vip").await;
+                rollback("allocate_apiserver_vip").await;
                 return Err(status);
             }
         };
         let service_block = match self
-            .allocate_service_block(external_pool, &tree, &cluster_id, service_count)
+            .allocate_service_block(pool, &cluster_id, service_count)
             .await
         {
             Ok(cidr) => cidr,
             Err(status) => {
-                rollback(&cluster_id, &tree.id, "allocate_service_block").await;
+                rollback("allocate_service_block").await;
                 return Err(status);
             }
         };
 
-        let row = ClusterRow {
-            id: cluster_id.clone(),
-            name: req.name.clone(),
-            tree_id: tree.id.clone(),
-            parent_cluster_id: if req.parent_cluster_id.is_empty() {
-                None
-            } else {
-                Some(req.parent_cluster_id.clone())
+        let row = ClusterRow::from_network(
+            ClusterIdentity {
+                id: cluster_id.clone(),
+                name: req.name.clone(),
+                control_plane_endpoint: endpoint.clone(),
+                apiserver_visibility: visibility as i64,
+                external_pool: req.external_ip_pool.clone(),
+                service_block_cidr: service_block.clone(),
+                trust_domain: req.trust_domain.clone(),
+                created_at: now_rfc3339(),
             },
-            control_plane_endpoint: endpoint.clone(),
-            external_pool: req.external_ip_pool.clone(),
-            service_block_cidr: service_block.clone(),
-            created_at: now_rfc3339(),
-        };
+            cluster_network,
+        );
         if let Err(e) = self.shared.db.insert_cluster(&row).await {
-            rollback(&cluster_id, &tree.id, "insert_cluster").await;
+            rollback("insert_cluster").await;
             return match e {
                 DbError::Conflict(_) => {
                     // Concurrent CreateCluster with the same name
@@ -940,13 +890,7 @@ impl basis_server::Basis for BasisApiService {
                                 req.name,
                             ))
                         })?;
-                    let etree = self
-                        .shared
-                        .db
-                        .get_tree(&existing.tree_id)
-                        .await
-                        .map_err(db_status)?;
-                    Ok(Response::new(create_cluster_response(&existing, &etree)))
+                    Ok(Response::new(create_cluster_response(&existing)))
                 }
                 other => Err(db_status(other)),
             };
@@ -956,11 +900,11 @@ impl basis_server::Basis for BasisApiService {
             cluster_id = %cluster_id,
             name = %req.name,
             endpoint = %endpoint,
-            tree_id = %tree.id,
-            vni = tree.vni,
+            vni = cluster_network.vni,
+            cidr = %cluster_network.cidr,
             "CreateCluster: new cluster provisioned"
         );
-        Ok(Response::new(create_cluster_response(&row, &tree)))
+        Ok(Response::new(create_cluster_response(&row)))
     }
 
     async fn delete_cluster(
@@ -971,28 +915,12 @@ impl basis_server::Basis for BasisApiService {
         let req = request.into_inner();
         info!(cluster_id = %req.cluster_id, "DeleteCluster received");
 
-        let cluster = self
+        let _ = self
             .shared
             .db
             .get_cluster(&req.cluster_id)
             .await
             .map_err(db_status)?;
-
-        // Refuse to orphan a subtree — children share this cluster's
-        // tree membership but are their own lifecycle units in Lattice.
-        let children = self
-            .shared
-            .db
-            .list_child_clusters(&req.cluster_id)
-            .await
-            .map_err(db_status)?;
-        if !children.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "cluster '{}' has {} child cluster(s); delete them first",
-                cluster.name,
-                children.len()
-            )));
-        }
 
         let vms = self
             .shared
@@ -1005,25 +933,17 @@ impl basis_server::Basis for BasisApiService {
 
         if let Err(e) = self.shared.db.release_cluster_ips(&req.cluster_id).await {
             warn!(cluster_id = %req.cluster_id, error = %e,
-                "failed to release cluster VIP during DeleteCluster");
+                "failed to release cluster VIPs during DeleteCluster");
         }
+        // Deleting the cluster row releases its (vni, cidr) pair back
+        // to the per-cell allocator pool — the next allocate_cluster_
+        // network reads `clusters` for taken VNIs/CIDRs, so removal is
+        // sufficient with no separate trees-table cascade.
         self.shared
             .db
             .delete_cluster(&req.cluster_id)
             .await
             .map_err(db_status)?;
-
-        let remaining = self
-            .shared
-            .db
-            .count_clusters_in_tree(&cluster.tree_id)
-            .await
-            .map_err(db_status)?;
-        if remaining == 0 {
-            if let Err(e) = self.shared.db.delete_tree(&cluster.tree_id).await {
-                warn!(tree_id = %cluster.tree_id, error = %e, "delete_tree failed");
-            }
-        }
 
         info!(cluster_id = %req.cluster_id, "DeleteCluster complete");
         Ok(Response::new(DeleteClusterResponse {}))
@@ -1041,13 +961,7 @@ impl basis_server::Basis for BasisApiService {
             .get_cluster(&req.cluster_id)
             .await
             .map_err(db_status)?;
-        let tree = self
-            .shared
-            .db
-            .get_tree(&cluster.tree_id)
-            .await
-            .map_err(db_status)?;
-        Ok(Response::new(cluster_to_proto(&cluster, &tree)))
+        Ok(Response::new(cluster_to_proto(&cluster)))
     }
 
     async fn list_clusters(
@@ -1056,26 +970,7 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<ListClustersResponse>, Status> {
         require_capi_caller(&request)?;
         let clusters = self.shared.db.list_clusters().await.map_err(db_status)?;
-        // Batch-load trees into a map so we only hit the reader pool
-        // once per distinct tree rather than N times per cluster.
-        let mut tree_cache: HashMap<String, TreeRow> = HashMap::new();
-        let mut out = Vec::with_capacity(clusters.len());
-        for c in clusters {
-            let tree = match tree_cache.get(&c.tree_id) {
-                Some(t) => t.clone(),
-                None => {
-                    let t = self
-                        .shared
-                        .db
-                        .get_tree(&c.tree_id)
-                        .await
-                        .map_err(db_status)?;
-                    tree_cache.insert(c.tree_id.clone(), t.clone());
-                    t
-                }
-            };
-            out.push(cluster_to_proto(&c, &tree));
-        }
+        let out = clusters.iter().map(cluster_to_proto).collect();
         Ok(Response::new(ListClustersResponse { clusters: out }))
     }
 
@@ -1134,13 +1029,6 @@ impl basis_server::Basis for BasisApiService {
             return Ok(Response::new(vm_to_create_response(&existing)));
         }
 
-        let tree = self
-            .shared
-            .db
-            .get_tree(&cluster.tree_id)
-            .await
-            .map_err(db_status)?;
-
         let vm_id = uuid::Uuid::new_v4().to_string();
         let now = now_rfc3339();
 
@@ -1154,7 +1042,7 @@ impl basis_server::Basis for BasisApiService {
         let placement = {
             let mut placement = None;
             for attempt in 1..=MAX_SCHEDULE_ATTEMPTS {
-                match self.try_place_vm(&req, &vm_id, &tree, &now).await {
+                match self.try_place_vm(&req, &vm_id, &cluster, &now).await {
                     Ok(p) => {
                         placement = Some(p);
                         break;
@@ -1214,24 +1102,32 @@ impl basis_server::Basis for BasisApiService {
         let ip_address = vm.ip_address.clone();
 
         // VM row now exists, so the host is registered as carrying
-        // this tree — `release_host_bridge_ip_if_idle` running from
-        // a concurrent delete will see VM count ≥ 1 and leave the
-        // mapping alone. Find-or-allocate the host's bridge IP here.
-        let host_gateway_ip = match self.shared.db.ensure_host_bridge_ip(&tree, &host_id).await {
+        // this cluster — `release_host_bridge_ip_if_idle` running
+        // from a concurrent delete will see VM count ≥ 1 and leave
+        // the mapping alone. Find-or-allocate the host's bridge IP
+        // here.
+        let host_gateway_ip = match self
+            .shared
+            .db
+            .ensure_host_bridge_ip(&cluster, &host_id)
+            .await
+        {
             Ok(ip) => ip,
             Err(e) => {
-                warn!(vm_id = %vm_id, host_id = %host_id, error = %e,
-                    "host bridge IP allocation failed after insert; cleaning up");
-                self.cleanup_failed_vm(&vm_id, &tree.id, &host_id).await;
+                warn!(
+                    vm_id = %vm_id, host_id = %host_id, error = %e,
+                    "host bridge IP allocation failed after insert; cleaning up"
+                );
+                self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
                 return Err(db_status(e));
             }
         };
 
         // Push the authoritative reconcile before dispatching CreateVm
-        // so the agent has the tree's bridge up before it has to
+        // so the agent has the cluster's bridge up before it has to
         // attach the VM's tap. mpsc preserves send order from this
         // task, so the broadcast lands first.
-        self.shared.broadcast_tree(&tree.id).await;
+        self.shared.broadcast_cluster(&cluster.id).await;
 
         let Some(agent) = self.shared.agents.get(&host_id) else {
             outcome.set("no_agent");
@@ -1256,7 +1152,7 @@ impl basis_server::Basis for BasisApiService {
                     bootstrap_data: req.bootstrap_data,
                     ip_address: ip_address.clone(),
                     gateway: host_gateway_ip.clone(),
-                    prefix_len: tree.prefix_len as u32,
+                    prefix_len: cluster.prefix_len as u32,
                     gpus: req.gpus,
                     gpu_constraints: req.gpu_constraints,
                     dns_servers: self.shared.dns_servers.as_ref().clone(),
@@ -1265,15 +1161,15 @@ impl basis_server::Basis for BasisApiService {
                         .map(|g| g.pci_address.clone())
                         .collect(),
                     extra_disks: req.extra_disks,
-                    vni: tree.vni as u32,
+                    vni: cluster.vni as u32,
                 },
             ))),
         };
 
-        info!(vm_id = %vm_id, host_id = %host_id, vni = tree.vni, "CreateMachine: dispatching CreateVm to agent");
+        info!(vm_id = %vm_id, host_id = %host_id, vni = cluster.vni, "CreateMachine: dispatching CreateVm to agent");
         if agent.command_tx.send(cmd).await.is_err() {
             self.pending_ops.remove(&vm_id);
-            self.cleanup_failed_vm(&vm_id, &tree.id, &host_id).await;
+            self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
             outcome.set("stream_closed");
             warn!(
                 vm_id = %vm_id,
@@ -1292,7 +1188,7 @@ impl basis_server::Basis for BasisApiService {
                 Ok(Response::new(vm_to_create_response(&row)))
             }
             Ok(Ok(Err(failure))) => {
-                self.cleanup_failed_vm(&vm_id, &tree.id, &host_id).await;
+                self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
                 if failure.transient {
                     outcome.set("busy");
                     warn!(
@@ -1318,7 +1214,7 @@ impl basis_server::Basis for BasisApiService {
             Ok(Err(_)) => {
                 outcome.set("agent_error");
                 warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: agent disconnected during VM creation");
-                self.cleanup_failed_vm(&vm_id, &tree.id, &host_id).await;
+                self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
                 Err(Status::internal("agent disconnected during VM creation"))
             }
             Err(_) => {
@@ -1719,24 +1615,25 @@ async fn handle_agent_message(
 
 // --- Proto conversions — single source of truth ---
 
-fn cluster_to_proto(c: &ClusterRow, tree: &TreeRow) -> Cluster {
+fn cluster_to_proto(c: &ClusterRow) -> Cluster {
     Cluster {
         cluster_id: c.id.clone(),
         name: c.name.clone(),
-        tree_id: tree.id.clone(),
-        parent_cluster_id: c.parent_cluster_id.clone().unwrap_or_default(),
         control_plane_endpoint: c.control_plane_endpoint.clone(),
-        vni: tree.vni as u32,
+        vni: c.vni as u32,
+        cidr: c.cidr.clone(),
         service_block_cidr: c.service_block_cidr.clone(),
+        apiserver_visibility: c.apiserver_visibility as i32,
+        trust_domain: c.trust_domain.clone(),
     }
 }
 
-fn create_cluster_response(c: &ClusterRow, tree: &TreeRow) -> CreateClusterResponse {
+fn create_cluster_response(c: &ClusterRow) -> CreateClusterResponse {
     CreateClusterResponse {
         cluster_id: c.id.clone(),
         control_plane_endpoint: c.control_plane_endpoint.clone(),
-        tree_id: tree.id.clone(),
-        vni: tree.vni as u32,
+        vni: c.vni as u32,
+        cidr: c.cidr.clone(),
         service_block_cidr: c.service_block_cidr.clone(),
     }
 }

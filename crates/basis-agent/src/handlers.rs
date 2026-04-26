@@ -344,7 +344,7 @@ pub async fn report_local_vm_states(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::{tree::TreeManager, NetworkManager, UplinkBridge};
+    use crate::network::{cluster::ClusterManager, NetworkManager, UplinkBridge};
 
     fn fake_vm(id: &str) -> LocalVmRow {
         LocalVmRow {
@@ -382,8 +382,9 @@ mod tests {
             std::env::temp_dir().join("basis-test-reconcile"),
         ));
         let uplink = UplinkBridge::new("test-br".to_string(), "lo".to_string(), 9000);
-        let trees = TreeManager::new("127.0.0.1".to_string(), 9000, "test-br".to_string());
-        (vm_mgr, NetworkManager::new(uplink, trees))
+        let clusters =
+            ClusterManager::new("127.0.0.1".to_string(), 9000, "test-br".to_string());
+        (vm_mgr, NetworkManager::new(uplink, clusters))
     }
 
     #[tokio::test]

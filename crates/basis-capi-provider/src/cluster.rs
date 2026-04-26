@@ -3,7 +3,7 @@
 //! Create flow is driven by two idempotency primitives:
 //!   - `Basis.CreateCluster` is idempotent by name server-side (see
 //!     basis-controller/src/server.rs). Calling it twice with the same
-//!     `(name, parent_cluster_id)` returns the same result.
+//!     `name` returns the same result.
 //!   - Every reconcile rewrites `spec.controlPlaneEndpoint` and the
 //!     `status` fields as merge patches. Writing identical values is a
 //!     no-op on the API server, so repeated reconciles converge without
@@ -139,29 +139,23 @@ async fn apply(
         .get(&cluster.spec.credentials_ref, &namespace)
         .await?;
 
-    // Parent comes from the provider's deploy-time config, not the CR.
-    // See `ProviderContext.parent_cluster_id`. Empty means this
-    // provider is running in the root cell.
-    let parent_cluster_id = if ctx.parent_cluster_id.is_empty() {
-        None
-    } else {
-        Some(ctx.parent_cluster_id.clone())
-    };
-
-    // Server-side `CreateCluster` materialises (or joins) a tree,
-    // allocates a VIP, and is idempotent by name: retrying returns the
-    // same result.
+    // Server-side `CreateCluster` allocates a fresh VNI + cluster
+    // CIDR, allocates the LB Service block (and the apiserver VIP
+    // when `apiserver_visibility = PUBLIC`) from the named pool,
+    // and is idempotent by name: retrying returns the same result.
     info!(
         cluster = %name,
-        parent = ?parent_cluster_id,
+        external_pool = %cluster.spec.external_ip_pool,
+        apiserver_visibility = ?cluster.spec.apiserver_visibility,
         "calling Basis.CreateCluster"
     );
     let created = basis
         .create_cluster(ClusterRequest {
             name: name.clone(),
-            parent_cluster_id,
             external_ip_pool: cluster.spec.external_ip_pool.clone(),
             external_service_ips: cluster.spec.external_service_ips,
+            apiserver_visibility: cluster.spec.apiserver_visibility.into(),
+            trust_domain: cluster.spec.trust_domain.clone().unwrap_or_default(),
         })
         .await?;
 
@@ -203,8 +197,8 @@ async fn apply(
         &json!({
             "status": {
                 "basisClusterId": created.cluster_id,
-                "treeId": created.tree_id,
                 "vni": created.vni,
+                "cidr": created.cidr,
                 "ready": true,
                 "initialization": { "provisioned": true },
                 "failureMessage": serde_json::Value::Null,

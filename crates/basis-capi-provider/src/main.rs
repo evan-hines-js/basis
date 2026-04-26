@@ -38,15 +38,6 @@ struct Cli {
     /// `scripts/generate-capi-components.sh`.
     #[arg(long)]
     print_components: bool,
-
-    /// Basis-side cluster id of the cluster this provider is running
-    /// in. Set at deploy time — Lattice's installer plumbs the
-    /// hosting cluster's `basisClusterId` in. Every `BasisCluster`
-    /// this provider creates becomes a child of this id in basis's
-    /// tree (trust domain). Leave unset only on the provider running
-    /// in the root cell, where there is no parent.
-    #[arg(long, env = "BASIS_PARENT_CLUSTER_ID", default_value = "")]
-    parent_cluster_id: String,
 }
 
 #[tokio::main]
@@ -58,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     run(cli).await
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(_cli: Cli) -> anyhow::Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
@@ -76,14 +67,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }))
         .init();
 
-    info!(
-        parent_cluster_id = %if cli.parent_cluster_id.is_empty() {
-            "<root>".to_string()
-        } else {
-            cli.parent_cluster_id.clone()
-        },
-        "starting basis-capi-provider"
-    );
+    info!("starting basis-capi-provider");
 
     let kube = Client::try_default().await?;
 
@@ -97,7 +81,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let ctx = Arc::new(ProviderContext {
         client: kube.clone(),
         clients: clients.clone(),
-        parent_cluster_id: cli.parent_cluster_id,
     });
 
     let cluster_task = tokio::spawn(cluster::run(ctx.clone()));

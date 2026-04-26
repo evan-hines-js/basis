@@ -10,31 +10,24 @@
 //!   dataDir: /var/lib/basis
 //!   tls: { ... }
 //!   network:
-//!     treeSupernet: 10.0.0.0/8
-//!     treePrefix: 20
+//!     clusterSupernet: 10.0.0.0/8
+//!     clusterPrefix: 24
 //!     vniRange: { start: 10000, end: 16000000 }
 //!     pools:
-//!       - name: cell-internal
+//!       - name: cell-public
 //!         cidr: 192.168.100.0/24
-//!         gateway: 192.168.100.1
-//!         rangeStart: 192.168.100.20
-//!         rangeEnd: 192.168.100.250
 //!   cpuOvercommitRatio: 4.0
 //! ```
 //!
 //! Address space has two planes:
-//!   * `treeSupernet` — overlay CIDR, auto-carved per-tree. VM primary
-//!     NICs, per-host bridge gateway IPs, and tree-internal allocations
-//!     come from here. Not routable outside the VXLAN fabric.
-//!   * `pools[]` — named LAN-routable pools. A cluster picks one pool
+//!   * `clusterSupernet` — overlay CIDR, auto-carved per-cluster. VM
+//!     primary NICs come from here. Not routable outside the cluster's
+//!     VXLAN; cross-cluster traffic goes through cell-public LB VIPs
+//!     (typically Istio east-west gateways), not the underlay.
+//!   * `pools[]` — named LAN-routable pools. A cluster names one pool
 //!     for its `externalIpPool`; both the apiserver VIP and the Cilium
-//!     LoadBalancer Service block are carved from it.
-//!
-//! An empty / absent `externalIpPool` selects the cluster's tree CIDR
-//! (nested cluster, kube-vip claims the apiserver VIP inside the tree,
-//! no LAN exposure). Any non-empty name resolves to a LAN pool and the
-//! host carrying the tree advertises the allocations via BGP plus
-//! proxy-ARP on the underlay so LAN clients can reach them.
+//!     LoadBalancer Service block are carved from it. Allocations are
+//!     advertised cell-wide via the BGP reflector.
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -59,7 +52,7 @@ pub struct BasisControllerSpec {
     /// Persistent state directory (holds `controller.db`).
     pub data_dir: PathBuf,
     pub tls: TlsConfig,
-    /// Networking fabric configuration: per-tree CIDR carving, VNI
+    /// Networking fabric configuration: per-cluster CIDR carving, VNI
     /// allocation bounds, and named LAN pools.
     pub network: NetworkConfig,
     /// Resolvers the agent bakes into each VM's cloud-init network config.
@@ -122,37 +115,34 @@ fn default_bgp_instance_name() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkConfig {
-    /// RFC1918 supernet that per-tree CIDRs are carved from, e.g.
-    /// `10.0.0.0/8`. Every tree gets its own disjoint
-    /// `/tree_prefix` slice.
-    pub tree_supernet: String,
+    /// RFC1918 supernet that per-cluster CIDRs are carved from, e.g.
+    /// `10.0.0.0/8`. Every cluster gets its own disjoint
+    /// `/cluster_prefix` slice.
+    pub cluster_supernet: String,
 
-    /// Prefix length of each per-tree CIDR. Default /20 — 4094 usable
-    /// addresses per tree, enough for one trust domain's worth of
-    /// control-plane VMs, worker VMs, and tree-internal cluster VIPs.
-    #[serde(default = "default_tree_prefix")]
-    pub tree_prefix: u8,
+    /// Prefix length of each per-cluster CIDR. Default /24 — with
+    /// `bridge_reserve` = 32, gives ~32 hosts × ~220 VMs per cluster.
+    /// Widen for larger clusters; `validate()` enforces enough
+    /// headroom for at least one VM after bridge + apiserver reserves.
+    #[serde(default = "default_cluster_prefix")]
+    pub cluster_prefix: u8,
 
-    /// Number of addresses at the TOP of each tree's CIDR reserved
-    /// for nested-cluster allocations — apiserver VIPs and Service
-    /// blocks for clusters whose `externalIpPool` is empty. Default 32.
-    #[serde(default = "default_vip_reserve")]
-    pub vip_reserve: u32,
+    /// Number of addresses at the BOTTOM of each cluster's CIDR
+    /// reserved for per-host bridge IPs. Each hypervisor carrying a
+    /// VM in the cluster gets one IP from this range and uses it as
+    /// the gateway for the cluster-local VMs it hosts. Per-host
+    /// uniqueness (rather than a shared anycast IP) is required so
+    /// cross-host VM→gateway replies routing back through the
+    /// gateway land on the originating hypervisor without depending
+    /// on EVPN-style ARP suppression. Default 32.
+    #[serde(default = "default_bridge_reserve")]
+    pub bridge_reserve: u32,
 
     /// Cell-wide default for `CreateClusterRequest.external_service_ips`
     /// when the caller passes 0. Must be a power of two so the
     /// allocator can carve an aligned /N. Default 16 (a /28).
     #[serde(default = "default_external_service_ips")]
     pub default_external_service_ips: u32,
-
-    /// Number of addresses at the BOTTOM of each tree's CIDR reserved
-    /// for per-host bridge IPs. Each hypervisor carrying this tree is
-    /// assigned one IP from this range and uses it as the gateway of
-    /// every VM it hosts in this tree. Per-host uniqueness is required
-    /// so cross-host replies routing back through the gateway land on
-    /// the correct hypervisor. Default 32.
-    #[serde(default = "default_bridge_reserve")]
-    pub bridge_reserve: u32,
 
     /// VNI allocation bounds, inclusive. Default 10000..=16_000_000 —
     /// leaves low VNIs for infrastructure, stays well below the 2^24
@@ -161,7 +151,10 @@ pub struct NetworkConfig {
     pub vni_range: VniRange,
 
     /// Named LAN-routable pools. A cluster's `externalIpPool` must
-    /// match one of these by name (or be empty for tree-scoped).
+    /// match one of these by name. Required: every cluster's LB
+    /// Service block (and the apiserver VIP, when
+    /// `apiserver_visibility = PUBLIC`) lives in a LAN pool so
+    /// cell-wide BGP advertisement always works.
     pub pools: Vec<Pool>,
 }
 
@@ -176,8 +169,7 @@ pub struct VniRange {
 #[serde(rename_all = "camelCase")]
 pub struct Pool {
     /// Unique, user-chosen name. Referenced by `BasisCluster.spec`.
-    /// Must not be empty (empty is reserved for "nested cluster, use
-    /// the tree CIDR").
+    /// Must not be empty.
     pub name: String,
     /// CIDR slice basis owns within the LAN. Both the pool's name and
     /// the addresses it allocates come from here — the allocator
@@ -188,11 +180,8 @@ pub struct Pool {
     pub cidr: String,
 }
 
-fn default_tree_prefix() -> u8 {
-    20
-}
-fn default_vip_reserve() -> u32 {
-    32
+fn default_cluster_prefix() -> u8 {
+    24
 }
 fn default_bridge_reserve() -> u32 {
     32
@@ -256,42 +245,41 @@ impl BgpConfig {
 }
 
 impl NetworkConfig {
-    /// Look up a pool by name. Empty name → `None` (the caller reads
-    /// this as "allocate from the tree's vip_range"); missing name →
-    /// `None` as well, which the caller distinguishes via an explicit
-    /// pre-check if it needs to.
+    /// Look up a pool by name. Empty / missing name → `None`; the
+    /// CreateCluster path treats `None` as a hard error since every
+    /// cluster needs a pool to host its apiserver VIP and LB block.
     pub fn pool_by_name(&self, name: &str) -> Option<&Pool> {
         self.pools.iter().find(|p| p.name == name)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        let supernet: ipnet::Ipv4Net = parse_cidr("network.treeSupernet", &self.tree_supernet)?;
-        if self.tree_prefix < supernet.prefix_len() || self.tree_prefix > 30 {
+        let supernet: ipnet::Ipv4Net =
+            parse_cidr("network.clusterSupernet", &self.cluster_supernet)?;
+        if self.cluster_prefix < supernet.prefix_len() || self.cluster_prefix > 30 {
             anyhow::bail!(
-                "network.treePrefix /{} must be between /{} (supernet) and /30 inclusive",
-                self.tree_prefix,
+                "network.clusterPrefix /{} must be between /{} (supernet) and /30 inclusive",
+                self.cluster_prefix,
                 supernet.prefix_len()
             );
         }
 
-        // Per-tree CIDR layout check:
-        //   1 (network) + bridge_reserve + vm range + vip_reserve + 1 (broadcast)
-        // The VM range needs at least one address or a tree can hold no VMs.
-        let addrs_per_tree: u32 = 1u32 << (32 - self.tree_prefix);
-        let need = self
-            .bridge_reserve
-            .saturating_add(self.vip_reserve)
-            .saturating_add(2);
-        if addrs_per_tree <= need {
+        // Per-cluster CIDR sanity:
+        //   1 (network) + bridge_reserve + ≥1 VM + 1 (broadcast)
+        // (with `apiserver_visibility = PRIVATE` the apiserver VIP
+        // takes one more, but that's a per-cluster choice rather than
+        // a config invariant — checked at allocate time.)
+        let addrs_per_cluster: u32 = 1u32 << (32 - self.cluster_prefix);
+        let need = self.bridge_reserve.saturating_add(2);
+        if addrs_per_cluster <= need {
             anyhow::bail!(
-                "network.treePrefix /{} holds {} addresses; bridgeReserve={} + vipReserve={} \
-                 leaves no VM capacity",
-                self.tree_prefix,
-                addrs_per_tree,
+                "network.clusterPrefix /{} holds {} addresses; \
+                 bridgeReserve={} + network + broadcast leaves no VM capacity",
+                self.cluster_prefix,
+                addrs_per_cluster,
                 self.bridge_reserve,
-                self.vip_reserve,
             );
         }
+
         if self.vni_range.start == 0 || self.vni_range.end < self.vni_range.start {
             anyhow::bail!(
                 "network.vniRange invalid: start={}, end={}",
@@ -330,7 +318,7 @@ impl NetworkConfig {
                 .expect("pool.validate checked cidr parses");
             if cidrs_overlap(&supernet, &net) {
                 anyhow::bail!(
-                    "network.treeSupernet {supernet} overlaps pool '{}' cidr {net}",
+                    "network.clusterSupernet {supernet} overlaps pool '{}' cidr {net}",
                     pool.name
                 );
             }
@@ -437,7 +425,7 @@ spec:
     key: /etc/basis/tls/controller.key
     ca: /etc/basis/tls/ca.crt
   network:
-    treeSupernet: 10.0.0.0/8
+    clusterSupernet: 10.0.0.0/8
     pools:
       - name: cell-internal
         cidr: 192.168.100.0/24
@@ -452,9 +440,8 @@ spec:
     fn loads_with_defaults() {
         let f = write(&base_yaml());
         let spec = BasisControllerSpec::load(f.path()).unwrap();
-        assert_eq!(spec.network.tree_prefix, 20);
+        assert_eq!(spec.network.cluster_prefix, 24);
         assert_eq!(spec.network.bridge_reserve, 32);
-        assert_eq!(spec.network.vip_reserve, 32);
         assert_eq!(spec.network.default_external_service_ips, 16);
         assert_eq!(spec.network.vni_range.start, 10_000);
         assert_eq!(spec.network.vni_range.end, 16_000_000);
@@ -494,9 +481,22 @@ spec:
     }
 
     #[test]
-    fn rejects_pool_overlap_with_tree_supernet() {
+    fn rejects_pool_overlap_with_cluster_supernet() {
         let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
         spec.network.pools[0].cidr = "10.200.0.0/24".to_string();
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_cluster_prefix_too_narrow_for_bridge_reserve() {
+        let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
+        // bridge_reserve = 32 + network + broadcast = 34 sentinels.
+        // /26 (64 addresses) fits with 30 VM headroom; /27 (32) is
+        // exactly the cliff (no VM capacity).
+        spec.network.bridge_reserve = 32;
+        spec.network.cluster_prefix = 26;
+        assert!(spec.validate().is_ok());
+        spec.network.cluster_prefix = 27;
         assert!(spec.validate().is_err());
     }
 
@@ -530,20 +530,6 @@ spec:
         assert!(spec.validate().is_err());
         spec.network.pools[0].cidr = "192.168.100.0/30".to_string();
         assert!(spec.validate().is_ok());
-    }
-
-    #[test]
-    fn rejects_tree_prefix_too_narrow_for_reserves() {
-        let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
-        // Explicit reserves so the test stays decoupled from default
-        // changes: 32 + 32 + 2 = 66 sentinels means /25 (128 addrs)
-        // fits with VM headroom and /26 (64) is just over the cliff.
-        spec.network.bridge_reserve = 32;
-        spec.network.vip_reserve = 32;
-        spec.network.tree_prefix = 25;
-        assert!(spec.validate().is_ok());
-        spec.network.tree_prefix = 26;
-        assert!(spec.validate().is_err());
     }
 
     #[test]

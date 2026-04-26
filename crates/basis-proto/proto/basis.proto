@@ -3,10 +3,17 @@ package basis.v1;
 
 // CAPI-facing service — called by basis-capi-provider running in Kubernetes.
 //
-// Two-level model: a caller first creates a Cluster (which materializes
-// or joins a tree and reserves a VIP), then creates Machines inside that
-// cluster. All placement decisions (host, GPUs, IP) belong to the
+// Two-level model: a caller first creates a Cluster (which allocates a
+// VNI + carves a CIDR + reserves a VIP), then creates Machines inside
+// that cluster. All placement decisions (host, GPUs, IP) belong to the
 // controller — callers describe intent, not placement.
+//
+// Network model: each cluster gets its own VXLAN VNI and CIDR. There is
+// no inter-cluster reachability at the underlay — cross-cluster traffic
+// goes through cell-public LB VIPs (typically Istio east-west gateways).
+// Trust domains live entirely in the mesh layer (SPIFFE / Istio
+// MeshNetworks); basis just provides isolated per-cluster networks and
+// BGP-advertised VIPs.
 service Basis {
   rpc CreateCluster(CreateClusterRequest) returns (CreateClusterResponse);
   rpc DeleteCluster(DeleteClusterRequest) returns (DeleteClusterResponse);
@@ -31,42 +38,62 @@ message CreateClusterRequest {
   // Human-readable cluster name. Must be unique across the Basis
   // controller. Used in logs and as the `cluster` label on VMs.
   string name = 1;
-  // If set, this cluster joins the tree of the referenced parent
-  // cluster. If empty, this cluster is a tree root — the controller
-  // materializes a new tree (allocates a VNI, carves a CIDR) before
-  // inserting the cluster row.
-  string parent_cluster_id = 2;
-  // Named pool the cluster's LAN-routable IPs are carved from — both
-  // the apiserver VIP (one /32) and the Cilium LoadBalancer Service
-  // block (one /N where N is derived from `external_service_ips`).
-  // Empty selects the cluster's tree CIDR for both (nested cluster,
-  // no LAN exposure; reachable only from sibling clusters in the
-  // tree). Any non-empty name resolves to a pool in the controller's
-  // `network.pools[]`. Allocations are advertised by every host
-  // carrying the cluster's tree via the cell BGP reflector.
-  string external_ip_pool = 3;
+  // Named pool the cluster's external IPs come from — always the
+  // LoadBalancer Service block, and the apiserver VIP too when
+  // `apiserver_visibility = APISERVER_PUBLIC`. Required: the pool
+  // name must match an entry in the controller's `network.pools[]`.
+  // Allocations are BGP-advertised cell-wide.
+  string external_ip_pool = 2;
   // Number of LoadBalancer Service IPs this cluster gets, exposed to
   // Cilium via a CiliumLoadBalancerIPPool. Must be a power of two so
   // the controller can carve an aligned /N out of the pool. 0 falls
   // back to the cell-wide default in `network.defaultExternalServiceIps`.
-  uint32 external_service_ips = 4;
+  uint32 external_service_ips = 3;
+  // Where the apiserver VIP lives. See `ApiserverVisibility`. Default
+  // `APISERVER_PUBLIC` — safe for the root mgmt cluster where the
+  // operator's `lattice install` needs direct LAN reachability.
+  // Workload clusters set `APISERVER_PRIVATE` to keep their apiserver
+  // inside the cluster CIDR (CAPI access flows through the parent
+  // cell's lattice-operator API proxy).
+  ApiserverVisibility apiserver_visibility = 4;
+  // Trust-domain label, propagated to BGP communities in Phase 2 of
+  // the network design so VIPs are only installed on hosts whose
+  // local clusters subscribe to the same trust domain. Empty (the
+  // default) means "untagged" — VIPs propagate to every host in the
+  // cell. Phase 1 stores the field but doesn't wire it through to
+  // holod yet.
+  string trust_domain = 5;
+}
+
+enum ApiserverVisibility {
+  // Apiserver VIP from `external_ip_pool`, BGP-advertised cell-wide.
+  // Required for the root mgmt cluster.
+  APISERVER_PUBLIC = 0;
+  // Apiserver VIP from the cluster's CIDR (last usable), private to
+  // the cluster. Reachable only from within the cluster's bridge.
+  APISERVER_PRIVATE = 1;
 }
 
 message CreateClusterResponse {
   string cluster_id = 1;
-  // Control-plane endpoint VIP, allocated by the controller from
-  // whichever pool the caller named in `external_ip_pool` (or the
-  // tree CIDR when that field is empty). Recorded onto the caller's
-  // `InfrastructureCluster` CR; CAPI core propagates it to
-  // `Cluster.spec.controlPlaneEndpoint`.
+  // Control-plane endpoint — the cluster's apiserver VIP. Where it
+  // lives depends on `apiserver_visibility` chosen at create time:
+  // `APISERVER_PUBLIC` puts it in `external_ip_pool` (BGP-advertised
+  // cell-wide); `APISERVER_PRIVATE` puts it at the last usable of
+  // `cidr` (private to the cluster, accessed via the parent cell's
+  // lattice-operator API proxy over the agent's reverse-tunneled
+  // gRPC stream).
   string control_plane_endpoint = 2;
-  // Tree this cluster belongs to. Root clusters materialize a new
-  // tree; children inherit their parent's.
-  string tree_id = 3;
-  // VXLAN Network Identifier for the tree. 24-bit.
-  uint32 vni = 4;
-  // CIDR of the cluster's LoadBalancer Service block. Same source as
-  // the apiserver VIP. Empty when the cluster requested 0 service IPs.
+  // VXLAN Network Identifier of this cluster's overlay. 24-bit;
+  // unique within the cell.
+  uint32 vni = 3;
+  // CIDR of the cluster's overlay (e.g. `10.42.0.0/24`). The bottom
+  // `bridgeReserve` addresses hold per-host gateway IPs (assigned by
+  // the controller on first VM scheduled to a host); the rest are VM
+  // IPs (less the apiserver VIP slot when private).
+  string cidr = 4;
+  // CIDR of the cluster's LoadBalancer Service block, allocated from
+  // the named pool. Empty when the cluster requested 0 service IPs.
   string service_block_cidr = 5;
 }
 
@@ -83,13 +110,14 @@ message GetClusterRequest {
 message Cluster {
   string cluster_id = 1;
   string name = 2;
-  string tree_id = 3;
-  string parent_cluster_id = 4;
-  string control_plane_endpoint = 5;
-  uint32 vni = 6;
+  string control_plane_endpoint = 3;
+  uint32 vni = 4;
+  string cidr = 5;
   // Same shape as `CreateClusterResponse.service_block_cidr`. Empty
   // when the cluster has no LoadBalancer Service block.
-  string service_block_cidr = 7;
+  string service_block_cidr = 6;
+  ApiserverVisibility apiserver_visibility = 7;
+  string trust_domain = 8;
 }
 
 message ListClustersRequest {}
@@ -205,26 +233,27 @@ message ControllerCommand {
     CreateVMCommand create_vm = 2;
     DeleteVMCommand delete_vm = 3;
     RegisterHostResponse register_ack = 4;
-    // Authoritative list of VMs + trees this host should carry. Fired
-    // on every relevant state change (VM create/delete, host joins or
-    // leaves a tree, peer-set shift) AND periodically so missed pushes
-    // converge. Agent reconciles local state to match — deletes VMs
-    // not in the list, builds bridges for trees not yet present,
-    // tears down bridges for trees no longer in the list, replaces
-    // FDB entries to match each tree's `vtep_addresses`.
+    // Authoritative list of VMs + clusters this host should carry.
+    // Fired on every relevant state change (VM create/delete, host
+    // joins or leaves a cluster, peer-set shift) AND periodically so
+    // missed pushes converge. Agent reconciles local state to match —
+    // deletes VMs not in the list, builds bridges for clusters not
+    // yet present, tears down bridges for clusters no longer in the
+    // list, replaces FDB entries to match each cluster's
+    // `vtep_addresses`.
     ReconcileHostCommand reconcile_host = 5;
   }
 }
 
 // The full authoritative view the controller holds of a single host.
-// One message drives three invariants: VM set, tree set, per-tree
-// peer VTEPs. There is no separate incremental message — every
-// relevant change re-sends this, and the periodic tick does too, so
-// there's exactly one code path on the agent that turns controller
-// state into host state.
+// One message drives three invariants: VM set, cluster set, per-cluster
+// peer VTEPs. There is no separate incremental message — every relevant
+// change re-sends this, and the periodic tick does too, so there's
+// exactly one code path on the agent that turns controller state into
+// host state.
 message ReconcileHostCommand {
   repeated string expected_vm_ids = 1;
-  repeated TreeState trees = 2;
+  repeated ClusterState clusters = 2;
 }
 
 message RegisterHostResponse {
@@ -244,38 +273,40 @@ message RegisterHostResponse {
   string bgp_reflector_address = 4;
 }
 
-// One tree's dataplane state the agent materialises locally.
-// `gateway_ip`/`prefix_len` are assigned to the host's own `brt<vni>`
-// so the host kernel acquires a route to the tree's CIDR via that
-// bridge — without this, a host can't reach VMs on its own tree.
-message TreeState {
-  uint32 vni = 1;
-  // This host's per-tree gateway IP, carved from the tree's
-  // `bridge_range`. Assigned to the local `brt<vni>`; every VM the
-  // host owns in this tree uses it as default gateway. Different
-  // hosts receive different addresses from the same range so
-  // cross-host replies routing through the gateway always land on
-  // the correct hypervisor.
-  string gateway_ip = 2;
-  uint32 prefix_len = 3;
+// One cluster's dataplane state the agent materialises locally.
+// `gateway_ip` is per-host (carved from the cluster's `bridge_range`
+// by the controller and unique among all hosts carrying the cluster);
+// every VM the host owns in this cluster uses it as default gateway.
+// Different hosts get different addresses so cross-host replies
+// routing back through the gateway always land on the originating
+// hypervisor — anycast on a shared IP would require EVPN-style ARP
+// suppression we don't have yet.
+message ClusterState {
+  // Cluster ID — opaque, used in logs.
+  string cluster_id = 1;
+  // VXLAN Network Identifier of this cluster's overlay. 24-bit.
+  uint32 vni = 2;
+  // The cluster's full CIDR (e.g. "10.42.0.0/24"). Used to scope the
+  // per-cluster MASQUERADE rule so cluster packets egress the uplink
+  // with the host's LAN IP.
+  string cidr = 3;
+  // This host's per-cluster bridge IP, carved from the cluster's
+  // `bridge_range`. Assigned to the local `brc<vni>` so the kernel
+  // acquires a route to the cluster CIDR via that bridge — without
+  // this, the host can't reach VMs on its own cluster.
+  string gateway_ip = 4;
+  uint32 prefix_len = 5;
   // VTEP addresses of every hypervisor currently carrying a VM of
-  // this tree. Learning is disabled on the VXLAN device, so this
+  // this cluster. Learning is disabled on the VXLAN device, so this
   // list is the FDB's BUM destination set.
-  repeated string vtep_addresses = 4;
-  // The tree's full CIDR (e.g. "10.0.0.0/20"). Used by the agent
-  // to install a source-scoped MASQUERADE rule so tree packets
-  // egress the uplink with the host's LAN IP — host-originated
-  // traffic is left untouched.
-  string cidr = 5;
-  // Pool-scoped cluster VIPs in this tree, as /32 prefixes. The
-  // agent advertises these via BGP (with self as next-hop) so they
-  // route to the tree from upstream; tree-scoped VIPs (inside
-  // `cidr`) are reachable through the tree CIDR advertisement and
-  // are NOT included here. Every host carrying the tree advertises
-  // the same VIP set — kube-vip leader election within the tree
-  // settles which CP VM owns the VIP at any moment, and cross-host
-  // VXLAN forwarding gets traffic to whichever host runs the leader.
-  repeated string cluster_vips = 6;
+  repeated string vtep_addresses = 6;
+  // Cluster VIPs (apiserver VIP when `APISERVER_PUBLIC` + LB Service
+  // block) as `<addr>/<prefix>` strings. The agent advertises these
+  // via BGP (with self as next-hop) so they route to the cluster
+  // from upstream. Every host carrying the cluster advertises the
+  // same VIP set — kube-vip leader election within the cluster
+  // settles which CP VM owns the apiserver VIP at any moment.
+  repeated string cluster_vips = 7;
 }
 
 // --- Agent registration ---
@@ -289,7 +320,7 @@ message RegisterHostRequest {
   // IP address the agent will use as the source for outgoing VXLAN
   // frames. Almost always the uplink interface's address. Reported
   // once at registration; the controller stores it on `hosts` and
-  // includes it in `TreeState.vtep_addresses` broadcasts.
+  // includes it in `ClusterState.vtep_addresses` broadcasts.
   string vtep_address = 6;
 }
 
@@ -314,7 +345,8 @@ message CreateVMCommand {
   uint32 disk_gib = 5;
   string image = 6;
   bytes bootstrap_data = 7;
-  // Primary IP (on the tree's VXLAN), gateway and prefix are the tree's.
+  // Primary IP (on the cluster's VXLAN); gateway is the cluster's
+  // anycast gateway and prefix is the cluster's.
   string ip_address = 8;
   string gateway = 9;
   uint32 prefix_len = 10;
@@ -323,11 +355,11 @@ message CreateVMCommand {
   repeated string dns_servers = 13;
   repeated string gpu_pci_addresses = 14;
   repeated ExtraDisk extra_disks = 15;
-  // VXLAN Network Identifier of the tree this VM joins at L2. The
-  // agent derives the bridge name from this and attaches the VM's
-  // primary TAP to it. The bridge itself is kept alive by
+  // VXLAN Network Identifier of the cluster this VM joins at L2. The
+  // agent derives the bridge name (`brc<vni>`) from this and attaches
+  // the VM's primary TAP to it. The bridge itself is kept alive by
   // `ReconcileHostCommand` — which precedes this command on the same
-  // mpsc stream whenever a new tree shows up on the host.
+  // mpsc stream whenever a new cluster shows up on the host.
   uint32 vni = 16;
 }
 

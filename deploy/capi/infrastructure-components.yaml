@@ -45,19 +45,28 @@ spec:
             description: |-
               Identifies a cluster that maps 1:1 to a Basis-side cluster.
 
-              User input is just `credentialsRef` (how to reach the basis
-              controller). The tree this cluster joins is *not* encoded here —
-              it's implied by the basis-capi-provider instance doing the
-              reconcile: every cluster the provider creates becomes a child of
-              the cluster the provider itself runs in. See
-              `ProviderContext.parent_cluster_id`.
+              User input is `credentialsRef` (how to reach the basis controller),
+              `externalIpPool` (where the LB Service block — and the apiserver
+              VIP, if public — comes from), `apiserverVisibility` (cell-public
+              vs cluster-private), and the optional `trustDomain` label.
 
-              `controlPlaneEndpoint`, `treeId`, and `vni` are populated by the
+              `controlPlaneEndpoint`, `vni`, and `cidr` are populated by the
               reconciler after basis allocates them — per CAPI convention, the
               infrastructure provider is authoritative for the endpoint and
               CAPI core propagates it onto `Cluster.spec.controlPlaneEndpoint`
               for downstream consumers.
             properties:
+              apiserverVisibility:
+                default: Public
+                description: |-
+                  Where the apiserver VIP lives. `Public` (default) — from
+                  `externalIpPool`, BGP-advertised cell-wide; safe for the root
+                  mgmt cluster. `Private` — from the cluster's CIDR (last
+                  usable), reachable only from inside the cluster's bridge.
+                enum:
+                - Public
+                - Private
+                type: string
               controlPlaneEndpoint:
                 description: |-
                   Populated by the reconciler after `Basis.CreateCluster` returns.
@@ -91,15 +100,11 @@ spec:
                 type: object
               externalIpPool:
                 description: |-
-                  Named LAN pool the cluster's external IPs (apiserver VIP and
-                  LoadBalancer Service block) are carved from. Empty / unset →
-                  the cluster's tree CIDR (nested cluster, no LAN exposure;
-                  reachable only from sibling clusters in the same tree). Any
-                  non-empty name must match a pool in the basis controller's
-                  `network.pools[]`; every host carrying the tree advertises
-                  the allocations via the cell BGP reflector with itself as
-                  next-hop, plus a proxy-ARP entry on the underlay so LAN
-                  clients can reach them.
+                  Named LAN pool the cluster's external IPs come from — the
+                  LoadBalancer Service block always, and the apiserver VIP when
+                  `apiserverVisibility = Public`. Required: must match a pool
+                  in the basis controller's `network.pools[]`. Allocations are
+                  BGP-advertised cell-wide.
                 type: string
               externalServiceIps:
                 description: |-
@@ -116,8 +121,17 @@ spec:
                   `CiliumLoadBalancerIPPool`. Empty when the cluster requested
                   0 service IPs.
                 type: string
+              trustDomain:
+                description: |-
+                  Trust-domain label, propagated to BGP communities in Phase 2
+                  of the network design so VIPs are only installed on hosts
+                  whose local clusters subscribe to the same trust domain.
+                  Empty / unset = untagged (cell-wide propagation).
+                nullable: true
+                type: string
             required:
             - credentialsRef
+            - externalIpPool
             type: object
           status:
             nullable: true
@@ -126,6 +140,12 @@ spec:
                 description: |-
                   Opaque cluster ID returned by `Basis.CreateCluster`. Written once
                   and used on delete.
+                nullable: true
+                type: string
+              cidr:
+                description: |-
+                  CIDR of the cluster's overlay (e.g. `10.42.0.0/24`). Same
+                  observability use as `vni`.
                 nullable: true
                 type: string
               conditions:
@@ -172,15 +192,11 @@ spec:
               ready:
                 default: false
                 type: boolean
-              treeId:
-                description: |-
-                  Tree (trust domain) this cluster belongs to. Observability-only
-                  on the K8s side — consumers that care (Lattice) read it here
-                  to sibling-check across the fleet.
-                nullable: true
-                type: string
               vni:
-                description: VXLAN Network Identifier of the tree. Same purpose as `treeId`.
+                description: |-
+                  VXLAN Network Identifier of the cluster's overlay.
+                  Observability — Lattice reads this to render dashboards and
+                  reason about the fabric.
                 format: uint32
                 minimum: 0.0
                 nullable: true

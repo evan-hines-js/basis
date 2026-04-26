@@ -153,7 +153,7 @@ pub struct ReconcileReport {
 /// Controller-side reconciliation happens later, once the agent connects
 /// and receives `RegisterHostResponse.initial_state` — any local VM not
 /// in that list is deleted by [`crate::handlers::reconcile_against_expected`],
-/// and the tree bridges are built by [`NetworkManager::reconcile_trees`].
+/// and the per-cluster bridges are built by [`NetworkManager::reconcile_clusters`].
 pub async fn reconcile_on_startup(
     config: &HostSpec,
     agent_db: &AgentDb,
@@ -346,11 +346,11 @@ async fn restart_vm(
     })?;
 
     // Controller hasn't connected yet at cold-boot time, so the
-    // tree's peer FDB isn't known — but we can bring the bridge +
+    // cluster's peer FDB isn't known — but we can bring the bridge +
     // VXLAN up with an empty peer set so this VM's TAP can attach.
-    // The first `reconcile_trees` call fills in peers.
+    // The first `reconcile_clusters` call fills in peers.
     net_mgr
-        .ensure_bootstrap_tree(vni)
+        .ensure_bootstrap_cluster(vni)
         .await
         .map_err(|e| RestartError::Other(e.into()))?;
 
