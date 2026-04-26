@@ -16,3 +16,9 @@ basis_lvm_devices:
 # lives in group_vars/all.yml — it's a cell-wide concern, not per-host.
 # Only override here for fields that genuinely vary across hosts in
 # the same cell (none today).
+
+# Enterprise SSDs with PLP — the right tier for control planes.
+# Workers go to `tier: slow` hosts (the NUC) and only fall back here
+# if their requires is satisfied (which it isn't by default).
+basis_host_labels:
+  tier: fast

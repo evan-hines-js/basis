@@ -18,26 +18,35 @@ The **Basis Cluster** dashboard is auto-loaded into the "Basis" folder.
 
 ## Scrape targets
 
-By default, Prometheus scrapes `host.docker.internal:9443` — the Docker
-host's loopback. This works when the Basis controller is running locally
-on the same machine as Docker Desktop.
+`prometheus.yml` is shipped pointing at the current dev cell:
 
-For a **remote controller**, edit `prometheus.yml` and replace the target:
+| Job               | Target            | Host label    |
+|-------------------|-------------------|---------------|
+| basis-controller  | 10.0.0.206:9443   | (n/a — controller self-labels metrics by host id) |
+| basis-agents      | 10.0.0.206:9444   | poweredge-md  |
+| basis-agents      | 10.0.0.97:9444    | poweredge-lg  |
 
-```yaml
-  - job_name: basis-controller
-    static_configs:
-      - targets:
-          - 10.0.0.131:9443
-```
+Each agent target lives in its own `static_configs` group so it can
+carry a per-host `host=` label. The controller-emitted metrics
+(`basis_host_cpu_total{host=...}` etc.) already carry a host label out
+of the box; the agent-emitted metrics (`basis_agent_*`) do not, so this
+label is what makes per-host Grafana panels work.
 
-Then reload without restarting Prometheus:
+For a **different cell**, edit the targets in `prometheus.yml` and reload:
 
 ```sh
 curl -X POST http://localhost:9090/-/reload
 ```
 
-Add agent hosts under the `basis-agents` job the same way.
+Add another agent host as a third group under `basis-agents`:
+
+```yaml
+      - targets:
+          - 10.0.0.42:9444
+        labels:
+          service: basis-agent
+          host: <hostname>
+```
 
 ## Metrics the controller emits
 

@@ -63,6 +63,14 @@ pub struct HostSpec {
     /// changes require a basis-agent restart.
     #[serde(default)]
     pub rank: u32,
+
+    /// Operator-assigned labels (e.g. {"tier": "fast"}). Used by the
+    /// scheduler's per-Machine `placement.requires` (hard filter)
+    /// and `placement.prefers` (soft tiebreak). Default empty means
+    /// "no labels" — the host satisfies only an empty `requires`.
+    /// Reported once at registration; changes require a restart.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 fn default_metrics_listen() -> String {

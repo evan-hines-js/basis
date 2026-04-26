@@ -286,6 +286,45 @@ spec:
                         format: uint32
                         minimum: 0.0
                         type: integer
+                      placement:
+                        description: |-
+                          Optional placement constraints. `requires` is a hard filter
+                          (CreateMachine fails if no host matches); `prefers` is a soft
+                          score added to the scheduler's tiebreak. Default empty: pick
+                          any host that fits, same as today.
+                        properties:
+                          prefers:
+                            items:
+                              properties:
+                                key:
+                                  type: string
+                                value:
+                                  type: string
+                                weight:
+                                  default: 0
+                                  format: uint32
+                                  minimum: 0.0
+                                  type: integer
+                              required:
+                              - key
+                              - value
+                              type: object
+                            type: array
+                          requires:
+                            items:
+                              properties:
+                                key:
+                                  type: string
+                                values:
+                                  items:
+                                    type: string
+                                  type: array
+                              required:
+                              - key
+                              - values
+                              type: object
+                            type: array
+                        type: object
                       providerID:
                         description: |-
                           Set by the provider after CreateMachine succeeds. The JSON field
@@ -389,6 +428,45 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
+              placement:
+                description: |-
+                  Optional placement constraints. `requires` is a hard filter
+                  (CreateMachine fails if no host matches); `prefers` is a soft
+                  score added to the scheduler's tiebreak. Default empty: pick
+                  any host that fits, same as today.
+                properties:
+                  prefers:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        value:
+                          type: string
+                        weight:
+                          default: 0
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                      required:
+                      - key
+                      - value
+                      type: object
+                    type: array
+                  requires:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        values:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - key
+                      - values
+                      type: object
+                    type: array
+                type: object
               providerID:
                 description: |-
                   Set by the provider after CreateMachine succeeds. The JSON field

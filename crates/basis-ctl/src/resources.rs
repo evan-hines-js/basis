@@ -78,6 +78,63 @@ pub struct MachineSpec {
     /// storage operator (Rook/Ceph) can claim them.
     #[serde(default, rename = "extraDiskGibs")]
     pub extra_disk_gibs: Vec<u32>,
+    /// Optional placement constraints (label-based requires/prefers).
+    /// Empty = pick any host that fits.
+    #[serde(default)]
+    pub placement: PlacementSpec,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PlacementSpec {
+    #[serde(default)]
+    pub requires: Vec<PlacementRequirement>,
+    #[serde(default)]
+    pub prefers: Vec<PlacementPreference>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlacementRequirement {
+    pub key: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlacementPreference {
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub weight: u32,
+}
+
+impl PlacementSpec {
+    fn is_empty(&self) -> bool {
+        self.requires.is_empty() && self.prefers.is_empty()
+    }
+
+    fn to_proto(&self) -> Option<basis_proto::PlacementSpec> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(basis_proto::PlacementSpec {
+            requires: self
+                .requires
+                .iter()
+                .map(|r| basis_proto::PlacementRequirement {
+                    key: r.key.clone(),
+                    values: r.values.clone(),
+                })
+                .collect(),
+            prefers: self
+                .prefers
+                .iter()
+                .map(|p| basis_proto::PlacementPreference {
+                    key: p.key.clone(),
+                    value: p.value.clone(),
+                    weight: p.weight,
+                })
+                .collect(),
+        })
+    }
 }
 
 impl MachineSpec {
@@ -111,6 +168,7 @@ impl MachineSpec {
             gpus: self.gpus,
             min_gpu_group_size: self.min_gpu_group_size,
             extra_disk_gibs: self.extra_disk_gibs.clone(),
+            placement: self.placement.to_proto(),
         })
     }
 }

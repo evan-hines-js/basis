@@ -525,6 +525,7 @@ mod tests {
             last_heartbeat: basis_common::time::now_rfc3339(),
             healthy,
             rank: 0,
+            labels: std::collections::BTreeMap::new(),
         }
     }
 

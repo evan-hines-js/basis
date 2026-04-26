@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::str::FromStr;
@@ -137,25 +137,12 @@ impl Db {
                 vtep_address TEXT NOT NULL DEFAULT '',
                 last_heartbeat TEXT NOT NULL,
                 healthy INTEGER NOT NULL DEFAULT 1,
-                rank INTEGER NOT NULL DEFAULT 0
+                rank INTEGER NOT NULL DEFAULT 0,
+                labels TEXT NOT NULL DEFAULT '{}'
             )",
         )
         .execute(&self.writer)
         .await?;
-        // Forward-compat: bring older DBs (created before `rank` was
-        // added) up to the current schema. SQLite errors on duplicate
-        // columns, so we swallow that one specific failure — every
-        // other error still propagates.
-        if let Err(sqlx::Error::Database(e)) = sqlx::query(
-            "ALTER TABLE hosts ADD COLUMN rank INTEGER NOT NULL DEFAULT 0",
-        )
-        .execute(&self.writer)
-        .await
-        {
-            if !e.message().contains("duplicate column") {
-                return Err(DbError::Sqlx(sqlx::Error::Database(e)));
-            }
-        }
 
         // Per-cluster network identity:
         //   * `vni` — VXLAN Network Identifier, unique cell-wide.
@@ -871,8 +858,8 @@ impl Db {
     pub async fn upsert_host(&self, host: &HostRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO hosts (id, hostname, total_cpu, total_memory_mib, total_disk_gib,
-                gpu_inventory, vtep_address, last_heartbeat, healthy, rank)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gpu_inventory, vtep_address, last_heartbeat, healthy, rank, labels)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 hostname = excluded.hostname,
                 total_cpu = excluded.total_cpu,
@@ -882,7 +869,8 @@ impl Db {
                 vtep_address = excluded.vtep_address,
                 last_heartbeat = excluded.last_heartbeat,
                 healthy = excluded.healthy,
-                rank = excluded.rank",
+                rank = excluded.rank,
+                labels = excluded.labels",
         )
         .bind(&host.id)
         .bind(&host.hostname)
@@ -897,6 +885,10 @@ impl Db {
         .bind(&host.last_heartbeat)
         .bind(host.healthy)
         .bind(host.rank)
+        .bind(
+            serde_json::to_string(&host.labels)
+                .expect("serializing BTreeMap<String, String> to JSON is infallible"),
+        )
         .execute(&self.writer)
         .await?;
         Ok(())
@@ -1366,6 +1358,14 @@ pub struct HostRow {
     /// operators bump deprioritized hosts (e.g. consumer-disk boxes
     /// that shouldn't carry etcd) to a higher number.
     pub rank: i64,
+    /// Operator-assigned labels (e.g. {"tier": "fast"}). Empty by
+    /// default. Consulted by `PlacementSpec.requires` (hard filter)
+    /// and `PlacementSpec.prefers` (soft tiebreak). Stored as JSON
+    /// in the `labels` column — `BTreeMap` for deterministic ordering
+    /// in logs, debug output, and snapshots. The schema doesn't need
+    /// to know the label vocabulary up front.
+    #[sqlx(json)]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1636,6 +1636,7 @@ mod tests {
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,
             rank: 0,
+            labels: BTreeMap::new(),
         }
     }
 

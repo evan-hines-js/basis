@@ -199,6 +199,12 @@ pub struct BasisMachineSpec {
     /// the N'th entry becomes `/dev/vd{c,d,...}` in the guest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_disk_gibs: Vec<u32>,
+    /// Optional placement constraints. `requires` is a hard filter
+    /// (CreateMachine fails if no host matches); `prefers` is a soft
+    /// score added to the scheduler's tiebreak. Default empty: pick
+    /// any host that fits, same as today.
+    #[serde(default, skip_serializing_if = "PlacementSpec::is_empty")]
+    pub placement: PlacementSpec,
     /// Set by the provider after CreateMachine succeeds. The JSON field
     /// is `providerID` (not `providerId`) to match the CAPI contract.
     #[serde(
@@ -214,6 +220,37 @@ pub struct BasisMachineSpec {
 pub struct GpuConstraints {
     #[serde(default)]
     pub min_group_size: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<PlacementRequirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefers: Vec<PlacementPreference>,
+}
+
+impl PlacementSpec {
+    fn is_empty(&self) -> bool {
+        self.requires.is_empty() && self.prefers.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementRequirement {
+    pub key: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementPreference {
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub weight: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]

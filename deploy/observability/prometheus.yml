@@ -16,8 +16,11 @@ scrape_configs:
           service: basis-controller
 
   # Basis agents - one target per host on port 9444 (configurable via
-  # spec.metricsListen in the Host YAML). Fill in the list below or
-  # replace with a file_sd_config once an inventory file exists.
+  # spec.metricsListen in the Host YAML). One static_configs group per
+  # host so each can carry its own `host=` label; the controller's
+  # cluster-level metrics already self-label by host id, but the
+  # agent-level metrics (basis_agent_*) don't, so this label is what
+  # makes per-host panels work in Grafana.
   - job_name: basis-agents
     metrics_path: /metrics
     static_configs:
@@ -25,3 +28,9 @@ scrape_configs:
           - 10.0.0.206:9444
         labels:
           service: basis-agent
+          host: poweredge-md
+      - targets:
+          - 10.0.0.97:9444
+        labels:
+          service: basis-agent
+          host: poweredge-lg

@@ -7,8 +7,96 @@ use crate::db::{HostRow, HostUsage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
+    /// No host has enough free CPU/memory/disk/GPUs for this request.
     #[error("no host can satisfy request: {0}")]
     NoCapacity(String),
+
+    /// Capacity exists, but no candidate host satisfies the request's
+    /// hard `placement.requires` filter. Distinct from `NoCapacity` so
+    /// operators can tell "you need to add capacity" from "you need to
+    /// label a host (or relax the requirement)".
+    #[error("no host satisfies placement requirements: {0}")]
+    UnsatisfiedRequirements(String),
+}
+
+/// Hard placement filter: `host.labels[key]` must be one of `values`.
+/// Empty `values` is a parse bug — the scheduler treats such an entry
+/// as un-satisfiable, which is the safe default if a CRD ever ships an
+/// empty list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementRequirement {
+    pub key: String,
+    pub values: Vec<String>,
+}
+
+/// Soft placement preference: when the host has `key=value`, add
+/// `weight` to the candidate's preference score. Multiple matches
+/// across different keys sum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementPreference {
+    pub key: String,
+    pub value: String,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Placement {
+    pub requires: Vec<PlacementRequirement>,
+    pub prefers: Vec<PlacementPreference>,
+}
+
+impl Placement {
+    /// True iff every requirement is satisfied by `host_labels`.
+    fn satisfies(&self, host_labels: &std::collections::BTreeMap<String, String>) -> bool {
+        self.requires.iter().all(|req| {
+            host_labels
+                .get(&req.key)
+                .map(|v| req.values.iter().any(|allowed| allowed == v))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Sum of preference weights matched by `host_labels`. Zero when
+    /// no preferences are declared or none match.
+    fn score(&self, host_labels: &std::collections::BTreeMap<String, String>) -> u32 {
+        self.prefers
+            .iter()
+            .filter(|p| host_labels.get(&p.key).is_some_and(|v| v == &p.value))
+            .map(|p| p.weight)
+            .sum()
+    }
+
+    fn describe_requires(&self) -> String {
+        self.requires
+            .iter()
+            .map(|r| format!("{}={:?}", r.key, r.values))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl From<basis_proto::PlacementSpec> for Placement {
+    fn from(spec: basis_proto::PlacementSpec) -> Self {
+        Self {
+            requires: spec
+                .requires
+                .into_iter()
+                .map(|r| PlacementRequirement {
+                    key: r.key,
+                    values: r.values,
+                })
+                .collect(),
+            prefers: spec
+                .prefers
+                .into_iter()
+                .map(|p| PlacementPreference {
+                    key: p.key,
+                    value: p.value,
+                    weight: p.weight,
+                })
+                .collect(),
+        }
+    }
 }
 
 pub struct ScheduleRequest {
@@ -26,6 +114,9 @@ pub struct ScheduleRequest {
     pub disk_gib: u32,
     pub gpus: u32,
     pub min_group_size: u32,
+    /// Operator-supplied placement constraints. Empty by default, in
+    /// which case the scheduler picks any host that fits.
+    pub placement: Placement,
 }
 
 impl From<&CreateMachineRequest> for ScheduleRequest {
@@ -42,6 +133,7 @@ impl From<&CreateMachineRequest> for ScheduleRequest {
                 .as_ref()
                 .map(|c| c.min_group_size)
                 .unwrap_or(0),
+            placement: req.placement.clone().map(Placement::from).unwrap_or_default(),
         }
     }
 }
@@ -85,10 +177,51 @@ impl Available {
     }
 }
 
+/// Composite score used to pick the best candidate. Field order is
+/// the tiebreak order: `Ord` derives lex compare across the tuple.
+///
+/// Each field's polarity matches "higher is better" so the scheduler
+/// can pick `.max_by_key` without per-field flips:
+/// - `gpu_score`: higher = better topology fit
+/// - `negative_cluster_mates`: stored negated so fewer mates wins
+/// - `prefers_score`: higher = more preference matches
+/// - `negative_rank`: stored negated so lower rank wins
+/// - `remaining_after`: tie-of-last-resort, smallest remaining wins
+///
+/// Storing negated values keeps the comparator a single derived `Ord`
+/// — much easier to test than a chain of `.then_with` flips.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CandidateScore {
+    gpu_score: i32,
+    negative_cluster_mates: i64,
+    prefers_score: u32,
+    negative_rank: i64,
+    // Best-fit. Wrapped in `std::cmp::Reverse` at compare time would
+    // also work, but inverting here keeps the type plain `Ord`.
+    negative_remaining_after: i64,
+}
+
+struct Candidate<'h> {
+    host: &'h HostRow,
+    score: CandidateScore,
+    selected_gpus: Vec<GpuInfo>,
+}
+
 /// Pick the best host for a VM request and return the GPUs selected
 /// on that host. The controller is the authoritative source of
 /// capacity: `usage_by_host` comes from `Db::host_usage_snapshot`
 /// and drives both the fit check and the already-claimed-GPU filter.
+///
+/// Tiebreak chain (encoded in `CandidateScore`'s field order):
+/// - capacity + GPU-availability + placement.requires: hard filters
+/// - GPU topology score: workload fit (NVLink affinity)
+/// - anti-affinity: spread same-cluster VMs across hosts
+/// - placement.prefers score: per-Machine soft preference (e.g.
+///   "this CP prefers tier=fast"). Above rank because it's a
+///   per-workload signal — more specific than a per-host one.
+/// - rank: per-host operator preference (e.g. "deprioritize the
+///   consumer-disk box")
+/// - best-fit bin-packing: smallest remaining capacity wins
 pub fn schedule(
     hosts: &[HostRow],
     usage_by_host: &HashMap<String, HostUsage>,
@@ -96,9 +229,18 @@ pub fn schedule(
     cpu_overcommit_ratio: f32,
 ) -> Result<(String, Vec<GpuInfo>), SchedulerError> {
     let empty = HostUsage::default();
-    let mut candidates: Vec<(&HostRow, i32, Vec<GpuInfo>, Available, u32)> = Vec::new();
+    let mut candidates: Vec<Candidate<'_>> = Vec::new();
+    // Track separately whether *any* host passed the requires filter.
+    // Lets us return `UnsatisfiedRequirements` only when requires is
+    // the actual cause — vs. `NoCapacity` for the more common case.
+    let mut any_passed_requires = false;
 
     for host in hosts.iter().filter(|h| h.healthy) {
+        if !req.placement.satisfies(&host.labels) {
+            continue;
+        }
+        any_passed_requires = true;
+
         let usage = usage_by_host.get(&host.id).unwrap_or(&empty);
         let avail = Available::from(host, usage, cpu_overcommit_ratio);
         if !avail.fits(req) {
@@ -112,7 +254,7 @@ pub fn schedule(
             .cloned()
             .collect();
 
-        let (score, selected) = if req.gpus > 0 {
+        let (gpu_score, selected_gpus) = if req.gpus > 0 {
             let (score, selected) = gpu_topology_score(&free_gpus, req.gpus, req.min_group_size);
             if selected.is_empty() {
                 continue;
@@ -132,35 +274,35 @@ pub fn schedule(
                 .unwrap_or(0)
         };
 
-        candidates.push((host, score, selected, avail, cluster_mates));
+        candidates.push(Candidate {
+            host,
+            score: CandidateScore {
+                gpu_score,
+                negative_cluster_mates: -(cluster_mates as i64),
+                prefers_score: req.placement.score(&host.labels),
+                negative_rank: -host.rank,
+                negative_remaining_after: -(avail.remaining_after(req) as i64),
+            },
+            selected_gpus,
+        });
     }
 
-    let (host, _score, selected, _, _) = candidates
-        .into_iter()
-        // Order: GPU-topology score (higher wins) → soft anti-affinity
-        // (fewer same-cluster VMs wins) → operator-assigned rank
-        // (lower wins; lets you say "prefer .206 for control plane")
-        // → best-fit bin-packing (smallest remaining wins).
-        //
-        // Rank sits below the workload-shape signals (GPU + anti-
-        // affinity) so an operator preference can't override a real
-        // placement constraint, but above best-fit so two equally-fit
-        // hosts go to the lower-rank one — which is what the operator
-        // actually meant by setting the rank.
-        .max_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.4.cmp(&a.4))
-                .then_with(|| b.0.rank.cmp(&a.0.rank))
-                .then_with(|| b.3.remaining_after(req).cmp(&a.3.remaining_after(req)))
-        })
-        .ok_or_else(|| {
+    if candidates.is_empty() {
+        return Err(if !any_passed_requires && !req.placement.requires.is_empty() {
+            SchedulerError::UnsatisfiedRequirements(req.placement.describe_requires())
+        } else {
             SchedulerError::NoCapacity(format!(
                 "cpu={}, mem={}MiB, disk={}GiB, gpus={}",
                 req.cpu, req.memory_mib, req.disk_gib, req.gpus
             ))
-        })?;
+        });
+    }
 
-    Ok((host.id.clone(), selected))
+    let winner = candidates
+        .into_iter()
+        .max_by(|a, b| a.score.cmp(&b.score))
+        .expect("checked non-empty above");
+    Ok((winner.host.id.clone(), winner.selected_gpus))
 }
 
 /// Score GPU topology and return the selected GPUs.
@@ -237,7 +379,21 @@ mod tests {
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
             healthy: true,
             rank: 0,
+            labels: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn with_labels(mut h: HostRow, labels: &[(&str, &str)]) -> HostRow {
+        h.labels = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        h
+    }
+
+    fn with_rank(mut h: HostRow, rank: i64) -> HostRow {
+        h.rank = rank;
+        h
     }
 
     fn gpu(pci: &str, nvlink_group: u32) -> GpuInfo {
@@ -257,6 +413,14 @@ mod tests {
             disk_gib: 100,
             gpus,
             min_group_size: min_group,
+            placement: Placement::default(),
+        }
+    }
+
+    fn req_with_placement(p: Placement) -> ScheduleRequest {
+        ScheduleRequest {
+            placement: p,
+            ..basic_req(0, 0)
         }
     }
 
@@ -310,14 +474,15 @@ mod tests {
     fn test_schedule_no_capacity() {
         let hosts = vec![make_host("h1", 2, 4096, 50, &[])];
         let req = ScheduleRequest {
-            cluster_id: String::new(),
             cpu: 8,
             memory_mib: 16384,
             disk_gib: 100,
-            gpus: 0,
-            min_group_size: 0,
+            ..basic_req(0, 0)
         };
-        assert!(schedule(&hosts, &empty(), &req, STRICT).is_err());
+        assert!(matches!(
+            schedule(&hosts, &empty(), &req, STRICT),
+            Err(SchedulerError::NoCapacity(_))
+        ));
     }
 
     #[test]
@@ -350,12 +515,10 @@ mod tests {
     #[test]
     fn test_schedule_empty_hosts_returns_error() {
         let req = ScheduleRequest {
-            cluster_id: String::new(),
             cpu: 1,
             memory_mib: 1024,
             disk_gib: 10,
-            gpus: 0,
-            min_group_size: 0,
+            ..basic_req(0, 0)
         };
         assert!(schedule(&[], &empty(), &req, STRICT).is_err());
     }
@@ -395,12 +558,8 @@ mod tests {
         let mut usage_by_host = HashMap::new();
         usage_by_host.insert("h1".to_string(), usage(4, 8192, 400, &[]));
         let req = ScheduleRequest {
-            cluster_id: String::new(),
-            cpu: 4,
-            memory_mib: 8192,
             disk_gib: 150,
-            gpus: 0,
-            min_group_size: 0,
+            ..basic_req(0, 0)
         };
         assert!(schedule(&hosts, &usage_by_host, &req, STRICT).is_err());
     }
@@ -424,6 +583,7 @@ mod tests {
                 basis_proto::ExtraDisk { size_gib: 400 },
                 basis_proto::ExtraDisk { size_gib: 100 },
             ],
+            placement: None,
         };
         let sched_req: ScheduleRequest = (&req).into();
         assert_eq!(sched_req.disk_gib, 600);
@@ -545,11 +705,7 @@ mod tests {
 
         let req = ScheduleRequest {
             cluster_id: "c1".into(),
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 0,
-            min_group_size: 0,
+            ..basic_req(0, 0)
         };
         let (host_id, _) = schedule(&hosts, &usage_by_host, &req, STRICT).unwrap();
         assert_eq!(host_id, "h2", "anti-affinity should outweigh tighter fit");
@@ -569,11 +725,7 @@ mod tests {
 
         let req = ScheduleRequest {
             cluster_id: "c2".into(),
-            cpu: 4,
-            memory_mib: 8192,
-            disk_gib: 100,
-            gpus: 0,
-            min_group_size: 0,
+            ..basic_req(0, 0)
         };
         let (host_id, _) = schedule(&hosts, &usage_by_host, &req, STRICT).unwrap();
         assert_eq!(host_id, "h1", "different cluster — best-fit wins");
@@ -587,12 +739,9 @@ mod tests {
         let mut usage_by_host = HashMap::new();
         usage_by_host.insert("h1".to_string(), usage(16, 8192, 50, &[]));
         let req = ScheduleRequest {
-            cluster_id: String::new(),
             cpu: 16,
-            memory_mib: 8192,
             disk_gib: 50,
-            gpus: 0,
-            min_group_size: 0,
+            ..basic_req(0, 0)
         };
         assert!(schedule(&hosts, &usage_by_host, &req, 1.0).is_err());
         let (host_id, _) = schedule(&hosts, &usage_by_host, &req, 2.0).unwrap();
@@ -607,12 +756,10 @@ mod tests {
         let mut usage_by_host = HashMap::new();
         usage_by_host.insert("h1".to_string(), usage(2, 8192, 10, &[]));
         let req = ScheduleRequest {
-            cluster_id: String::new(),
             cpu: 2,
             memory_mib: 1024,
             disk_gib: 10,
-            gpus: 0,
-            min_group_size: 0,
+            ..basic_req(0, 0)
         };
         assert!(schedule(&hosts, &usage_by_host, &req, 8.0).is_err());
 
@@ -629,5 +776,136 @@ mod tests {
         let mut usage_by_host = HashMap::new();
         usage_by_host.insert("h1".to_string(), usage(14, 8192, 50, &[]));
         assert!(schedule(&hosts, &usage_by_host, &basic_req(0, 0), 1.0).is_err());
+    }
+
+    // --- Placement (labels) ---
+
+    #[test]
+    fn placement_requires_filters_out_non_matching_hosts() {
+        // Two roomy hosts; only one carries the required label. Even
+        // though the other has plenty of capacity, the requires
+        // filter is hard, so it must not be considered.
+        let hosts = vec![
+            with_labels(make_host("fast", 16, 65536, 1000, &[]), &[("tier", "fast")]),
+            make_host("bulk", 16, 65536, 1000, &[]),
+        ];
+        let req = req_with_placement(Placement {
+            requires: vec![PlacementRequirement {
+                key: "tier".into(),
+                values: vec!["fast".into()],
+            }],
+            prefers: vec![],
+        });
+        let (host_id, _) = schedule(&hosts, &empty(), &req, STRICT).unwrap();
+        assert_eq!(host_id, "fast");
+    }
+
+    #[test]
+    fn placement_requires_no_match_returns_unsatisfied_requirements() {
+        // Unsatisfiable requires must surface as a distinct error so
+        // operators can tell "label your host" from "add capacity".
+        let hosts = vec![make_host("h1", 16, 65536, 1000, &[])];
+        let req = req_with_placement(Placement {
+            requires: vec![PlacementRequirement {
+                key: "tier".into(),
+                values: vec!["fast".into()],
+            }],
+            prefers: vec![],
+        });
+        assert!(matches!(
+            schedule(&hosts, &empty(), &req, STRICT),
+            Err(SchedulerError::UnsatisfiedRequirements(_))
+        ));
+    }
+
+    #[test]
+    fn placement_prefers_breaks_ties_in_favor_of_matching_host() {
+        // Both hosts fit, no anti-affinity, no GPU difference. Only
+        // the prefers score should decide.
+        let hosts = vec![
+            make_host("plain", 16, 65536, 1000, &[]),
+            with_labels(make_host("fast", 16, 65536, 1000, &[]), &[("tier", "fast")]),
+        ];
+        let req = req_with_placement(Placement {
+            requires: vec![],
+            prefers: vec![PlacementPreference {
+                key: "tier".into(),
+                value: "fast".into(),
+                weight: 100,
+            }],
+        });
+        let (host_id, _) = schedule(&hosts, &empty(), &req, STRICT).unwrap();
+        assert_eq!(host_id, "fast");
+    }
+
+    #[test]
+    fn placement_prefers_loses_to_anti_affinity() {
+        // The "fast" host already has a cluster mate; the unlabeled
+        // host doesn't. Anti-affinity sits above prefers in the chain
+        // — spreading the cluster wins over the operator's tier hint.
+        // Models the "first VM goes to fast, subsequent ones spread"
+        // behavior callers actually want.
+        let hosts = vec![
+            with_labels(make_host("fast", 16, 65536, 1000, &[]), &[("tier", "fast")]),
+            make_host("bulk", 16, 65536, 1000, &[]),
+        ];
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert(
+            "fast".to_string(),
+            usage_with_cluster(4, 8192, 100, "c1", 1),
+        );
+        let req = ScheduleRequest {
+            cluster_id: "c1".into(),
+            ..req_with_placement(Placement {
+                requires: vec![],
+                prefers: vec![PlacementPreference {
+                    key: "tier".into(),
+                    value: "fast".into(),
+                    weight: 100,
+                }],
+            })
+        };
+        let (host_id, _) = schedule(&hosts, &usage_by_host, &req, STRICT).unwrap();
+        assert_eq!(host_id, "bulk");
+    }
+
+    #[test]
+    fn placement_prefers_beats_rank() {
+        // The "fast" host carries a higher rank (worse tiebreak) but
+        // matches the workload's prefers — and prefers sits above rank
+        // in the chain, so the workload preference wins.
+        let hosts = vec![
+            with_rank(
+                with_labels(make_host("fast", 16, 65536, 1000, &[]), &[("tier", "fast")]),
+                10,
+            ),
+            make_host("bulk", 16, 65536, 1000, &[]),
+        ];
+        let req = req_with_placement(Placement {
+            requires: vec![],
+            prefers: vec![PlacementPreference {
+                key: "tier".into(),
+                value: "fast".into(),
+                weight: 100,
+            }],
+        });
+        let (host_id, _) = schedule(&hosts, &empty(), &req, STRICT).unwrap();
+        assert_eq!(host_id, "fast");
+    }
+
+    #[test]
+    fn placement_empty_is_no_op() {
+        // Sanity: empty placement leaves the scheduler in pre-placement
+        // behavior. Two equal hosts → best-fit / arbitrary tie.
+        let hosts = vec![
+            with_labels(
+                make_host("labelled", 16, 65536, 1000, &[]),
+                &[("tier", "fast")],
+            ),
+            make_host("plain", 16, 65536, 1000, &[]),
+        ];
+        // Both hosts are valid; we just assert the call succeeds and
+        // doesn't crash on the empty placement path.
+        assert!(schedule(&hosts, &empty(), &basic_req(0, 0), STRICT).is_ok());
     }
 }

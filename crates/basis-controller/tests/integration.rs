@@ -197,6 +197,7 @@ async fn register_agent(
             gpus: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
             rank: 0,
+            labels: std::collections::HashMap::new(),
         })),
     })
     .await
@@ -231,6 +232,7 @@ fn basic_machine_req(name: &str, cluster_id: &str) -> CreateMachineRequest {
         gpus: 0,
         gpu_constraints: None,
         extra_disks: Vec::new(),
+        placement: None,
     }
 }
 
@@ -573,6 +575,7 @@ async fn test_create_machine_no_agent() {
         last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
         healthy: true,
         rank: 0,
+        labels: std::collections::BTreeMap::new(),
     })
     .await
     .unwrap();
@@ -696,6 +699,7 @@ async fn test_agent_cn_must_match_registered_hostname() {
             gpus: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
             rank: 0,
+            labels: std::collections::HashMap::new(),
         })),
     })
     .await

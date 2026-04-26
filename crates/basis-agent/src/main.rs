@@ -421,6 +421,7 @@ async fn send_register(
                 gpus: gpu_devices,
                 vtep_address: rt.vtep_address.clone(),
                 rank: rt.spec.rank,
+                labels: rt.spec.labels.clone().into_iter().collect(),
             })),
         })
         .await?;

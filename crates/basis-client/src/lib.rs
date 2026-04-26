@@ -120,6 +120,10 @@ pub struct MachineRequest {
     /// size in GiB. Order is stable and becomes the guest virtio-blk
     /// enumeration order after rootfs + cloud-init.
     pub extra_disk_gibs: Vec<u32>,
+    /// Optional placement constraints (label-based requires/prefers).
+    /// `None` means no constraint — the scheduler picks any host that
+    /// fits, identical to today's pre-placement behavior.
+    pub placement: Option<basis_proto::PlacementSpec>,
 }
 
 /// Inputs to `create_cluster`.
@@ -315,6 +319,7 @@ impl BasisClient {
                 .into_iter()
                 .map(|size_gib| ExtraDisk { size_gib })
                 .collect(),
+            placement: req.placement,
         };
         let resp = self
             .call(|mut c| {

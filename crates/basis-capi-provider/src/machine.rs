@@ -225,6 +225,7 @@ async fn apply(
                 .as_ref()
                 .map(|c| c.min_group_size),
             extra_disk_gibs: machine.spec.extra_disk_gibs.clone(),
+            placement: placement_spec_to_proto(&machine.spec.placement),
         })
         .await?;
 
@@ -536,6 +537,37 @@ async fn find_bootstrap_secret(
         .ok_or(MachineError::WaitingForCapi(
             "Machine.spec.bootstrap.dataSecretName",
         ))
+}
+
+/// Map the CRD's PlacementSpec to the proto sent to basis-controller.
+/// Returns `None` for an empty spec so the wire form stays minimal —
+/// the proto field is optional, and the server treats absent the same
+/// as both lists empty.
+fn placement_spec_to_proto(
+    spec: &crate::crds::PlacementSpec,
+) -> Option<basis_proto::PlacementSpec> {
+    if spec.requires.is_empty() && spec.prefers.is_empty() {
+        return None;
+    }
+    Some(basis_proto::PlacementSpec {
+        requires: spec
+            .requires
+            .iter()
+            .map(|r| basis_proto::PlacementRequirement {
+                key: r.key.clone(),
+                values: r.values.clone(),
+            })
+            .collect(),
+        prefers: spec
+            .prefers
+            .iter()
+            .map(|p| basis_proto::PlacementPreference {
+                key: p.key.clone(),
+                value: p.value.clone(),
+                weight: p.weight,
+            })
+            .collect(),
+    })
 }
 
 fn error_policy(

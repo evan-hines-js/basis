@@ -169,6 +169,12 @@ basis_agent_registries: []
 # value other than 0.
 basis_host_rank: 0
 
+# Operator-assigned labels (e.g. {tier: fast, gpu: h100}). Used by
+# Machine specs that declare `placement.requires` (hard filter) or
+# `placement.prefers` (soft tiebreak). Default empty — a host with no
+# labels satisfies only an empty `requires`. Per-host override.
+basis_host_labels: {}
+
 # Per-host bridge name. Set to `vmbr0` when colocating Basis on hosts
 # that already run Proxmox — the agent skips bridge creation if one
 # by this name already exists, and Basis's VMs end up on the same L2

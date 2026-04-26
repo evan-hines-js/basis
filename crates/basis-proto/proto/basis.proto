@@ -144,6 +144,40 @@ message CreateMachineRequest {
   // handed to the guest unformatted so an in-cluster storage operator
   // (Rook/Ceph) can claim and manage them directly.
   repeated ExtraDisk extra_disks = 10;
+  // Optional placement spec. Both `requires` and `prefers` default to
+  // empty — empty means "no constraint" and the scheduler picks
+  // wherever capacity fits, same as today.
+  PlacementSpec placement = 11;
+}
+
+// Operator-supplied placement constraints, layered on top of the
+// scheduler's built-in capacity / GPU / anti-affinity logic.
+//
+// Both lists default to empty, which means "no constraint": empty
+// `requires` matches every host, empty `prefers` adds zero score.
+// This keeps placement 100% optional — labelling is incremental.
+message PlacementSpec {
+  // Hard filter. A host satisfies a single requirement when its
+  // labels contain `key` with a value in `values`. The host must
+  // satisfy *every* entry in this list. CreateMachine fails with
+  // `FailedPrecondition` when no host satisfies all entries —
+  // distinguishable from the "out of capacity" failure.
+  repeated PlacementRequirement requires = 1;
+  // Soft tiebreaker. Each match contributes `weight` to the host's
+  // score; the scheduler prefers higher scores. Sits between the
+  // anti-affinity tiebreak and the per-host `rank` knob.
+  repeated PlacementPreference prefers = 2;
+}
+
+message PlacementRequirement {
+  string key = 1;
+  repeated string values = 2;
+}
+
+message PlacementPreference {
+  string key = 1;
+  string value = 2;
+  uint32 weight = 3;
 }
 
 message ExtraDisk {
@@ -330,6 +364,13 @@ message RegisterHostRequest {
   // higher number. Reported once at registration and stored on
   // `hosts`; change requires a basis-agent restart.
   uint32 rank = 7;
+  // Operator-assigned labels (e.g. {"tier": "fast", "gpu": "h100"}).
+  // Used by `PlacementSpec.requires` (hard filter) and
+  // `PlacementSpec.prefers` (soft score). Default empty means "no
+  // labels"; a host with no labels satisfies only an empty `requires`.
+  // Reported once at registration; change requires a basis-agent
+  // restart.
+  map<string, string> labels = 8;
 }
 
 // Liveness ping. The controller learns *which* host this came from

@@ -9,9 +9,8 @@
 basis_lvm_devices:
   - /dev/sdf
 
-# Deprioritize this host vs node-2 for placement: node-2 has enterprise
-# SSDs with PLP, this NUC has a single SATA drive shared with PVE. The
-# scheduler still uses both — anti-affinity spreads multi-VM clusters
-# across them — but the *first* VM in any cluster (notably control
-# planes) lands on node-2 by default.
-basis_host_rank: 10
+# Single SATA drive shared with PVE — only good enough for workers.
+# CP with `prefers: tier=fast` falls back here if no fast host is up;
+# workers with `requires: tier=slow` land here exclusively.
+basis_host_labels:
+  tier: slow

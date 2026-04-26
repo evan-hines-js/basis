@@ -25,3 +25,9 @@ spec:
 {% endfor %}
 {% endif %}
   rank: {{ basis_host_rank }}
+{% if basis_host_labels %}
+  labels:
+{% for k, v in (basis_host_labels | dictsort) %}
+    {{ k }}: {{ v }}
+{% endfor %}
+{% endif %}

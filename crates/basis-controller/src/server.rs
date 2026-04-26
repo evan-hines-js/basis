@@ -615,6 +615,26 @@ impl BasisApiService {
                 );
                 Err(Status::resource_exhausted(msg))
             }
+            Err(SchedulerError::UnsatisfiedRequirements(msg)) => {
+                // Distinct from NoCapacity: a host with the right
+                // labels exists somewhere or could be added; capacity
+                // would just be more of the same wrong shape. Use
+                // FAILED_PRECONDITION (operator must change inputs)
+                // rather than RESOURCE_EXHAUSTED (try again later).
+                self.shared
+                    .metrics
+                    .scheduler_decisions_total
+                    .with_label_values(&["unsatisfied_requirements"])
+                    .inc();
+                warn!(
+                    requires = %msg,
+                    healthy_hosts = hosts.len(),
+                    "scheduler rejected VM: no host satisfies placement requirements"
+                );
+                Err(Status::failed_precondition(format!(
+                    "no host satisfies placement requirements: {msg}"
+                )))
+            }
         }
     }
 
@@ -1574,6 +1594,7 @@ impl BasisAgentService {
             last_heartbeat: now_rfc3339(),
             healthy: true,
             rank: register.rank as i64,
+            labels: register.labels.clone().into_iter().collect(),
         };
         self.shared
             .db
