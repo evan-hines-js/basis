@@ -67,7 +67,7 @@ struct AgentRuntime {
     gpus: Vec<GpuInfo>,
     /// Probed once at startup and reported on every RegisterHost so
     /// the controller can add this host to the VTEP peer list of any
-    /// tree it hosts.
+    /// cluster overlay it carries.
     vtep_address: String,
     reconnect_signal: CancellationToken,
     /// Lazily started in `handshake` once the controller's first
@@ -441,7 +441,7 @@ async fn handshake(
     let bgp_reflector = ack.bgp_reflector_address.clone();
     let initial = ack.initial_state;
 
-    // Apply tree + VM reconcile and persist the host id while we
+    // Apply cluster + VM reconcile and persist the host id while we
     // hold the read guard.
     {
         let rt = runtime.read().await;

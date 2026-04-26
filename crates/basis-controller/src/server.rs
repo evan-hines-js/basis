@@ -35,9 +35,9 @@ fn db_status(e: DbError) -> Status {
         DbError::NotFound(_) => Status::not_found(e.to_string()),
         DbError::Conflict(_) => Status::already_exists(e.to_string()),
         DbError::Exhausted(_) => Status::resource_exhausted(e.to_string()),
-        DbError::HostUnavailable(_) | DbError::CapacityRaced(_) => {
-            Status::unavailable(e.to_string())
-        }
+        DbError::HostUnavailable(_)
+        | DbError::CapacityRaced(_)
+        | DbError::AllocationRaced(_) => Status::unavailable(e.to_string()),
         DbError::Sqlx(_) | DbError::Migrate(_) | DbError::Malformed(_) => {
             Status::internal(e.to_string())
         }
@@ -257,7 +257,14 @@ impl SharedCtx {
             // itself is intentionally NOT advertised: VM IPs are
             // private to the cluster's bridge, no inter-cluster L3.
             let mut cluster_vips: Vec<String> = Vec::with_capacity(2);
-            if cluster.apiserver_visibility == 0 {
+            let visibility = ApiserverVisibility::try_from(cluster.apiserver_visibility as i32)
+                .map_err(|_| {
+                    DbError::Malformed(format!(
+                        "cluster {} has unknown apiserver_visibility {}",
+                        cluster.id, cluster.apiserver_visibility,
+                    ))
+                })?;
+            if visibility == ApiserverVisibility::ApiserverPublic {
                 if let Ok(vip) = cluster
                     .control_plane_endpoint
                     .parse::<std::net::Ipv4Addr>()
@@ -296,13 +303,21 @@ impl SharedCtx {
             }
         };
         if let Some(agent) = self.agents.get(host_id) {
-            let _ = agent
+            if let Err(e) = agent
                 .command_tx
                 .send(ControllerCommand {
                     request_id: String::new(),
                     command: Some(controller_command::Command::ReconcileHost(Box::new(cmd))),
                 })
-                .await;
+                .await
+            {
+                // Channel send only fails when the per-agent task is
+                // gone (i.e. the agent disconnected). Recovery is
+                // implicit: on reconnect the agent gets a fresh
+                // reconcile from `register_host`. Trace-only so the
+                // diagnostic exists without spamming on routine churn.
+                tracing::trace!(host_id, error = %e, "push_reconcile: agent channel closed");
+            }
         }
     }
 
@@ -769,8 +784,13 @@ impl basis_server::Basis for BasisApiService {
     ) -> Result<Response<CreateClusterResponse>, Status> {
         require_capi_caller(&request)?;
         let req = request.into_inner();
-        let visibility = ApiserverVisibility::try_from(req.apiserver_visibility)
-            .unwrap_or(ApiserverVisibility::ApiserverPublic);
+        let visibility =
+            ApiserverVisibility::try_from(req.apiserver_visibility).map_err(|_| {
+                Status::invalid_argument(format!(
+                    "unknown apiserver_visibility {}",
+                    req.apiserver_visibility,
+                ))
+            })?;
         info!(
             name = %req.name,
             external_pool = %req.external_ip_pool,
@@ -812,72 +832,87 @@ impl basis_server::Basis for BasisApiService {
             return Ok(Response::new(create_cluster_response(&existing)));
         }
 
-        // Allocate this cluster's network identity (vni + cidr). Held
-        // by-value until insert_cluster commits the row — the row's
-        // UNIQUE (vni) constraint protects against concurrent creates
-        // racing on the same VNI, and any rollback path before the
-        // insert just discards the value (no separate trees table to
-        // clean up).
-        let cluster_network = self
-            .shared
-            .db
-            .allocate_cluster_network(&self.shared.network)
-            .await
-            .map_err(db_status)?;
+        // Allocate-and-insert is wrapped in a bounded retry: the
+        // pre-insert allocator (`allocate_cluster_network`) only reads
+        // from `clusters`, so two concurrent creates can pick the same
+        // (vni, cidr) and one loses the UNIQUE constraint at insert
+        // time. On that race we release any IPs we pre-allocated and
+        // re-pick — the loser's snapshot now sees the winner's row and
+        // moves to the next free slot. Bounded so a wedged allocator
+        // surfaces as a clean error instead of an infinite loop.
+        const MAX_ALLOCATION_ATTEMPTS: usize = 8;
+        for attempt in 1..=MAX_ALLOCATION_ATTEMPTS {
+            let cluster_network = self
+                .shared
+                .db
+                .allocate_cluster_network(&self.shared.network)
+                .await
+                .map_err(db_status)?;
 
-        let cluster_id = uuid::Uuid::new_v4().to_string();
+            let cluster_id = uuid::Uuid::new_v4().to_string();
 
-        // Helper: drop every IP we allocated for this pending cluster
-        // (apiserver VIP if from pool, service block, private apiserver
-        // reservation). Used by every failure-rollback site below so
-        // leaks can't accumulate.
-        let rollback = async |label: &str| {
-            if let Err(e) = self.shared.db.release_cluster_ips(&cluster_id).await {
-                warn!(cluster_id, error = %e, label, "rollback: release_cluster_ips");
-            }
-        };
+            // Helper: drop every IP we allocated for this pending cluster
+            // (apiserver VIP if from pool, service block, private apiserver
+            // reservation). Used by every failure-rollback site below so
+            // leaks can't accumulate.
+            let rollback = async |label: &str| {
+                if let Err(e) = self.shared.db.release_cluster_ips(&cluster_id).await {
+                    warn!(cluster_id, error = %e, label, "rollback: release_cluster_ips");
+                }
+            };
 
-        let endpoint = match self
-            .allocate_apiserver_vip(visibility, pool, &cluster_network, &cluster_id)
-            .await
-        {
-            Ok(ep) => ep,
-            Err(status) => {
-                rollback("allocate_apiserver_vip").await;
-                return Err(status);
-            }
-        };
-        let service_block = match self
-            .allocate_service_block(pool, &cluster_id, service_count)
-            .await
-        {
-            Ok(cidr) => cidr,
-            Err(status) => {
-                rollback("allocate_service_block").await;
-                return Err(status);
-            }
-        };
+            let endpoint = match self
+                .allocate_apiserver_vip(visibility, pool, &cluster_network, &cluster_id)
+                .await
+            {
+                Ok(ep) => ep,
+                Err(status) => {
+                    rollback("allocate_apiserver_vip").await;
+                    return Err(status);
+                }
+            };
+            let service_block = match self
+                .allocate_service_block(pool, &cluster_id, service_count)
+                .await
+            {
+                Ok(cidr) => cidr,
+                Err(status) => {
+                    rollback("allocate_service_block").await;
+                    return Err(status);
+                }
+            };
 
-        let row = ClusterRow::from_network(
-            ClusterIdentity {
-                id: cluster_id.clone(),
-                name: req.name.clone(),
-                control_plane_endpoint: endpoint.clone(),
-                apiserver_visibility: visibility as i64,
-                external_pool: req.external_ip_pool.clone(),
-                service_block_cidr: service_block.clone(),
-                trust_domain: req.trust_domain.clone(),
-                created_at: now_rfc3339(),
-            },
-            cluster_network,
-        );
-        if let Err(e) = self.shared.db.insert_cluster(&row).await {
-            rollback("insert_cluster").await;
-            return match e {
-                DbError::Conflict(_) => {
-                    // Concurrent CreateCluster with the same name
-                    // beat us. Return the committed row as an
-                    // idempotent success.
+            let row = ClusterRow::from_network(
+                ClusterIdentity {
+                    id: cluster_id.clone(),
+                    name: req.name.clone(),
+                    control_plane_endpoint: endpoint.clone(),
+                    apiserver_visibility: visibility as i64,
+                    external_pool: req.external_ip_pool.clone(),
+                    service_block_cidr: service_block.clone(),
+                    trust_domain: req.trust_domain.clone(),
+                    created_at: now_rfc3339(),
+                },
+                cluster_network,
+            );
+            match self.shared.db.insert_cluster(&row).await {
+                Ok(()) => {
+                    info!(
+                        cluster_id = %cluster_id,
+                        name = %req.name,
+                        endpoint = %endpoint,
+                        vni = cluster_network.vni,
+                        cidr = %cluster_network.cidr,
+                        attempt,
+                        "CreateCluster: new cluster provisioned"
+                    );
+                    return Ok(Response::new(create_cluster_response(&row)));
+                }
+                Err(DbError::Conflict(_)) => {
+                    // Concurrent CreateCluster with the same name beat
+                    // us. Return the committed row as an idempotent
+                    // success.
+                    rollback("insert_cluster: name conflict").await;
                     let existing = self
                         .shared
                         .db
@@ -886,25 +921,36 @@ impl basis_server::Basis for BasisApiService {
                         .map_err(db_status)?
                         .ok_or_else(|| {
                             Status::internal(format!(
-                                "cluster '{}' insert rejected as duplicate but row not found",
+                                "cluster '{}' insert rejected as name duplicate but row not found",
                                 req.name,
                             ))
                         })?;
-                    Ok(Response::new(create_cluster_response(&existing)))
+                    return Ok(Response::new(create_cluster_response(&existing)));
                 }
-                other => Err(db_status(other)),
-            };
+                Err(DbError::AllocationRaced(msg)) => {
+                    // VNI or CIDR collision with a concurrent winner.
+                    // Release this attempt's IPs and try again with a
+                    // fresh snapshot.
+                    rollback("insert_cluster: allocation race").await;
+                    warn!(
+                        name = %req.name, attempt, max = MAX_ALLOCATION_ATTEMPTS,
+                        vni = cluster_network.vni, cidr = %cluster_network.cidr,
+                        sqlite_error = %msg,
+                        "CreateCluster: VNI/CIDR raced concurrent winner, retrying"
+                    );
+                    continue;
+                }
+                Err(other) => {
+                    rollback("insert_cluster: error").await;
+                    return Err(db_status(other));
+                }
+            }
         }
-
-        info!(
-            cluster_id = %cluster_id,
-            name = %req.name,
-            endpoint = %endpoint,
-            vni = cluster_network.vni,
-            cidr = %cluster_network.cidr,
-            "CreateCluster: new cluster provisioned"
-        );
-        Ok(Response::new(create_cluster_response(&row)))
+        Err(Status::resource_exhausted(format!(
+            "CreateCluster '{}' lost VNI/CIDR allocation race {} times in a row — \
+             cluster supernet may be saturated or under sustained concurrent create load",
+            req.name, MAX_ALLOCATION_ATTEMPTS,
+        )))
     }
 
     async fn delete_cluster(
@@ -936,9 +982,9 @@ impl basis_server::Basis for BasisApiService {
                 "failed to release cluster VIPs during DeleteCluster");
         }
         // Deleting the cluster row releases its (vni, cidr) pair back
-        // to the per-cell allocator pool — the next allocate_cluster_
-        // network reads `clusters` for taken VNIs/CIDRs, so removal is
-        // sufficient with no separate trees-table cascade.
+        // to the per-cell allocator: the next `allocate_cluster_network`
+        // reads `clusters` for taken VNIs/CIDRs, so removing the row
+        // is sufficient.
         self.shared
             .db
             .delete_cluster(&req.cluster_id)

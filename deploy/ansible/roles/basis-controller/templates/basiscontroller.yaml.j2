@@ -11,7 +11,13 @@ spec:
     key: {{ basis_tls_dir }}/controller.key
     ca: {{ basis_tls_dir }}/ca.crt
   network:
-    treeSupernet: {{ basis_network.tree_supernet }}
+    clusterSupernet: {{ basis_network.cluster_supernet }}
+{% if basis_network.cluster_prefix is defined %}
+    clusterPrefix: {{ basis_network.cluster_prefix }}
+{% endif %}
+{% if basis_network.bridge_reserve is defined %}
+    bridgeReserve: {{ basis_network.bridge_reserve }}
+{% endif %}
 {% if basis_network.default_external_service_ips is defined %}
     defaultExternalServiceIps: {{ basis_network.default_external_service_ips }}
 {% endif %}

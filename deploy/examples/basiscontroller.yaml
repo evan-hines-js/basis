@@ -12,14 +12,22 @@ spec:
     key: /etc/basis/tls/controller.key
     ca: /etc/basis/tls/ca.crt
   network:
-    # Overlay space — every tree (trust domain) carves a disjoint
-    # sub-CIDR out of this supernet. Does NOT need to match the
-    # physical LAN; VMs reach it via VXLAN.
-    treeSupernet: 10.100.0.0/16
+    # Overlay space — every cluster carves a disjoint sub-CIDR out of
+    # this supernet. Does NOT need to match the physical LAN; VMs
+    # reach it via VXLAN.
+    clusterSupernet: 10.100.0.0/16
+    # Default per-cluster CIDR prefix length. /24 fits ~32 hosts (the
+    # `bridgeReserve` carve at the bottom) plus ~220 VM IPs. Widen
+    # for larger clusters.
+    clusterPrefix: 24
+    # Number of addresses at the bottom of each cluster's CIDR
+    # reserved for per-host bridge IPs. One per hypervisor carrying a
+    # VM in the cluster.
+    bridgeReserve: 32
     # Named LAN-routable pools. A cluster's `externalIpPool` picks
-    # which pool its apiserver VIP and Cilium LoadBalancer Service
-    # block are carved from. Empty `externalIpPool` keeps the cluster
-    # inside the tree overlay (nested cluster, no LAN exposure).
+    # which pool its LoadBalancer Service block (and apiserver VIP,
+    # when `apiserverVisibility: Public`) is carved from. Required:
+    # every cluster names exactly one.
     pools:
       # Each pool is the LAN slice basis owns, expressed as a single
       # CIDR. Allocations walk the host range (skip network +

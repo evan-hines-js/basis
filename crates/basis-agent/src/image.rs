@@ -148,11 +148,11 @@ pub struct GuestNetwork<'a> {
     pub gateway: &'a str,
     pub prefix_len: u32,
     pub dns_servers: &'a [String],
-    /// Inner-MTU for the tree NIC. Must equal `uplink_mtu - 50`
-    /// (VXLAN header overhead) so guest IP packets fit in a single
-    /// underlay frame. Without this the guest defaults to 1500,
-    /// large packets silently drop on the bridge, and overlay TLS
-    /// handshakes hang at ClientHello.
+    /// Inner-MTU for the cluster overlay NIC. Must equal
+    /// `uplink_mtu - 50` (VXLAN header overhead) so guest IP packets
+    /// fit in a single underlay frame. Without this the guest
+    /// defaults to 1500, large packets silently drop on the bridge,
+    /// and overlay TLS handshakes hang at ClientHello.
     pub mtu: u32,
 }
 

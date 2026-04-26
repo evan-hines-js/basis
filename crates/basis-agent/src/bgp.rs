@@ -4,8 +4,9 @@
 //! does. The agent connects to its local holod via the gRPC northbound
 //! and pushes a single BGP speaker config: ASN, router-id (the host's
 //! underlay address), one neighbor (the cell route reflector), and
-//! the prefix set this host advertises (tree CIDRs + cluster VIPs
-//! sourced from `ReconcileHostCommand`).
+//! the prefix set this host advertises (per-cluster VIPs — apiserver
+//! VIP when `APISERVER_PUBLIC` plus the LB Service block — sourced
+//! from `ReconcileHostCommand.clusters[].cluster_vips`).
 //!
 //! Decoupling the BGP daemon's lifecycle from the agent's matters: an
 //! agent restart must not drop BGP sessions. holod runs under systemd

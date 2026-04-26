@@ -198,7 +198,9 @@ apiVersion: basis.dev/v1
 kind: Cluster
 metadata:
   name: $CLUSTER_NAME
-spec: {}
+spec:
+  externalIpPool: cell-public
+  externalServiceIps: 2
 YAML
     cat >"$MACHINE_FIXTURE" <<YAML
 apiVersion: basis.dev/v1
@@ -527,7 +529,9 @@ apiVersion: basis.dev/v1
 kind: Cluster
 metadata:
   name: $name
-spec: {}
+spec:
+  externalIpPool: cell-public
+  externalServiceIps: 2
 YAML
 }
 CLUSTER_A="$TMP_DIR/cluster-vip-a.yaml"

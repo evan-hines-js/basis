@@ -12,7 +12,7 @@ basis_lvm_devices:
   - /dev/sdd
   - /dev/sde
 
-# Network config (tree_supernet, pools, default_external_service_ips)
+# Network config (cluster_supernet, pools, default_external_service_ips)
 # lives in group_vars/all.yml — it's a cell-wide concern, not per-host.
 # Only override here for fields that genuinely vary across hosts in
 # the same cell (none today).

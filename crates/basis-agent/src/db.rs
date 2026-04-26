@@ -188,9 +188,9 @@ pub struct LocalVmRow {
     pub disk_gib: i64,
     pub gpu_pci_addresses: String,
     pub image: String,
-    /// VXLAN Network Identifier of the tree this VM's primary TAP
+    /// VXLAN Network Identifier of the cluster this VM's primary TAP
     /// attaches to. Persisted so a post-reboot restart knows which
-    /// `brt<vni>` bridge to re-attach the TAP to.
+    /// `brc<vni>` bridge to re-attach the TAP to.
     pub vni: i64,
     pub created_at: String,
     /// JSON-encoded `Vec<u32>` of extra data-disk sizes in GiB, in the

@@ -45,6 +45,16 @@ pub enum DbError {
     #[error("placement on host '{0}' raced a concurrent create")]
     CapacityRaced(String),
 
+    /// `insert_cluster` rejected the row because another concurrent
+    /// `CreateCluster` claimed the same VNI or CIDR between this
+    /// caller's `allocate_cluster_network` snapshot and its insert.
+    /// The pre-insert allocator only reads from `clusters`; it doesn't
+    /// reserve, so two racers can pick the same (vni, cidr) and one
+    /// loses the UNIQUE constraint. Caller should release any IPs it
+    /// pre-allocated and retry the whole allocate-and-insert sequence.
+    #[error("cluster network allocation raced a concurrent create: {0}")]
+    AllocationRaced(String),
+
     #[error("malformed DB state: {0}")]
     Malformed(String),
 }
@@ -725,7 +735,16 @@ impl Db {
         .await
         .map_err(|e| match e {
             sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-                DbError::Conflict(format!("cluster '{}' already exists", cluster.name))
+                // Distinguish name dup (idempotent retry) from VNI/CIDR
+                // dup (allocation race). SQLite includes the constraint
+                // column in the message, e.g.
+                // "UNIQUE constraint failed: clusters.vni".
+                let msg = db_err.message();
+                if msg.contains("clusters.vni") || msg.contains("clusters.cidr") {
+                    DbError::AllocationRaced(msg.to_string())
+                } else {
+                    DbError::Conflict(format!("cluster '{}' already exists", cluster.name))
+                }
             }
             other => DbError::Sqlx(other),
         })?;
@@ -1214,7 +1233,7 @@ impl Db {
 fn cidrs_overlap(a: &ipnet::Ipv4Net, b: &ipnet::Ipv4Net) -> bool {
     // Two /N networks overlap iff one contains the other's network
     // address. For equal-prefix slices this reduces to equality, which
-    // is what we hit in tree carving.
+    // is what cluster-CIDR carving hits.
     a.contains(&b.network()) || b.contains(&a.network())
 }
 
@@ -1279,8 +1298,8 @@ pub struct HostRow {
     pub gpu_inventory: Vec<GpuInfo>,
     /// IP address the agent uses as the VXLAN src for outgoing tunneled
     /// frames. Reported on `RegisterHostRequest`; empty string means
-    /// the agent is pre-VXLAN and cross-host traffic for any tree it
-    /// hosts won't reach its peers.
+    /// the agent is pre-VXLAN and cross-host traffic for any cluster
+    /// overlay it carries won't reach its peers.
     pub vtep_address: String,
     pub last_heartbeat: String,
     pub healthy: bool,
@@ -1597,8 +1616,7 @@ mod tests {
         let net = make_net_config();
 
         // Need actual cluster rows for the next allocation to see VNIs
-        // as taken — `allocate_cluster_network` reads from the
-        // `clusters` table, not a separate trees table.
+        // as taken — `allocate_cluster_network` reads from `clusters`.
         let n1 = db.allocate_cluster_network(&net).await.unwrap();
         db.insert_cluster(&make_cluster("c1", "c1", n1, "unused"))
             .await
