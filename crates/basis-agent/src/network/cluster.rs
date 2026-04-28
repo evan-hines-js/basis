@@ -507,6 +507,29 @@ impl ClusterManager {
             ensure_cluster_masquerade(&cluster.cidr, &self.uplink_bridge).await?;
         }
 
+        // Tree-pool reply path. Enslaving the bridge to the VRF
+        // moves its connected route (`<cidr> dev brc<vni>`) out of
+        // the main table and into the VRF's table — correct for
+        // tree-internal lookups. But VM-initiated NAT'd egress
+        // returns through the uplink, which lives in the *main*
+        // namespace. With no copy of `<cidr>` in main, the kernel
+        // can't resolve the un-NAT'd reverse destination on ingress
+        // and silently drops every reply. Re-installing the route
+        // in main fixes the reverse path without compromising tree
+        // isolation: foreign-tree internal VIPs are /32s installed
+        // in their own VRF tables and never appear in main, so a
+        // packet from one tree's bridge looking up another tree's
+        // VIP still misses everywhere and dies.
+        if vrf.is_some() && !cluster.cidr.is_empty() {
+            run_cmd(
+                "ip",
+                &[
+                    "route", "replace", &cluster.cidr, "dev", &bridge, "table", "main",
+                ],
+            )
+            .await?;
+        }
+
         self.reconcile_fdb(&vxlan, &cluster.vtep_addresses).await?;
         Ok(vrf)
     }

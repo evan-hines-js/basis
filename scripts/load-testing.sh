@@ -47,28 +47,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES="$REPO_ROOT/crates/basis-ctl/fixtures"
 BIN="$REPO_ROOT/target/release/basis-ctl"
 
-# PKI fallback (mirrors smoke.sh): rsync.sh syncs deploy/ansible/pki/
-# to every host, so unset/stale BASIS_TLS_* paths fall back there
-# rather than blowing up with a bare "No such file" from tonic.
-PKI_DEFAULT_DIR="$REPO_ROOT/deploy/ansible/pki"
-resolve_pki() {
-    local var="$1" filename="$2" current
-    current="${!var:-}"
-    if [[ -n "$current" && -f "$current" ]]; then
-        return 0
-    fi
-    local fallback="$PKI_DEFAULT_DIR/$filename"
-    if [[ -f "$fallback" ]]; then
-        if [[ -n "$current" ]]; then
-            echo "  warn: $var=$current does not exist; falling back to $fallback" >&2
-        fi
-        printf -v "$var" '%s' "$fallback"
-        export "${var?}"
-        return 0
-    fi
-    echo "FAIL: $var unset (or stale) and no fallback at $fallback" >&2
-    exit 2
-}
+# shellcheck source=lib/pki.sh
+. "$REPO_ROOT/scripts/lib/pki.sh"
 resolve_pki BASIS_TLS_CA   ca.crt
 resolve_pki BASIS_TLS_CERT capi-provider.crt
 resolve_pki BASIS_TLS_KEY  capi-provider.key

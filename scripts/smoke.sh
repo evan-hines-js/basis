@@ -50,36 +50,13 @@ set -euo pipefail
 
 : "${BASIS_ENDPOINT:?BASIS_ENDPOINT not set (e.g. https://10.0.0.206:7443)}"
 
-# PKI path resolution. ansible writes the issued certs into the repo's
-# deploy/ansible/pki/ on the install host, and rsync.sh syncs that
-# whole tree to every other host — so the rsync'd checkout reliably
-# has working certs at $REPO_ROOT/deploy/ansible/pki/. We use those
-# as the fallback when the BASIS_TLS_* env vars are unset OR set to a
-# stale path (e.g. an operator's .basis.credentials still pointing at
-# /root/deploy/... from before the repo moved under ~/basis/). Without
-# this fallback, the only signal is a generic "No such file" from the
-# tonic TLS loader, which usually sends people on a long detour.
-SCRIPT_DIR_FOR_PKI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT_FOR_PKI="$(cd "$SCRIPT_DIR_FOR_PKI/.." && pwd)"
-PKI_DEFAULT_DIR="$REPO_ROOT_FOR_PKI/deploy/ansible/pki"
-resolve_pki() {
-    local var="$1" filename="$2" current
-    current="${!var:-}"
-    if [[ -n "$current" && -f "$current" ]]; then
-        return 0
-    fi
-    local fallback="$PKI_DEFAULT_DIR/$filename"
-    if [[ -f "$fallback" ]]; then
-        if [[ -n "$current" ]]; then
-            echo "  warn: $var=$current does not exist; falling back to $fallback" >&2
-        fi
-        printf -v "$var" '%s' "$fallback"
-        export "${var?}"
-        return 0
-    fi
-    echo "FAIL: $var unset (or stale) and no fallback at $fallback" >&2
-    exit 2
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FIXTURES="$REPO_ROOT/crates/basis-ctl/fixtures"
+BIN="$REPO_ROOT/target/release/basis-ctl"
+
+# shellcheck source=lib/pki.sh
+. "$REPO_ROOT/scripts/lib/pki.sh"
 resolve_pki BASIS_TLS_CA   ca.crt
 resolve_pki BASIS_TLS_CERT capi-provider.crt
 resolve_pki BASIS_TLS_KEY  capi-provider.key
@@ -97,11 +74,6 @@ for arg in "$@"; do
         *) echo "unknown arg: $arg" >&2; exit 2;;
     esac
 done
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-FIXTURES="$REPO_ROOT/crates/basis-ctl/fixtures"
-BIN="$REPO_ROOT/target/release/basis-ctl"
 
 # How long we'll wait after CreateMachine for the guest to answer ICMP.
 # cloud-init + getty + sshd is typically 20-30s on Ubuntu noble on this
