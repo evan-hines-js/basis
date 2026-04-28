@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>basis — packet flows</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --drop: #f85149;
+    --packet: #ffa657;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", monospace;
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  h1 { font-size: 18px; margin: 0 0 4px 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  main {
+    display: grid;
+    grid-template-columns: 280px 1fr 360px;
+    gap: 16px;
+    padding: 16px;
+    height: calc(100vh - 70px);
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px;
+    overflow-y: auto;
+  }
+  .panel h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 10px 0;
+    letter-spacing: 0.04em;
+  }
+  .scenario {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 4px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    font: inherit;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .scenario:hover { border-color: var(--accent); }
+  .scenario.active {
+    border-color: var(--accent);
+    background: rgba(88, 166, 255, 0.08);
+  }
+  .scenario .title { font-weight: 600; margin-bottom: 4px; }
+  .scenario .desc { font-size: 12px; color: var(--muted); }
+  .scenario .verdict {
+    display: inline-block;
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-top: 6px;
+  }
+  .scenario .verdict.ok { background: rgba(63, 185, 80, 0.15); color: var(--ok); }
+  .scenario .verdict.drop { background: rgba(248, 81, 73, 0.15); color: var(--drop); }
+  #stage {
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+  }
+  #svgwrap {
+    flex: 1;
+    min-height: 0;
+    padding: 16px;
+  }
+  svg { width: 100%; height: 100%; }
+  .controls {
+    border-top: 1px solid var(--border);
+    padding: 12px 16px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .controls button {
+    background: var(--accent);
+    border: none;
+    color: white;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .controls .step-info {
+    color: var(--muted);
+    font-size: 12px;
+    margin-left: auto;
+  }
+  /* SVG node styles */
+  .node {
+    fill: var(--panel);
+    stroke: var(--border);
+    stroke-width: 1.5;
+  }
+  .node.host { stroke: var(--accent); stroke-dasharray: 4,3; }
+  .node.vrf { stroke: var(--warn); stroke-dasharray: 6,3; }
+  .node.bridge { fill: #1c2128; stroke: var(--ok); }
+  .node.vm { fill: #1c2128; stroke: var(--text); }
+  .node.lan { fill: #1c2128; stroke: var(--muted); }
+  .node-label {
+    fill: var(--text);
+    font-size: 11px;
+    font-family: monospace;
+    pointer-events: none;
+  }
+  .node-label.muted { fill: var(--muted); font-size: 10px; }
+  .link {
+    stroke: var(--border);
+    stroke-width: 1.5;
+    fill: none;
+  }
+  .link.lit {
+    stroke: var(--packet);
+    stroke-width: 2.5;
+  }
+  .packet {
+    fill: var(--packet);
+    stroke: var(--bg);
+    stroke-width: 2;
+    transition: cx 0.5s ease, cy 0.5s ease, fill 0.3s;
+    opacity: 0;
+  }
+  .packet.visible { opacity: 1; }
+  .packet.dropped { fill: var(--drop); }
+  .packet.natted { fill: var(--ok); }
+
+  /* Detail panel */
+  .step {
+    border-left: 2px solid var(--border);
+    padding: 8px 0 8px 12px;
+    margin-bottom: 12px;
+  }
+  .step.current { border-left-color: var(--packet); }
+  .step.dropped { border-left-color: var(--drop); }
+  .step .where { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+  .step .what { font-size: 12px; color: var(--muted); }
+  .step pre {
+    background: #0a0e13;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin: 6px 0 0 0;
+    font-size: 11px;
+    color: var(--text);
+    overflow-x: auto;
+  }
+  .legend {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  .legend .swatch {
+    display: inline-block;
+    width: 10px; height: 10px; border-radius: 2px;
+    margin-right: 4px; vertical-align: middle;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>basis — packet flow visualiser</h1>
+  <div class="sub">click a scenario, step through to see which routing table the kernel consults at each hop, where SNAT fires, and where (if anywhere) the packet drops.</div>
+</header>
+<main>
+  <div class="panel" id="scenarios">
+    <h2>Scenarios</h2>
+  </div>
+
+  <div class="panel" id="stage">
+    <div id="svgwrap">
+      <svg viewBox="0 0 920 580" preserveAspectRatio="xMidYMid meet" id="topology"></svg>
+    </div>
+    <div class="controls">
+      <button id="prev" disabled>◀ prev</button>
+      <button id="next" disabled>next ▶</button>
+      <button id="reset" disabled>reset</button>
+      <span class="step-info" id="stepinfo">choose a scenario</span>
+    </div>
+  </div>
+
+  <div class="panel" id="detail">
+    <h2>Hop detail</h2>
+    <div id="steps"></div>
+    <div class="legend">
+      <div><span class="swatch" style="background: var(--packet)"></span> packet (in flight)</div>
+      <div><span class="swatch" style="background: var(--ok)"></span> packet (after SNAT)</div>
+      <div><span class="swatch" style="background: var(--drop)"></span> packet (dropped — kernel route lookup miss)</div>
+      <div style="margin-top:8px"><span class="swatch" style="background: var(--warn); border:1px dashed var(--warn)"></span> tree VRF (per-trust-domain Linux VRF)</div>
+      <div><span class="swatch" style="background: var(--accent); border:1px dashed var(--accent)"></span> hypervisor (host network namespace)</div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ---------- Topology layout ----------
+// Two hypervisors side by side, plus the LAN router and an external workstation.
+// Coordinates chosen so the SVG is readable at the default viewport.
+
+const NODES = {
+  // External
+  workstation: { x:  60, y:  60, w: 140, h: 50, label: "workstation",
+    sub: "10.0.0.180", cls: "lan" },
+  lanRouter:   { x: 380, y:  40, w: 160, h: 50, label: "LAN router",
+    sub: "10.0.0.1",   cls: "lan" },
+  internet:    { x: 720, y:  60, w: 140, h: 50, label: "Internet",
+    sub: "1.1.1.1",    cls: "lan" },
+
+  // Host A (left hypervisor)
+  hostA:       { x:  40, y: 160, w: 380, h: 380, label: "hypervisor A",
+    sub: "10.0.0.206", cls: "host" },
+  vmbrA:       { x:  60, y: 200, w: 160, h: 36, label: "vmbr0",
+    sub: "10.0.0.206", cls: "bridge", host: "A" },
+  mainA:       { x: 240, y: 200, w: 160, h: 36, label: "main table",
+    sub: "default via 10.0.0.1", cls: "node", host: "A" },
+  vrfA:        { x:  60, y: 270, w: 340, h: 250, label: "bvrf-beaf205088",
+    sub: "table 790656920", cls: "vrf", host: "A" },
+  brcA:        { x:  80, y: 320, w: 160, h: 36, label: "brc10000",
+    sub: "10.100.0.1/24", cls: "bridge", host: "A" },
+  vrfTblA:     { x: 260, y: 320, w: 130, h: 36, label: "VRF table",
+    sub: "790656920", cls: "node", host: "A" },
+  vxcA:        { x:  80, y: 380, w: 160, h: 30, label: "vxc10000",
+    sub: "VXLAN VNI 10000", cls: "bridge", host: "A" },
+  vmA1:        { x:  80, y: 440, w: 100, h: 50, label: "VM cp-1",
+    sub: "10.100.0.33", cls: "vm", host: "A" },
+  vmA2:        { x: 200, y: 440, w: 100, h: 50, label: "VM worker-1",
+    sub: "10.100.0.34", cls: "vm", host: "A" },
+
+  // Host B (right hypervisor) — collapsed; shown to support cross-host
+  hostB:       { x: 540, y: 160, w: 340, h: 380, label: "hypervisor B",
+    sub: "10.0.0.207", cls: "host" },
+  vmbrB:       { x: 560, y: 200, w: 140, h: 36, label: "vmbr0",
+    sub: "10.0.0.207", cls: "bridge", host: "B" },
+  mainB:       { x: 720, y: 200, w: 140, h: 36, label: "main table",
+    sub: "default via 10.0.0.1", cls: "node", host: "B" },
+  vrfB:        { x: 560, y: 270, w: 300, h: 250, label: "bvrf-beaf205088",
+    sub: "table 790656920", cls: "vrf", host: "B" },
+  brcB:        { x: 580, y: 320, w: 140, h: 36, label: "brc10000",
+    sub: "(eager bootstrap)", cls: "bridge", host: "B" },
+  vxcB:        { x: 580, y: 380, w: 140, h: 30, label: "vxc10000",
+    sub: "VXLAN VNI 10000", cls: "bridge", host: "B" },
+  vmB1:        { x: 580, y: 440, w: 140, h: 50, label: "VM tenant-b",
+    sub: "10.200.0.10\ntrust_domain=B",  cls: "vm", host: "B" },
+  brcB2:       { x: 740, y: 320, w: 110, h: 36, label: "brc20000",
+    sub: "10.250.0.1/24", cls: "bridge", host: "B" },
+  vmB2:        { x: 740, y: 440, w: 110, h: 50, label: "VM cp-other",
+    sub: "10.250.0.5",     cls: "vm", host: "B" },
+};
+
+// ---------- Scenarios ----------
+// Each scenario is a list of steps. A step = "where the packet is now" + "what
+// happens here." `node` matches a key in NODES; `dst` is what the packet's
+// outer-header destination is at this point (post-NAT updates as we go).
+
+const SCENARIOS = [
+  {
+    id: "vm-egress",
+    title: "VM → Internet (1.1.1.1)",
+    desc: "VM on host A pings 1.1.1.1. Egress through cluster bridge → VRF table → main table → MASQUERADE on uplink.",
+    verdict: "ok",
+    steps: [
+      { node: "vmA1", where: "VM cp-1 on host A",
+        what: "VM emits ICMP echo. Default gateway 10.100.0.1 (the bridge). Source 10.100.0.33.",
+        cmd: "ip route\n→ default via 10.100.0.1 dev ens3" },
+      { node: "brcA", where: "brc10000 (host A)",
+        what: "Bridge receives the frame. ens3 is enslaved to brc10000 which is enslaved to bvrf-beaf205088. L3 lookup happens in the VRF table.",
+        cmd: "ip vrf show master brc10000\n→ bvrf-beaf205088 table 790656920" },
+      { node: "vrfTblA", where: "VRF table 790656920",
+        what: "Lookup 1.1.1.1 in the VRF's table. No specific match. Default route resolves to vmbr0 via 10.0.0.1.",
+        cmd: "ip route show table 790656920\n→ default via 10.0.0.1 dev vmbr0" },
+      { node: "vmbrA", where: "vmbr0 (host A)",
+        what: "Packet leaves through the uplink. POSTROUTING/nat fires the per-cluster MASQUERADE rule: src 10.100.0.33 → 10.0.0.206 (host's LAN IP). conntrack records the rewrite.",
+        cmd: "iptables -t nat -L POSTROUTING\n→ -s 10.100.0.0/24 -o vmbr0 -j MASQUERADE",
+        nat: true },
+      { node: "lanRouter", where: "LAN router (10.0.0.1)",
+        what: "Router routes to upstream. Reply will return to 10.0.0.206; conntrack reverses the MASQUERADE on ingress." },
+      { node: "internet", where: "Internet host (1.1.1.1)",
+        what: "Reply emitted; comes back through the LAN router → vmbr0 (host A). Reply path: kernel does FIB lookup on 10.100.0.33 in main table (route was mirrored from VRF on bridge enslave). Found. Delivered via brc10000.",
+        cmd: "ip route show 10.100.0.0/24\n→ 10.100.0.0/24 dev brc10000" },
+    ],
+  },
+  {
+    id: "lan-public-vip",
+    title: "LAN → public apiserver VIP",
+    desc: "Workstation on the LAN reaches the kubeadm apiserver VIP at 10.0.0.193. LAN-pool /32 lives in BOTH main and the VRF table.",
+    verdict: "ok",
+    steps: [
+      { node: "workstation", where: "workstation (10.0.0.180)",
+        what: "ARPs for 10.0.0.193. Hypervisor A answers via proxy-ARP installed on vmbr0 by the agent." },
+      { node: "vmbrA", where: "vmbr0 (host A)",
+        what: "Frame arrives. Kernel route lookup for 10.0.0.193 happens in the main table (vmbr0 is in the host namespace, not the VRF).",
+        cmd: "ip route show 10.0.0.193\n→ 10.0.0.193 dev brc10000" },
+      { node: "mainA", where: "main table",
+        what: "Found. Agent mirrors the LAN-scoped /32 from the VRF table into main exactly so this lookup succeeds. Packet forwarded to brc10000." },
+      { node: "brcA", where: "brc10000 (host A)",
+        what: "Bridge has a learned FDB entry pointing at the CP VM's MAC (kube-vip emitted gARP on leadership)." },
+      { node: "vmA1", where: "VM cp-1 (10.100.0.33)",
+        what: "kube-vip claimed 10.0.0.193 via secondary IP. apiserver listens on it. Reply traverses the same path in reverse." },
+    ],
+  },
+  {
+    id: "same-tree-internal",
+    title: "VM → same-tree internal VIP (cross-cluster)",
+    desc: "VM on host A reaches 10.250.0.1 (cluster B's internal apiserver, same trust_domain). Lookup hits the shared VRF; packet egresses VXLAN to host B.",
+    verdict: "ok",
+    steps: [
+      { node: "vmA1", where: "VM cp-1 (10.100.0.33)",
+        what: "Packet to 10.250.0.1. Default gateway is 10.100.0.1." },
+      { node: "brcA", where: "brc10000 (host A)",
+        what: "Bridge in bvrf-beaf205088. L3 lookup in the VRF table." },
+      { node: "vrfTblA", where: "VRF table 790656920",
+        what: "Looking up 10.250.0.1. The eager-bootstrap fan-out installed `10.250.0.0/24 dev brc20000` here: every host in the tree carries a brc<vni> for every cluster in the tree, even hosts with no VMs of that cluster. So host A has brc20000 too — bridge object only, no local TAP.",
+        cmd: "ip route show table 790656920 | grep 10.250\n→ 10.250.0.0/24 dev brc20000" },
+      { node: "vxcA", where: "vxc20000 on host A — VXLAN encap",
+        what: "Bridge has no local port for the dest MAC, so the frame floods to its VXLAN port. Encapsulated with inner (10.100.0.33 → 10.250.0.1, VNI 20000), outer (10.0.0.206 → 10.0.0.207). Peer VTEP comes from the FDB the controller seeded with cluster-other's host list." },
+      { node: "vxcB", where: "vxc20000 on host B — VXLAN decap",
+        what: "Outer packet arrives via vmbr0, UDP/4789. Spoof guard (FORWARD UDP/4789 DROP) is bypassed because kernel-originated VXLAN traffic is local-input, not forwarded. vxc20000 decaps; inner frame goes into brc20000." },
+      { node: "vmB2", where: "VM cp-other (10.250.0.5)",
+        what: "Frame delivered to bridge port for the CP VM. apiserver responds." },
+    ],
+  },
+  {
+    id: "cross-tree-internal",
+    title: "VM → cross-tree internal VIP",
+    desc: "VM on host A in trust_domain root-A tries to reach 10.200.0.10 (a tenant-b internal VIP). Different VRF on host A's lookup; route doesn't exist in either table; packet drops in the kernel.",
+    verdict: "drop",
+    steps: [
+      { node: "vmA1", where: "VM cp-1 (10.100.0.33)",
+        what: "Packet to 10.200.0.10. Default gateway 10.100.0.1." },
+      { node: "brcA", where: "brc10000 (host A)",
+        what: "Bridge enslaved to bvrf-beaf205088 (root-A's VRF). L3 lookup in THIS VRF's table." },
+      { node: "vrfTblA", where: "VRF table 790656920 (root-A)",
+        what: "Looking up 10.200.0.10. Not present — tenant-b's /32 lives in tenant-b's VRF table on its hosts, never replicated here. Lookup miss." },
+      { node: "mainA", where: "main table (host A)",
+        what: "VRF lookup miss does NOT fall through to main for tree-internal addresses (they were never in main; agent only mirrors LAN-scoped /32s). Packet has nowhere to go.",
+        drop: true },
+    ],
+  },
+  {
+    id: "lan-cross-tree-internal",
+    title: "LAN → cross-tree internal VIP (negative test)",
+    desc: "Workstation tries to reach a tenant-b internal VIP (10.200.0.10) directly from the LAN. Drops in the host's main table — internal VIPs are never advertised, never proxy-ARPed, never in main.",
+    verdict: "drop",
+    steps: [
+      { node: "workstation", where: "workstation (10.0.0.180)",
+        what: "ARPs for 10.200.0.10. No host responds (no proxy-ARP for tree-internal VIPs). ARP fails after retries.",
+        drop: true },
+    ],
+  },
+];
+
+// ---------- Render topology ----------
+const svg = document.getElementById("topology");
+const NS = "http://www.w3.org/2000/svg";
+
+function el(tag, attrs = {}, children = []) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  for (const c of children) e.appendChild(c);
+  return e;
+}
+
+function renderTopology() {
+  // Render order: hosts (containers) first, then VRFs, then leaf nodes,
+  // then links, then the packet on top.
+  const order = [
+    "hostA","hostB","vrfA","vrfB",
+    "workstation","lanRouter","internet",
+    "vmbrA","mainA","brcA","vrfTblA","vxcA","vmA1","vmA2",
+    "vmbrB","mainB","brcB","vxcB","vmB1","brcB2","vmB2",
+  ];
+  for (const id of order) {
+    const n = NODES[id];
+    if (!n) continue;
+    const g = el("g", { id: `n-${id}`, class: "node-group" });
+    g.appendChild(el("rect", {
+      x: n.x, y: n.y, width: n.w, height: n.h, rx: 4, ry: 4,
+      class: `node ${n.cls}`,
+    }));
+    g.appendChild(el("text", {
+      x: n.x + 8, y: n.y + 16, class: "node-label",
+    })).textContent = n.label;
+    if (n.sub) {
+      const lines = n.sub.split("\n");
+      lines.forEach((line, i) => {
+        const t = el("text", {
+          x: n.x + 8, y: n.y + 30 + i * 11,
+          class: "node-label muted",
+        });
+        t.textContent = line;
+        g.appendChild(t);
+      });
+    }
+    svg.appendChild(g);
+  }
+  // The packet (initially hidden)
+  const packet = el("circle", {
+    id: "packet", cx: 0, cy: 0, r: 7, class: "packet",
+  });
+  svg.appendChild(packet);
+}
+
+renderTopology();
+
+// ---------- Scenario panel ----------
+const scenariosPanel = document.getElementById("scenarios");
+SCENARIOS.forEach((s, i) => {
+  const btn = document.createElement("button");
+  btn.className = "scenario";
+  btn.dataset.idx = i;
+  btn.innerHTML = `
+    <div class="title">${s.title}</div>
+    <div class="desc">${s.desc}</div>
+    <div class="verdict ${s.verdict}">${s.verdict.toUpperCase()}</div>
+  `;
+  btn.addEventListener("click", () => loadScenario(i));
+  scenariosPanel.appendChild(btn);
+});
+
+// ---------- Step-through controls ----------
+let currentScenario = null;
+let currentStep = -1;
+const packet = document.getElementById("packet");
+const stepsPanel = document.getElementById("steps");
+const stepInfo = document.getElementById("stepinfo");
+const prevBtn = document.getElementById("prev");
+const nextBtn = document.getElementById("next");
+const resetBtn = document.getElementById("reset");
+
+function loadScenario(i) {
+  document.querySelectorAll(".scenario").forEach((b, j) =>
+    b.classList.toggle("active", i === j));
+  currentScenario = SCENARIOS[i];
+  currentStep = -1;
+  renderSteps();
+  updateControls();
+  goToStep(0);
+}
+
+function renderSteps() {
+  stepsPanel.innerHTML = "";
+  if (!currentScenario) return;
+  currentScenario.steps.forEach((s, i) => {
+    const div = document.createElement("div");
+    div.className = "step";
+    div.id = `step-${i}`;
+    let html = `<div class="where">${i + 1}. ${s.where}</div>
+                <div class="what">${s.what}</div>`;
+    if (s.cmd) html += `<pre>${s.cmd}</pre>`;
+    div.innerHTML = html;
+    stepsPanel.appendChild(div);
+  });
+}
+
+function goToStep(i) {
+  if (!currentScenario) return;
+  if (i < 0 || i >= currentScenario.steps.length) return;
+  currentStep = i;
+  const step = currentScenario.steps[i];
+  const node = NODES[step.node];
+  if (node) {
+    packet.classList.add("visible");
+    packet.setAttribute("cx", node.x + node.w / 2);
+    packet.setAttribute("cy", node.y + node.h / 2);
+  }
+  // colour: dropped > natted > normal
+  packet.classList.toggle("dropped", !!step.drop);
+  packet.classList.toggle("natted", !!step.nat && !step.drop);
+
+  // highlight active step in detail panel
+  document.querySelectorAll(".step").forEach((s, j) => {
+    s.classList.toggle("current", j === i && !step.drop);
+    s.classList.toggle("dropped", j === i && step.drop);
+  });
+
+  updateControls();
+}
+
+function updateControls() {
+  if (!currentScenario) {
+    prevBtn.disabled = nextBtn.disabled = resetBtn.disabled = true;
+    stepInfo.textContent = "choose a scenario";
+    return;
+  }
+  prevBtn.disabled = currentStep <= 0;
+  nextBtn.disabled = currentStep >= currentScenario.steps.length - 1;
+  resetBtn.disabled = false;
+  stepInfo.textContent =
+    `step ${currentStep + 1} / ${currentScenario.steps.length}`;
+}
+
+prevBtn.addEventListener("click", () => goToStep(currentStep - 1));
+nextBtn.addEventListener("click", () => goToStep(currentStep + 1));
+resetBtn.addEventListener("click", () => goToStep(0));
+
+// ---------- Keyboard ----------
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") nextBtn.click();
+  else if (e.key === "ArrowLeft") prevBtn.click();
+  else if (/^[1-9]$/.test(e.key)) {
+    const i = +e.key - 1;
+    if (i < SCENARIOS.length) loadScenario(i);
+  }
+});
+</script>
+</body>
+</html>

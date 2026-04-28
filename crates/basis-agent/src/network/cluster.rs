@@ -256,24 +256,53 @@ impl ClusterManager {
             //     no proxy-ARP (the LAN must not reach the VIP).
             let (lan_prefixes, lan_addrs) = expand_prefixes(&cluster.cluster_vips);
             let (tree_prefixes, _) = expand_prefixes(&cluster.internal_cluster_vips);
-            let mut want_prefixes = lan_prefixes;
-            want_prefixes.extend(tree_prefixes);
 
-            // Per-bridge prefix-route diff scoped to this cluster, in
-            // the cluster's VRF table when it has a trust_domain (else
-            // the main table). Reading the kernel up-front catches
-            // stale entries (re-carved LB block) without ever touching
-            // another cluster's bridge or the wrong table.
             let bridge = bridge_name(cluster.vni);
             let table_id = vrf.as_ref().map(|v| v.table_id);
-            let kernel_prefixes = list_kernel_prefix_routes(&bridge, table_id).await?;
-            for stale in kernel_prefixes.difference(&want_prefixes) {
-                if let Err(e) = del_prefix_route(stale, &bridge, table_id).await {
-                    warn!(prefix = %stale, vni = cluster.vni, error = %e, "prefix route del");
+
+            // Two-table reconcile when the cluster is in a VRF:
+            //   * MAIN gets the LAN-scoped prefixes ONLY. The tree's
+            //     internal VIPs must never appear in main — that
+            //     would let LAN traffic dst-routed to vmbr0 reach
+            //     them and break tree isolation.
+            //   * VRF gets BOTH lan + tree prefixes. LAN prefixes
+            //     are mirrored so VMs in this tree (whose bridge
+            //     looks up in the VRF table) can also reach their
+            //     own LAN VIPs.
+            // Without VRF (LAN-only cluster, empty trust_domain),
+            // there's no separate VRF table; everything just lives
+            // in main as a single set.
+            let want_main: BTreeSet<String> = if table_id.is_some() {
+                lan_prefixes.clone()
+            } else {
+                let mut set = lan_prefixes.clone();
+                set.extend(tree_prefixes.iter().cloned());
+                set
+            };
+            let kernel_main = list_kernel_prefix_routes(&bridge, None).await?;
+            for stale in kernel_main.difference(&want_main) {
+                if let Err(e) = del_prefix_route(stale, &bridge, None).await {
+                    warn!(prefix = %stale, vni = cluster.vni, error = %e, "main prefix route del");
                 }
             }
-            for new in want_prefixes.difference(&kernel_prefixes) {
-                add_prefix_route(new, &bridge, table_id).await?;
+            for new in want_main.difference(&kernel_main) {
+                add_prefix_route(new, &bridge, None).await?;
+            }
+
+            let mut want_combined = lan_prefixes;
+            want_combined.extend(tree_prefixes);
+
+            if let Some(t) = table_id {
+                let kernel_vrf = list_kernel_prefix_routes(&bridge, Some(t)).await?;
+                for stale in kernel_vrf.difference(&want_combined) {
+                    if let Err(e) = del_prefix_route(stale, &bridge, Some(t)).await {
+                        warn!(prefix = %stale, vni = cluster.vni, table = t, error = %e,
+                            "vrf prefix route del");
+                    }
+                }
+                for new in want_combined.difference(&kernel_vrf) {
+                    add_prefix_route(new, &bridge, Some(t)).await?;
+                }
             }
 
             let entry = live.entry(cluster.vni).or_default();
@@ -282,7 +311,7 @@ impl ClusterManager {
             } else {
                 Some(cluster.cidr.clone())
             };
-            entry.prefixes = want_prefixes;
+            entry.prefixes = want_combined;
             entry.proxy_arp_addrs = lan_addrs;
             entry.vrf = vrf;
         }
