@@ -30,6 +30,17 @@ rules:
   - get
   - list
   - watch
+# `get` on namespaces (cluster-scoped) is required to read the
+# kube-system namespace UID at startup; that UID is the
+# trust-domain identifier stamped onto every BasisCluster this
+# provider creates so all clusters spawned by the same management
+# cluster share a per-tree VRF on every basis host.
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
 - apiGroups:
   - cluster.x-k8s.io
   resources:

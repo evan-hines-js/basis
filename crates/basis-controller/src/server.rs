@@ -1691,7 +1691,7 @@ impl basis_server::Basis for BasisApiService {
             .gpus_for_vm(&vm.id)
             .await
             .map_err(db_status)?;
-        Ok(Response::new(vm_to_machine(&vm, &gpus)))
+        Ok(Response::new(vm_to_machine(&vm, &gpus)?))
     }
 
     async fn list_machines(
@@ -1713,10 +1713,10 @@ impl basis_server::Basis for BasisApiService {
             .gpus_for_vms(&vm_ids)
             .await
             .map_err(db_status)?;
-        let machines = vms
+        let machines: Vec<Machine> = vms
             .iter()
             .map(|v| vm_to_machine(v, gpus_by_vm.remove(&v.id).as_deref().unwrap_or(&[])))
-            .collect();
+            .collect::<Result<_, Status>>()?;
         Ok(Response::new(ListMachinesResponse { machines }))
     }
 }
@@ -2135,17 +2135,37 @@ fn create_cluster_response(c: &ClusterRow) -> CreateClusterResponse {
     }
 }
 
-fn vm_to_machine(vm: &VmRow, gpus: &[GpuAssignment]) -> Machine {
-    let narrow = |field: &'static str, v: i64| -> u32 {
-        u32::try_from(v).unwrap_or_else(|_| {
-            panic!(
-                "vms.{field} = {v} on vm '{}' is out of u32 range — DB corruption",
-                vm.id
-            )
+/// Convert a `VmRow` (i64 columns) to its protobuf wire form (u32
+/// fields). Returns `Status::data_loss` when a width that should
+/// always fit in u32 doesn't — the only writer of these columns
+/// inserts proto u32 values widened to i64, so an out-of-range
+/// number on read means the row was hand-edited or a future code
+/// path skipped that path. Surfacing it as a clean RPC error rather
+/// than a panic keeps GetMachine/ListMachines from tearing down the
+/// whole gRPC stream when one bad row is in the result set.
+fn vm_to_machine(vm: &VmRow, gpus: &[GpuAssignment]) -> Result<Machine, Status> {
+    let narrow = |field: &'static str, v: i64| -> Result<u32, Status> {
+        u32::try_from(v).map_err(|_| {
+            Status::data_loss(format!(
+                "vms.{field} = {v} on vm '{}' is out of u32 range",
+                vm.id,
+            ))
         })
     };
 
-    Machine {
+    let extra_disks = vm
+        .extra_disks()
+        .map_err(|e| {
+            Status::data_loss(format!(
+                "vms.extra_disk_gibs on vm '{}' failed to parse: {e}",
+                vm.id,
+            ))
+        })?
+        .into_iter()
+        .map(|size_gib| ExtraDisk { size_gib })
+        .collect();
+
+    Ok(Machine {
         id: vm.id.clone(),
         name: vm.name.clone(),
         cluster_id: vm.cluster_id.clone(),
@@ -2153,9 +2173,9 @@ fn vm_to_machine(vm: &VmRow, gpus: &[GpuAssignment]) -> Machine {
         provider_id: provider_id(&vm.id),
         ip_address: vm.ip_address.clone(),
         state: vm.state as i32,
-        cpu: narrow("cpu", vm.cpu),
-        memory_mib: narrow("memory_mib", vm.memory_mib),
-        disk_gib: narrow("disk_gib", vm.disk_gib),
+        cpu: narrow("cpu", vm.cpu)?,
+        memory_mib: narrow("memory_mib", vm.memory_mib)?,
+        disk_gib: narrow("disk_gib", vm.disk_gib)?,
         gpus: gpus
             .iter()
             .map(|g| MachineGpu {
@@ -2165,12 +2185,8 @@ fn vm_to_machine(vm: &VmRow, gpus: &[GpuAssignment]) -> Machine {
             })
             .collect(),
         error_message: vm.error_message.clone(),
-        extra_disks: vm
-            .extra_disks()
-            .into_iter()
-            .map(|size_gib| ExtraDisk { size_gib })
-            .collect(),
-    }
+        extra_disks,
+    })
 }
 
 /// Narrower response wrapper for create/idempotent-return paths.
@@ -2279,6 +2295,59 @@ mod tests {
             tree,
             vec!["10.100.0.10/32".to_string(), "10.250.0.16/28".to_string()],
             "both apiserver /32 and LB /28 must land in internal_cluster_vips",
+        );
+    }
+
+    /// Skeleton VmRow whose narrow widths fit in u32, plus a valid
+    /// extra_disks JSON. Tests override individual fields to drive
+    /// `vm_to_machine` failure paths.
+    fn vm_row_ok() -> VmRow {
+        VmRow {
+            id: "vm-1".to_string(),
+            name: "vm-1".to_string(),
+            cluster_id: "c-1".to_string(),
+            host_id: "h-1".to_string(),
+            ip_address: "10.0.0.10".to_string(),
+            state: 2,
+            cpu: 4,
+            memory_mib: 4096,
+            disk_gib: 50,
+            extra_disk_total_gib: 0,
+            extra_disk_gibs: "[]".to_string(),
+            image: "ubuntu:22.04".to_string(),
+            error_message: String::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Sole writer of vms.cpu/memory/disk widens proto u32 → i64, so
+    /// any out-of-range value at read time means the row was edited
+    /// outside our writer (hand-edit, future code path skipping
+    /// `insert_vm`). The conversion must surface a clean RPC error
+    /// rather than panic — a panic would tear down the whole gRPC
+    /// stream when one bad row lands in a ListMachines result set.
+    #[test]
+    fn vm_to_machine_returns_data_loss_on_oversized_cpu() {
+        let mut vm = vm_row_ok();
+        vm.cpu = (u32::MAX as i64) + 1;
+        let err = vm_to_machine(&vm, &[]).expect_err("oversized cpu must fail");
+        assert_eq!(err.code(), tonic::Code::DataLoss, "code: {err:?}");
+        assert!(err.message().contains("cpu"), "message: {}", err.message());
+    }
+
+    /// Same contract for the JSON-encoded extra_disk_gibs column:
+    /// malformed JSON must not panic vm_to_machine.
+    #[test]
+    fn vm_to_machine_returns_data_loss_on_malformed_extra_disks() {
+        let mut vm = vm_row_ok();
+        vm.extra_disk_gibs = "not-json".to_string();
+        let err = vm_to_machine(&vm, &[]).expect_err("bad json must fail");
+        assert_eq!(err.code(), tonic::Code::DataLoss, "code: {err:?}");
+        assert!(
+            err.message().contains("extra_disk_gibs"),
+            "message: {}",
+            err.message(),
         );
     }
 }

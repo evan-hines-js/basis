@@ -217,10 +217,18 @@ pub async fn delete_vm(
     }
 
     if let Some(record) = record {
-        for addr in record.gpus() {
-            if let Err(e) = gpu::unbind_vfio(&addr).await {
-                warn!(vm_id, pci = %addr, error = %e, "failed to unbind GPU");
+        match record.gpus() {
+            Ok(addrs) => {
+                for addr in addrs {
+                    if let Err(e) = gpu::unbind_vfio(&addr).await {
+                        warn!(vm_id, pci = %addr, error = %e, "failed to unbind GPU");
+                    }
+                }
             }
+            Err(e) => warn!(
+                vm_id, error = %e,
+                "failed to parse local_vms.gpu_pci_addresses; skipping VFIO unbind",
+            ),
         }
     }
 

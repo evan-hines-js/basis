@@ -422,7 +422,17 @@ async fn refresh_vm_gauges(
             .set(1);
         metrics.vm_cpu_quota.with_label_values(&[vm_id]).set(vm.cpu);
 
-        let total_disk_gib = vm.disk_gib + vm.extra_disks().iter().map(|g| *g as i64).sum::<i64>();
+        let extra_total = vm
+            .extra_disks()
+            .map(|disks| disks.iter().map(|g| *g as i64).sum::<i64>())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    vm_id, error = %e,
+                    "metrics: malformed local_vms.extra_disk_gibs; reporting 0",
+                );
+                0
+            });
+        let total_disk_gib = vm.disk_gib + extra_total;
         metrics
             .vm_disk_gib
             .with_label_values(&[vm_id])

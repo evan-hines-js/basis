@@ -5,7 +5,6 @@
 
 pub mod gpu;
 pub mod holo;
-pub mod json;
 pub mod resource;
 pub mod time;
 pub mod tls;

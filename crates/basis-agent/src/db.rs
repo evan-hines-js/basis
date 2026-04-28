@@ -199,17 +199,17 @@ pub struct LocalVmRow {
 }
 
 impl LocalVmRow {
-    /// Parsed PCI addresses of every GPU assigned to this VM. One place
-    /// for the `Vec<String>` decode so a schema tweak can't drift
-    /// between `handlers.rs` and `reconcile.rs`.
-    pub fn gpus(&self) -> Vec<String> {
-        basis_common::json::parse_owned_json(&self.gpu_pci_addresses, "local_vms.gpu_pci_addresses")
+    /// Parsed PCI addresses of every GPU assigned to this VM. One
+    /// place for the `Vec<String>` decode so a schema tweak can't
+    /// drift between `handlers.rs` and `reconcile.rs`.
+    pub fn gpus(&self) -> serde_json::Result<Vec<String>> {
+        serde_json::from_str(&self.gpu_pci_addresses)
     }
 
     /// Parsed per-extra-disk sizes, in the same order the guest sees
     /// them on the virtio bus.
-    pub fn extra_disks(&self) -> Vec<u32> {
-        basis_common::json::parse_owned_json(&self.extra_disk_gibs, "local_vms.extra_disk_gibs")
+    pub fn extra_disks(&self) -> serde_json::Result<Vec<u32>> {
+        serde_json::from_str(&self.extra_disk_gibs)
     }
 }
 

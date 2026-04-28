@@ -1587,8 +1587,8 @@ impl VmRow {
         self.disk_gib + self.extra_disk_total_gib
     }
 
-    pub fn extra_disks(&self) -> Vec<u32> {
-        basis_common::json::parse_owned_json(&self.extra_disk_gibs, "vms.extra_disk_gibs")
+    pub fn extra_disks(&self) -> serde_json::Result<Vec<u32>> {
+        serde_json::from_str(&self.extra_disk_gibs)
     }
 }
 

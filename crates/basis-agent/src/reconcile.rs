@@ -317,7 +317,12 @@ async fn restart_vm(
         });
     }
 
-    let extra_disk_gibs = vm_record.extra_disks();
+    let extra_disk_gibs = vm_record
+        .extra_disks()
+        .map_err(|e| RestartError::Other(anyhow::anyhow!(
+            "VM {} has malformed local_vms.extra_disk_gibs: {e}",
+            vm_record.vm_id,
+        )))?;
     let mut data_disk_paths = Vec::with_capacity(extra_disk_gibs.len());
     for index in 0..extra_disk_gibs.len() {
         let path = lvm::data_disk_lv_path(&vm_record.vm_id, index as u32);
@@ -359,7 +364,12 @@ async fn restart_vm(
         .await
         .map_err(|e| RestartError::Other(e.into()))?;
 
-    let gpu_addrs = vm_record.gpus();
+    let gpu_addrs = vm_record
+        .gpus()
+        .map_err(|e| RestartError::Other(anyhow::anyhow!(
+            "VM {} has malformed local_vms.gpu_pci_addresses: {e}",
+            vm_record.vm_id,
+        )))?;
     let mut vfio_devices = Vec::new();
     for addr in &gpu_addrs {
         match gpu::bind_vfio(addr).await {
