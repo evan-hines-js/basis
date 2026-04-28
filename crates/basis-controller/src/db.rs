@@ -159,8 +159,15 @@ impl Db {
         //     the pool, BGP-advertised cell-wide), `1` = PRIVATE
         //     (apiserver VIP from `cidr`, never advertised). Stored as
         //     i64 to match the proto enum.
-        //   * `trust_domain` — Phase-2 BGP-community label. Empty
-        //     means untagged (cell-wide propagation, today's behavior).
+        //   * `trust_domain` — string label that scopes the eager-
+        //     bootstrap fan-out. A tree-scoped cluster is fanned out
+        //     only to hosts that already carry a cluster with the
+        //     same trust_domain. Cross-trust-domain traffic is
+        //     blocked at the dataplane by the absence of a kernel
+        //     route — no BGP filtering involved (tree VIPs aren't
+        //     advertised). Empty string ("") is its own group:
+        //     joins other empty-trust_domain clusters, doesn't
+        //     merge with named ones.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS clusters (
                 id TEXT PRIMARY KEY,
@@ -1163,6 +1170,19 @@ impl Db {
             .await?)
     }
 
+    /// Full `VmRow` for every VM the controller has on this host. Used
+    /// by the register handler to diff the controller's view against
+    /// the agent's reported `current_inventory` and reap rows the
+    /// agent says it doesn't have anymore.
+    pub async fn list_vms_on_host(&self, host_id: &str) -> Result<Vec<VmRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, VmRow>("SELECT * FROM vms WHERE host_id = ?")
+                .bind(host_id)
+                .fetch_all(&self.reader)
+                .await?,
+        )
+    }
+
     /// Point-in-time, per-host view of everything the scheduler cares
     /// about: consumed cpu / memory / disk, and the set of GPU PCI
     /// addresses already claimed. Read from the reader pool in a
@@ -1716,9 +1736,9 @@ pub struct ClusterRow {
     /// CIDR of this cluster's LoadBalancer Service block. Empty when
     /// the cluster asked for 0 service IPs.
     pub service_block_cidr: String,
-    /// Trust-domain label. Empty = untagged (today's behavior, VIPs
-    /// propagate cell-wide). Phase 2 will translate this to a BGP
-    /// community for VIP isolation.
+    /// Trust-domain label that scopes the controller's eager-bootstrap
+    /// fan-out for tree-scoped pool VIPs (see
+    /// `build_reconcile_command`). Empty is its own group.
     pub trust_domain: String,
     pub created_at: String,
 }

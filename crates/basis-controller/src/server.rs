@@ -18,7 +18,7 @@ use basis_common::gpu::GpuInfo;
 use basis_common::time::now_rfc3339;
 use basis_common::tls;
 
-use crate::config::{BgpConfig, NetworkConfig, Pool};
+use crate::config::{BgpConfig, NetworkConfig, Pool, SafetyConfig};
 use crate::db::{
     ClusterIdentity, ClusterRow, Db, DbError, GpuAssignment, VmRow, VM_STATE_PENDING_TEARDOWN,
 };
@@ -86,16 +86,29 @@ pub fn provider_id(vm_id: &str) -> String {
 /// tree-scoped lists for `ClusterState.cluster_vips` and
 /// `ClusterState.internal_cluster_vips` respectively.
 ///
-/// Pool scope decides which list each VIP goes into:
+/// `apiserver_visibility` decides where the apiserver VIP comes
+/// FROM — `APISERVER_PUBLIC` allocates it from `external_pool`,
+/// `APISERVER_PRIVATE` puts it at the last usable address in the
+/// cluster's tree CIDR (and so it doesn't appear in either list,
+/// since it's reachable purely via the cluster's bridge route from
+/// `gateway_ip`). `pool.scope` decides where any pool-allocated VIP
+/// is reachable:
+///
 /// * `Lan` — advertised cell-wide via BGP, proxy-ARPed onto the
-///   uplink, and bridge route. The LAN can reach the VIP.
+///   uplink, and bridge route. LAN-reachable.
 /// * `Tree` — bridge route only, no BGP/proxy-ARP. The LAN can NOT
 ///   reach the VIP; cross-cluster reachability within the cell flows
 ///   through each host's per-cluster bridge.
 ///
-/// `APISERVER_PUBLIC + Tree` is rejected at CreateCluster, so a
-/// public apiserver VIP only ever appears for a Lan pool. The
-/// cluster's overlay CIDR itself is intentionally NOT advertised
+/// `APISERVER_PUBLIC + Tree` is therefore a valid combination — the
+/// apiserver VIP is allocated from the tree pool's CIDR and is
+/// reachable from any cluster in the cell that can route to that
+/// CIDR (every host installs a bridge route via the eager-bootstrap
+/// path), but never reaches the LAN. That's the intended shape for
+/// internal clusters whose apiserver needs a stable named-pool
+/// address without LAN exposure.
+///
+/// The cluster's overlay CIDR itself is intentionally NOT advertised
 /// either way: VM IPs are private to the cluster's bridge, no
 /// inter-cluster L3.
 ///
@@ -112,7 +125,12 @@ fn classify_cluster_vips(
     let mut internal_cluster_vips: Vec<String> = Vec::with_capacity(2);
     if visibility == ApiserverVisibility::ApiserverPublic {
         if let Ok(vip) = cluster.control_plane_endpoint.parse::<std::net::Ipv4Addr>() {
-            cluster_vips.push(format!("{vip}/32"));
+            let target = if pool.is_tree() {
+                &mut internal_cluster_vips
+            } else {
+                &mut cluster_vips
+            };
+            target.push(format!("{vip}/32"));
         }
     }
     if !cluster.service_block_cidr.is_empty() {
@@ -159,6 +177,7 @@ pub struct BasisServer {
     dns_servers: Arc<Vec<String>>,
     network: Arc<NetworkConfig>,
     bgp: Arc<BgpConfig>,
+    safety: Arc<SafetyConfig>,
     reconcile_interval: std::time::Duration,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     pending_ops: Arc<DashMap<String, PendingVmOp>>,
@@ -180,6 +199,7 @@ impl BasisServer {
         dns_servers: Vec<String>,
         network: NetworkConfig,
         bgp: BgpConfig,
+        safety: SafetyConfig,
     ) -> Self {
         Self {
             db,
@@ -187,6 +207,7 @@ impl BasisServer {
             dns_servers: Arc::new(dns_servers),
             network: Arc::new(network),
             bgp: Arc::new(bgp),
+            safety: Arc::new(safety),
             reconcile_interval: DEFAULT_AGENT_RECONCILE_INTERVAL,
             agents: Arc::new(DashMap::new()),
             pending_ops: Arc::new(DashMap::new()),
@@ -236,6 +257,7 @@ impl BasisServer {
             dns_servers: self.dns_servers.clone(),
             network: self.network.clone(),
             bgp: self.bgp.clone(),
+            safety: self.safety.clone(),
             agents: self.agents.clone(),
             placement_lock: Mutex::new(()),
         });
@@ -259,6 +281,7 @@ struct SharedCtx {
     dns_servers: Arc<Vec<String>>,
     network: Arc<NetworkConfig>,
     bgp: Arc<BgpConfig>,
+    safety: Arc<SafetyConfig>,
     agents: Arc<DashMap<String, ConnectedAgent>>,
     /// Serializes placement: held across `pick_host` → `insert_vm` so
     /// each scoring pass sees the prior placement's commit. Without
@@ -322,6 +345,7 @@ impl SharedCtx {
                 gateway_ip: membership.bridge_ip.clone(),
                 prefix_len: cluster.prefix_len as u32,
                 vtep_addresses: self.db.list_cluster_vteps(&cluster.id).await?,
+                trust_domain: cluster.trust_domain.clone(),
                 cluster_vips,
                 internal_cluster_vips,
             });
@@ -338,6 +362,16 @@ impl SharedCtx {
         // is installed because `internal_cluster_vips` is populated.
         // Cluster cidr/gateway/MASQUERADE are deliberately skipped —
         // those only matter for hosts running VMs of the cluster.
+        //
+        // Trust-domain isolation is enforced on the agent side via
+        // per-tree Linux VRFs — every `brc<vni>` is enslaved to the
+        // VRF named after its `trust_domain`, and route fan-out
+        // installs into that VRF's table. So fan-out here is
+        // unconditional: the controller ships every tree cluster to
+        // every host, and the kernel makes cross-tree traffic die
+        // when the source bridge's VRF table has no route to the
+        // foreign tree's VIPs. trust_domain is metadata on the tree,
+        // not a host attribute.
         for cluster in self.db.list_clusters().await? {
             if carried.contains(&cluster.id) {
                 continue;
@@ -355,10 +389,26 @@ impl SharedCtx {
             if !pool.is_tree() {
                 continue;
             }
-            let mut internal_cluster_vips: Vec<String> = Vec::with_capacity(1);
-            // APISERVER_PUBLIC is rejected at CreateCluster for tree
-            // pools, so apiserver VIPs never need fan-out — only the
-            // LB Service block does.
+            let mut internal_cluster_vips: Vec<String> = Vec::with_capacity(2);
+            // For tree pools, both the apiserver VIP (when
+            // APISERVER_PUBLIC) and the LB Service block fan out so
+            // every host can route the cell-internal address into the
+            // cluster's bridge. APISERVER_PRIVATE puts the apiserver
+            // VIP at the last usable address in the cluster's tree
+            // CIDR — that's reachable via `gateway_ip` on the bridge,
+            // no separate `internal_cluster_vips` entry needed.
+            let visibility = ApiserverVisibility::try_from(cluster.apiserver_visibility as i32)
+                .map_err(|_| {
+                    DbError::Malformed(format!(
+                        "cluster {} has unknown apiserver_visibility {}",
+                        cluster.id, cluster.apiserver_visibility,
+                    ))
+                })?;
+            if visibility == ApiserverVisibility::ApiserverPublic {
+                if let Ok(vip) = cluster.control_plane_endpoint.parse::<std::net::Ipv4Addr>() {
+                    internal_cluster_vips.push(format!("{vip}/32"));
+                }
+            }
             if !cluster.service_block_cidr.is_empty() {
                 internal_cluster_vips.push(cluster.service_block_cidr.clone());
             }
@@ -369,6 +419,7 @@ impl SharedCtx {
                 gateway_ip: String::new(),
                 prefix_len: 0,
                 vtep_addresses: self.db.list_cluster_vteps(&cluster.id).await?,
+                trust_domain: cluster.trust_domain.clone(),
                 cluster_vips: Vec::new(),
                 internal_cluster_vips,
             });
@@ -399,32 +450,34 @@ impl SharedCtx {
     /// for any kernel state the agent reports but the controller
     /// doesn't track.
     ///
-    /// Synthesised tombstones aren't backed by DB rows — there's
-    /// nothing to drop on ack — so re-emitting them on a subsequent
-    /// register (if the first ack was lost) just produces another
-    /// idempotent no-op teardown on the agent side. The agent's
-    /// `delete_vm` / `tombstone_cluster` tear-down paths are
-    /// idempotent; missing local state is the desired end state.
+    /// Gated on `safety.auto_reconcile_orphan_inventory`. When the
+    /// flag is OFF (default), this function logs every orphan loudly
+    /// and changes nothing, so an operator can see "the agents have
+    /// state I don't recognise" and decide whether the DB has been
+    /// lost (don't tombstone — restore the DB) or wiped deliberately
+    /// (flip the flag, restart, agents reconnect, clean up). This is
+    /// the safety mechanism that prevents
+    /// "controller.db lost ⇒ every VM auto-deleted on reconnect".
     ///
-    /// This is the controller's only escape hatch for the
-    /// "controller DB wiped while agents kept running" disaster-
-    /// recovery flow. Without it, a fresh controller would see no
-    /// host_clusters / vms rows for the host and emit an empty
-    /// reconcile, leaving every bridge/VM as an orphan forever.
+    /// When the flag is ON, synthesised tombstones aren't backed by
+    /// DB rows — there's nothing to drop on ack — so re-emitting them
+    /// on a subsequent register (if the first ack was lost) just
+    /// produces another idempotent no-op teardown on the agent side.
     async fn extend_with_orphan_tombstones(
         &self,
         host_id: &str,
         inventory: &HostInventory,
         cmd: &mut ReconcileHostCommand,
     ) -> Result<(), DbError> {
-        // VMs the agent reports that aren't in `vms` for THIS host
-        // become synthetic vm_tombstones. A vms row on a different
-        // host_id (the controller has moved/re-recorded the VM
-        // elsewhere) also counts as orphan from this host's
-        // perspective — keep the local copy from squatting.
-        let mut already_tombstoned: HashSet<String> = cmd.vm_tombstones.iter().cloned().collect();
+        // First pass: classify every reported resource as either
+        // tracked (DB has a row), already-tombstoned (in this
+        // reconcile's lists), or orphan. Orphans are the candidates
+        // that either get appended (flag ON) or merely logged
+        // (flag OFF, default — the safety freeze).
+        let already_t_vms: HashSet<String> = cmd.vm_tombstones.iter().cloned().collect();
+        let mut orphan_vm_ids: Vec<String> = Vec::new();
         for vm_id in &inventory.vm_ids {
-            if already_tombstoned.contains(vm_id) {
+            if already_t_vms.contains(vm_id) {
                 continue;
             }
             let owned_here = match self.db.get_vm(vm_id).await {
@@ -433,17 +486,10 @@ impl SharedCtx {
                 Err(e) => return Err(e),
             };
             if !owned_here {
-                cmd.vm_tombstones.push(vm_id.clone());
-                already_tombstoned.insert(vm_id.clone());
+                orphan_vm_ids.push(vm_id.clone());
             }
         }
 
-        // Cluster bridges the agent reports that the controller has
-        // no host_clusters row for (in either ACTIVE or PENDING
-        // state) become synthetic cluster_tombstones. The agent's
-        // reported cidr is the source of truth for the MASQUERADE-
-        // rule removal — the controller may not even have a clusters
-        // row for that vni after a wipe.
         let mut tracked_vnis: HashSet<u32> = self
             .db
             .list_active_host_clusters(host_id)
@@ -454,13 +500,48 @@ impl SharedCtx {
         for t in &self.db.list_pending_cluster_tombstones(host_id).await? {
             tracked_vnis.insert(t.vni as u32);
         }
-        let mut already_t_vnis: HashSet<u32> =
-            cmd.cluster_tombstones.iter().map(|t| t.vni).collect();
+        let already_t_vnis: HashSet<u32> = cmd.cluster_tombstones.iter().map(|t| t.vni).collect();
+        let mut orphan_clusters: Vec<&InventoryCluster> = Vec::new();
         for inv_cluster in &inventory.clusters {
             if tracked_vnis.contains(&inv_cluster.vni) || already_t_vnis.contains(&inv_cluster.vni)
             {
                 continue;
             }
+            orphan_clusters.push(inv_cluster);
+        }
+
+        if orphan_vm_ids.is_empty() && orphan_clusters.is_empty() {
+            return Ok(());
+        }
+
+        // When `safety.auto_reconcile_orphan_inventory` is OFF, log
+        // every orphan loudly and return WITHOUT appending
+        // tombstones. The agent's reconcile keeps everything alive —
+        // exactly the behaviour we want when the controller's DB has
+        // been lost or restored from an old snapshot.
+        if !self.safety.auto_reconcile_orphan_inventory {
+            warn!(
+                host_id,
+                orphan_vm_ids = ?orphan_vm_ids,
+                orphan_cluster_vnis = ?orphan_clusters.iter().map(|c| c.vni).collect::<Vec<_>>(),
+                "agent reports inventory the controller's DB doesn't track; preserving \
+                 it untouched. Set spec.safety.autoReconcileOrphanInventory=true to \
+                 auto-clean (only do that if the DB was wiped deliberately). Otherwise \
+                 restore the controller DB before flipping the flag.",
+            );
+            return Ok(());
+        }
+
+        warn!(
+            host_id,
+            orphan_vm_ids = ?orphan_vm_ids,
+            orphan_cluster_vnis = ?orphan_clusters.iter().map(|c| c.vni).collect::<Vec<_>>(),
+            "autoReconcileOrphanInventory=true: emitting one-shot tombstones for \
+             unrecognised inventory; agent will tear these down on receipt",
+        );
+
+        cmd.vm_tombstones.extend(orphan_vm_ids);
+        for inv_cluster in orphan_clusters {
             cmd.cluster_tombstones.push(ClusterTombstone {
                 vni: inv_cluster.vni,
                 // The controller has no cluster_id for this orphan;
@@ -469,7 +550,6 @@ impl SharedCtx {
                 cluster_id: String::new(),
                 cidr: inv_cluster.cidr.clone(),
             });
-            already_t_vnis.insert(inv_cluster.vni);
         }
         Ok(())
     }
@@ -518,6 +598,145 @@ impl SharedCtx {
         for host_id in hosts {
             self.push_reconcile(&host_id).await;
         }
+    }
+
+    /// Roll a VM the controller knows about but no longer has on the
+    /// host (failed CreateMachine, VM disappeared from agent
+    /// inventory, etc.) into the tombstone-driven teardown pipeline.
+    /// Mark the VM pending teardown (no-op if its row never made it
+    /// in), mark its host_cluster pending teardown iff this was the
+    /// last live VM there, then nudge the host so the next reconcile
+    /// carries the tombstones. Allocations + the vms row drain via
+    /// the agent's `TombstoneAck` — same path every other delete
+    /// takes.
+    async fn cleanup_failed_vm(&self, vm_id: &str, cluster_id: &str, host_id: &str) {
+        match self.db.mark_vm_pending_teardown(vm_id).await {
+            Ok(()) => {}
+            // No vms row means insert_vm never landed (e.g. capacity
+            // race lost). The orphan ip_allocations entry is released
+            // below; nothing else to do.
+            Err(DbError::NotFound(_)) => {}
+            Err(e) => warn!(vm_id, error = %e, "cleanup: mark VM pending teardown"),
+        }
+        if let Err(e) = self.db.release_vm_ips(vm_id).await {
+            warn!(vm_id, error = %e, "cleanup: release VM IPs");
+        }
+        if let Err(e) = self
+            .db
+            .mark_host_cluster_pending_teardown(cluster_id, host_id)
+            .await
+        {
+            warn!(
+                vm_id, cluster_id, host_id, error = %e,
+                "cleanup: mark host_cluster pending teardown",
+            );
+        }
+        self.push_reconcile(host_id).await;
+    }
+
+    /// Reverse-direction inventory reconciliation: the controller's
+    /// DB has rows the agent's reported `current_inventory` doesn't
+    /// include. Three cases, all converted into the standard
+    /// teardown pipeline so there is exactly one "delete" code path:
+    ///
+    ///   * VM in PENDING/CREATING/RUNNING — call `cleanup_failed_vm`.
+    ///     The row flips to PENDING_TEARDOWN, the agent gets a
+    ///     tombstone (idempotent no-op since it has no such VM), and
+    ///     the next ack drops the row + releases allocations.
+    ///   * VM in PENDING_TEARDOWN — synthesise an ack-equivalent: the
+    ///     teardown is implicitly satisfied (the resource is gone),
+    ///     so drop the row + release IPs/GPUs directly via
+    ///     `ack_tombstones`. Symmetric to the agent-orphan path
+    ///     where the controller synthesises a one-shot tombstone.
+    ///   * host_cluster in PENDING_TEARDOWN — same ack-equivalent.
+    ///
+    /// Terminal-state VMs (FAILED/STOPPED) are left alone — they're
+    /// already in a CAPI-visible terminal state and not running, so
+    /// agent-side absence isn't surprising.
+    ///
+    /// Active host_clusters that the agent doesn't have are NOT
+    /// reaped here: the additive reconcile carried in the same
+    /// register-ack will recreate the bridge from `clusters[]` on
+    /// the next apply pass. Reaping the row would be wrong.
+    ///
+    /// Gated by `safety.auto_reconcile_orphan_inventory`: when the
+    /// flag is OFF (default), log loudly and return without touching
+    /// the DB. Symmetric to `extend_with_orphan_tombstones`.
+    async fn reap_db_orphans_from_inventory(
+        &self,
+        host_id: &str,
+        inventory: &HostInventory,
+    ) -> Result<(), DbError> {
+        let inv_vms: HashSet<&str> = inventory.vm_ids.iter().map(String::as_str).collect();
+        let inv_vnis: HashSet<u32> = inventory.clusters.iter().map(|c| c.vni).collect();
+
+        let mut live_orphans: Vec<VmRow> = Vec::new();
+        let mut pending_vm_orphans: Vec<String> = Vec::new();
+        for vm in self.db.list_vms_on_host(host_id).await? {
+            if inv_vms.contains(vm.id.as_str()) {
+                continue;
+            }
+            match vm.state {
+                s if s == VM_STATE_PENDING_TEARDOWN => pending_vm_orphans.push(vm.id.clone()),
+                s if s == MachineState::Pending as i64
+                    || s == MachineState::Creating as i64
+                    || s == MachineState::Running as i64 =>
+                {
+                    live_orphans.push(vm);
+                }
+                _ => {}
+            }
+        }
+
+        let mut pending_cluster_orphans: Vec<u32> = Vec::new();
+        for t in self.db.list_pending_cluster_tombstones(host_id).await? {
+            let vni = t.vni as u32;
+            if !inv_vnis.contains(&vni) {
+                pending_cluster_orphans.push(vni);
+            }
+        }
+
+        if live_orphans.is_empty()
+            && pending_vm_orphans.is_empty()
+            && pending_cluster_orphans.is_empty()
+        {
+            return Ok(());
+        }
+
+        if !self.safety.auto_reconcile_orphan_inventory {
+            warn!(
+                host_id,
+                live_vm_orphans = ?live_orphans.iter().map(|v| &v.id).collect::<Vec<_>>(),
+                pending_vm_orphans = ?pending_vm_orphans,
+                pending_cluster_orphans = ?pending_cluster_orphans,
+                "DB has rows the agent's inventory doesn't include; preserving them \
+                 untouched. Set spec.safety.autoReconcileOrphanInventory=true to roll \
+                 live VMs into the teardown pipeline + reap pending teardowns. \
+                 Otherwise investigate manually — agent inventory may be stale or buggy.",
+            );
+            return Ok(());
+        }
+
+        warn!(
+            host_id,
+            live_vm_orphans = ?live_orphans.iter().map(|v| &v.id).collect::<Vec<_>>(),
+            pending_vm_orphans = ?pending_vm_orphans,
+            pending_cluster_orphans = ?pending_cluster_orphans,
+            "autoReconcileOrphanInventory=true: rolling live orphan VMs into the \
+             teardown pipeline; ack-completing pending teardowns the agent \
+             already lacks",
+        );
+
+        for vm in &live_orphans {
+            self.cleanup_failed_vm(&vm.id, &vm.cluster_id, host_id)
+                .await;
+        }
+        if !pending_vm_orphans.is_empty() || !pending_cluster_orphans.is_empty() {
+            self.db
+                .ack_tombstones(host_id, &pending_cluster_orphans, &pending_vm_orphans)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -596,38 +815,6 @@ impl BasisApiService {
             .allocate_service_block(&pool.name, &range, cluster_id, count)
             .await
             .map_err(db_status)
-    }
-
-    /// Roll a failed CreateMachine back into the tombstone-driven
-    /// teardown pipeline. Mark the VM pending teardown (no-op if its
-    /// row never made it in), mark its host_cluster pending teardown
-    /// iff this was the last live VM there, then nudge the host so the
-    /// next reconcile carries the tombstones. Allocations + the vms
-    /// row drain via the agent's TombstoneAck like every other delete.
-    async fn cleanup_failed_vm(&self, vm_id: &str, cluster_id: &str, host_id: &str) {
-        match self.shared.db.mark_vm_pending_teardown(vm_id).await {
-            Ok(()) => {}
-            // No vms row means insert_vm never landed (e.g. capacity
-            // race lost). The orphan ip_allocations entry is released
-            // below; nothing else to do.
-            Err(DbError::NotFound(_)) => {}
-            Err(e) => warn!(vm_id, error = %e, "cleanup: mark VM pending teardown"),
-        }
-        if let Err(e) = self.shared.db.release_vm_ips(vm_id).await {
-            warn!(vm_id, error = %e, "cleanup: release VM IPs");
-        }
-        if let Err(e) = self
-            .shared
-            .db
-            .mark_host_cluster_pending_teardown(cluster_id, host_id)
-            .await
-        {
-            warn!(
-                vm_id, cluster_id, host_id, error = %e,
-                "cleanup: mark host_cluster pending teardown",
-            );
-        }
-        self.shared.push_reconcile(host_id).await;
     }
 
     fn register_pending_op(
@@ -964,31 +1151,6 @@ impl basis_server::Basis for BasisApiService {
 
         // Fail fast on a bad pool name before allocating anything.
         let pool = self.resolve_pool(&req.external_ip_pool)?;
-
-        // Tree-scoped pools are LAN-invisible; a public apiserver VIP
-        // needs to be reachable from the LAN, so the combination is
-        // never useful and is rejected at create time so the operator
-        // gets a clear error rather than a silent unreachable apiserver.
-        if pool.is_tree() && visibility == ApiserverVisibility::ApiserverPublic {
-            return Err(Status::invalid_argument(format!(
-                "pool '{}' is tree-scoped (cell-internal); public apiserver VIPs require a Lan-scoped pool",
-                pool.name,
-            )));
-        }
-        // Phase 1 leniency: tree pools without a `trust_domain` work
-        // (they're cell-internal, not yet trust-domain-isolated).
-        // Phase 2 will turn this into a hard error once BGP communities
-        // enforce per-trust-domain scoping. Warn so the operator is on
-        // notice now.
-        if pool.is_tree() && req.trust_domain.is_empty() {
-            warn!(
-                cluster = %req.name,
-                pool = %pool.name,
-                "tree-scoped pool used without trust_domain — VIPs will not be \
-                 trust-domain-isolated until trust_domain is set (Phase 2 will \
-                 reject this configuration)"
-            );
-        }
 
         // Idempotent by name.
         if let Some(existing) = self
@@ -1352,7 +1514,9 @@ impl basis_server::Basis for BasisApiService {
                     vm_id = %vm_id, host_id = %host_id, error = %e,
                     "host bridge IP allocation failed after insert; cleaning up"
                 );
-                self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
+                self.shared
+                    .cleanup_failed_vm(&vm_id, &cluster.id, &host_id)
+                    .await;
                 return Err(db_status(e));
             }
         };
@@ -1366,7 +1530,9 @@ impl basis_server::Basis for BasisApiService {
         let Some(agent) = self.shared.agents.get(&host_id) else {
             outcome.set("no_agent");
             warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: scheduled host has no connected agent");
-            self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
+            self.shared
+                .cleanup_failed_vm(&vm_id, &cluster.id, &host_id)
+                .await;
             return Err(Status::unavailable(format!(
                 "agent for host '{host_id}' not connected"
             )));
@@ -1404,7 +1570,9 @@ impl basis_server::Basis for BasisApiService {
         info!(vm_id = %vm_id, host_id = %host_id, vni = cluster.vni, "CreateMachine: dispatching CreateVm to agent");
         if agent.command_tx.send(cmd).await.is_err() {
             self.pending_ops.remove(&vm_id);
-            self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
+            self.shared
+                .cleanup_failed_vm(&vm_id, &cluster.id, &host_id)
+                .await;
             outcome.set("stream_closed");
             warn!(
                 vm_id = %vm_id,
@@ -1423,7 +1591,9 @@ impl basis_server::Basis for BasisApiService {
                 Ok(Response::new(vm_to_create_response(&row)))
             }
             Ok(Ok(Err(failure))) => {
-                self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
+                self.shared
+                    .cleanup_failed_vm(&vm_id, &cluster.id, &host_id)
+                    .await;
                 if failure.transient {
                     outcome.set("busy");
                     warn!(
@@ -1449,7 +1619,9 @@ impl basis_server::Basis for BasisApiService {
             Ok(Err(_)) => {
                 outcome.set("agent_error");
                 warn!(vm_id = %vm_id, host_id = %host_id, "CreateMachine: agent disconnected during VM creation");
-                self.cleanup_failed_vm(&vm_id, &cluster.id, &host_id).await;
+                self.shared
+                    .cleanup_failed_vm(&vm_id, &cluster.id, &host_id)
+                    .await;
                 Err(Status::internal("agent disconnected during VM creation"))
             }
             Err(_) => {
@@ -1604,14 +1776,33 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
         // Initial reconcile — agent uses this to build bridges +
         // process tombstones before accepting any CreateVm. The
         // inventory the agent reported gets diffed against the DB
-        // and any orphans (kernel state the controller doesn't track)
-        // become one-shot synthesised tombstones in this reply.
+        // in BOTH directions, gated by `safety.autoReconcileOrphanInventory`:
+        //   * agent has, DB doesn't → synthesise one-shot tombstones
+        //     in this reply (`extend_with_orphan_tombstones`).
+        //   * DB has, agent doesn't → roll live VMs into the
+        //     pipeline + ack-complete pending teardowns
+        //     (`reap_db_orphans_from_inventory`). Re-build the
+        //     reconcile command afterwards so the new tombstones
+        //     emitted by `cleanup_failed_vm` ride this same ack.
         let mut initial_state = self
             .shared
             .build_reconcile_command(&host_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if let Some(inv) = register.current_inventory.as_ref() {
+            self.shared
+                .extend_with_orphan_tombstones(&host_id, inv, &mut initial_state)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.shared
+                .reap_db_orphans_from_inventory(&host_id, inv)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            initial_state = self
+                .shared
+                .build_reconcile_command(&host_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
             self.shared
                 .extend_with_orphan_tombstones(&host_id, inv, &mut initial_state)
                 .await
@@ -2069,5 +2260,25 @@ mod tests {
             classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPrivate, &p);
         assert!(lan.is_empty());
         assert!(tree.is_empty());
+    }
+
+    /// Tree pool + apiserver-public: the apiserver VIP is allocated
+    /// from the tree pool's CIDR and routes through every host's
+    /// per-cluster bridge — cell-wide reachable but never on the LAN.
+    /// Both VIPs land in `internal_cluster_vips`.
+    #[test]
+    fn classify_tree_public_routes_apiserver_vip_to_internal() {
+        let cluster = cluster_with("cell-internal", true, "10.250.0.16/28");
+        let p = pool("cell-internal", PoolScope::Tree);
+        let (lan, tree) = classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPublic, &p);
+        assert!(
+            lan.is_empty(),
+            "tree pool VIPs must never appear in `cluster_vips` (the LAN-routable list)",
+        );
+        assert_eq!(
+            tree,
+            vec!["10.100.0.10/32".to_string(), "10.250.0.16/28".to_string()],
+            "both apiserver /32 and LB /28 must land in internal_cluster_vips",
+        );
     }
 }

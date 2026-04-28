@@ -56,12 +56,16 @@ message CreateClusterRequest {
   // inside the cluster CIDR (CAPI access flows through the parent
   // cell's lattice-operator API proxy).
   ApiserverVisibility apiserver_visibility = 4;
-  // Trust-domain label, propagated to BGP communities in Phase 2 of
-  // the network design so VIPs are only installed on hosts whose
-  // local clusters subscribe to the same trust domain. Empty (the
-  // default) means "untagged" — VIPs propagate to every host in the
-  // cell. Phase 1 stores the field but doesn't wire it through to
-  // holod yet.
+  // Trust-domain label that scopes the eager-bootstrap fan-out for
+  // tree-scoped pool VIPs. A tree cluster's bridge is fanned out to
+  // host H iff H already carries a cluster with the same
+  // trust_domain — so cross-trust-domain reachability dies at the
+  // source's host kernel from a missing route. Empty string ("") is
+  // its own group: joins other empty-trust_domain clusters but not
+  // any named one. Operators wanting strict isolation between
+  // tenants assign a non-empty trust_domain per tenant. Has no
+  // effect on Lan-scoped pools (their VIPs are LAN-routable by
+  // definition).
   string trust_domain = 5;
 }
 
@@ -372,6 +376,13 @@ message ClusterState {
   // this cluster. Learning is disabled on the VXLAN device, so this
   // list is the FDB's BUM destination set.
   repeated string vtep_addresses = 6;
+  // Trust-domain label of the tree this cluster belongs to. The
+  // agent maps this to a per-tree Linux VRF: every `brc<vni>` for
+  // a tree is enslaved to the tree's VRF, and the tree's prefix
+  // routes are installed in that VRF's routing table. Cross-tree
+  // traffic dies in the kernel because each tree's table only
+  // holds its own routes.
+  string trust_domain = 9;
   // LAN-routable cluster VIPs (apiserver VIP when `APISERVER_PUBLIC`
   // + LB Service block from a `Lan`-scoped pool) as `<addr>/<prefix>`
   // strings. The agent advertises these via BGP (with self as
@@ -380,15 +391,16 @@ message ClusterState {
   // set — kube-vip leader election within the cluster settles which
   // CP VM owns the apiserver VIP at any moment.
   repeated string cluster_vips = 7;
-  // Tree-scoped cluster VIPs (apiserver VIP when `APISERVER_PRIVATE`
-  // + LB Service block from a `Tree`-scoped pool, when configured).
-  // Agent installs the bridge route only — no proxy-ARP on the
-  // uplink, no BGP advertisement in Phase 1. The LAN cannot reach
-  // these; cross-cluster reachability inside the cell flows through
-  // each host's per-cluster bridge (eagerly bootstrapped on every
-  // host for tree-scoped clusters via `ClusterState` entries with
-  // empty `gateway_ip`/`cidr`). Phase 2 will advertise these via BGP
-  // with a community derived from the cluster's `trust_domain`.
+  // Tree-scoped cluster VIPs (apiserver VIP and/or LB Service block
+  // from a `Tree`-scoped pool). Agent installs the bridge route only
+  // — no proxy-ARP on the uplink, no BGP advertisement. The LAN
+  // cannot reach these; cross-cluster reachability inside the cell
+  // flows through each host's per-cluster bridge (eagerly
+  // bootstrapped on hosts whose carried clusters share the cluster's
+  // `trust_domain`, via `ClusterState` entries with empty
+  // `gateway_ip`/`cidr`). Cross-trust-domain traffic stops at the
+  // source's host kernel from a missing route — the dataplane is
+  // the trust boundary.
   repeated string internal_cluster_vips = 8;
 }
 

@@ -16,8 +16,10 @@
 
 use std::time::{Duration, Instant};
 
+use k8s_openapi::api::core::v1::Namespace;
 use kube::api::{Api, ListParams};
 use kube::Client;
+use kube::ResourceExt;
 use serde::de::DeserializeOwned;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -36,6 +38,50 @@ pub async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
     wait_for_crd::<BasisMachine>(client, "BasisMachine", deadline).await?;
     wait_for_crd::<BasisMachineTemplate>(client, "BasisMachineTemplate", deadline).await?;
     Ok(())
+}
+
+/// Resolve the trust-domain identifier this provider stamps onto every
+/// `BasisCluster` it creates. Two-tier lookup:
+///
+///   1. `BASIS_TRUST_DOMAIN` env var — if set non-empty, use it
+///      verbatim. This is how a child cluster inherits its parent's
+///      tree (the parent's provider sets the env on the child's
+///      provider Deployment at install time) and how an operator
+///      overrides the default if they want to merge two roots.
+///   2. The `kube-system` Namespace UID — the root fallback. The
+///      namespace is created at apiserver bootstrap and its UID is
+///      immutable for the cluster's lifetime, so this is stable
+///      across provider restarts and CAPI restarts.
+///
+/// Every `BasisCluster` spawned by the same root therefore shares a
+/// tree (and a per-tree VRF on every basis host); clusters spawned by
+/// different roots land in different trees and are isolated at the
+/// kernel routing level. Operator-invisible at the cluster level —
+/// the contract is "two clusters under the same Lattice root can
+/// talk; under different roots they can't."
+///
+/// Fail loud if both lookups fail: running without a trust-domain
+/// identity would silently merge every basis cluster the provider
+/// touches into the empty-trust-domain tree and break isolation.
+pub async fn read_trust_domain(client: &Client) -> anyhow::Result<String> {
+    if let Ok(explicit) = std::env::var("BASIS_TRUST_DOMAIN") {
+        if !explicit.is_empty() {
+            info!(trust_domain = %explicit, "trust domain set via BASIS_TRUST_DOMAIN");
+            return Ok(explicit);
+        }
+    }
+    let api: Api<Namespace> = Api::all(client.clone());
+    let ns = api
+        .get("kube-system")
+        .await
+        .map_err(|e| anyhow::anyhow!("read kube-system namespace for trust domain: {e}"))?;
+    let uid = ns.uid().ok_or_else(|| {
+        anyhow::anyhow!(
+            "kube-system namespace has no UID — apiserver state is corrupt or non-conformant"
+        )
+    })?;
+    info!(trust_domain = %uid, "trust domain resolved from kube-system namespace UID (root fallback)");
+    Ok(uid)
 }
 
 async fn wait_for_crd<K>(client: &Client, kind: &str, deadline: Instant) -> anyhow::Result<()>

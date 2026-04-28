@@ -93,6 +93,28 @@ basis_cpu_overcommit_ratio: 4.0
 basis_bgp_asn: 64512
 basis_bgp_router_id: "{{ hostvars[groups['basis_controller'][0]]['ansible_host'] }}"
 
+# Bidirectional inventory reconciliation on agent register.
+# Compares the agent's reported `current_inventory` against the
+# controller's DB and acts on the discrepancies.
+#
+#   false (default, prod-safe):
+#     The controller logs every discrepancy loudly but changes
+#     nothing. Agent kernel state, VMs, and DB rows all stay put.
+#     Use this in production: a DB loss should NEVER cause an
+#     automatic teardown of running workloads.
+#
+#   true (dev / test):
+#     The controller automatically reconciles in BOTH directions —
+#     synthesises one-shot tombstones for kernel state the DB
+#     doesn't track AND rolls DB rows the agent doesn't have into
+#     the standard teardown pipeline. Useful for CI / dev loops
+#     where wiping controller.db and letting the cell reset is the
+#     workflow.
+#
+# Flip per-environment in host/group vars only after you've decided
+# the wipe is intentional.
+basis_auto_reconcile_orphan_inventory: true
+
 # Where the playbook finds binaries on the control node. Build with
 # `cargo build --release` before running.
 basis_repo_root: "{{ playbook_dir }}/../.."

@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         config.dns_servers,
         config.network,
         config.bgp,
+        config.safety,
     )
     .serve(listener, tls_config, shutdown)
     .await?;

@@ -62,6 +62,13 @@ where
 pub struct ProviderContext {
     pub client: Client,
     pub clients: Arc<BasisClientCache>,
+    /// Trust-domain identifier stamped onto every `BasisCluster` this
+    /// provider creates. Resolved once at startup via
+    /// `startup::read_trust_domain` (env override or kube-system UID
+    /// fallback). All clusters spawned by this provider share the
+    /// value, so they all land in the same per-tree VRF on every
+    /// basis host.
+    pub trust_domain: String,
 }
 
 /// Properties every reconcile-error type carries. Keeps the failure

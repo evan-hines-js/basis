@@ -155,7 +155,7 @@ async fn apply(
             external_ip_pool: cluster.spec.external_ip_pool.clone(),
             external_service_ips: cluster.spec.external_service_ips,
             apiserver_visibility: cluster.spec.apiserver_visibility.into(),
-            trust_domain: cluster.spec.trust_domain.clone().unwrap_or_default(),
+            trust_domain: ctx.trust_domain.clone(),
         })
         .await?;
 

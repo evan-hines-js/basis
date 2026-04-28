@@ -15,8 +15,18 @@ pub const API_VERSION: &str = "v1alpha1";
 ///
 /// User input is `credentialsRef` (how to reach the basis controller),
 /// `externalIpPool` (where the LB Service block — and the apiserver
-/// VIP, if public — comes from), `apiserverVisibility` (cell-public
-/// vs cluster-private), and the optional `trustDomain` label.
+/// VIP, if public — comes from), and `apiserverVisibility` (cell-public
+/// vs cluster-private).
+///
+/// Trust-domain assignment is NOT a user-facing field: every
+/// `BasisCluster` inherits its trust_domain from the provider
+/// instance that creates it (the management cluster's `kube-system`
+/// UID, or an explicit `BASIS_TRUST_DOMAIN` env override on the
+/// provider Deployment). Two clusters under the same management
+/// cluster share a tree and can talk; clusters under different
+/// management clusters land in different per-tree VRFs and are
+/// isolated at the kernel routing level. Operators never type
+/// "trust domain."
 ///
 /// `controlPlaneEndpoint`, `vni`, and `cidr` are populated by the
 /// reconciler after basis allocates them — per CAPI convention, the
@@ -61,13 +71,6 @@ pub struct BasisClusterSpec {
     /// usable), reachable only from inside the cluster's bridge.
     #[serde(default)]
     pub apiserver_visibility: ApiserverVisibility,
-
-    /// Trust-domain label, propagated to BGP communities in Phase 2
-    /// of the network design so VIPs are only installed on hosts
-    /// whose local clusters subscribe to the same trust domain.
-    /// Empty / unset = untagged (cell-wide propagation).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trust_domain: Option<String>,
 
     /// Populated by the reconciler after `Basis.CreateCluster` returns.
     /// Never set by the user — if present on first apply, the

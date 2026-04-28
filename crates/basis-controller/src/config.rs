@@ -70,10 +70,48 @@ pub struct BasisControllerSpec {
     /// itself — `holod` runs as a sibling systemd service on the
     /// same host and basis pushes config to it via gRPC.
     pub bgp: BgpConfig,
+    /// Safety policies that gate destructive controller actions.
+    /// Defaults are conservative: a freshly-restored controller with
+    /// a missing or partial DB will *freeze* unrecognised host state
+    /// rather than tombstone it. Operators flip individual fields
+    /// after a deliberate wipe to opt back into auto-cleanup.
+    #[serde(default)]
+    pub safety: SafetyConfig,
 }
 
 fn default_metrics_listen() -> String {
     "0.0.0.0:9443".to_string()
+}
+
+/// Safety policies that gate destructive controller behaviour.
+/// Every field defaults to the conservative answer; operators flip a
+/// field on only when they understand the failure mode it protects
+/// against and are sure they want the destructive path.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafetyConfig {
+    /// Controls inventory reconciliation on agent register, in both
+    /// directions:
+    ///
+    ///   * agent reports a VM/cluster the DB doesn't know → synthesise
+    ///     a one-shot tombstone so the agent tears it down.
+    ///   * DB has a VM/cluster the agent doesn't report → roll live
+    ///     VMs into the standard teardown pipeline; ack-complete
+    ///     pending teardowns whose agent-side resource is already
+    ///     gone.
+    ///
+    /// When `true`, the controller does both of the above
+    /// automatically. Used in dev/CI where wiping `controller.db`
+    /// and letting the cell self-clean is the intended workflow.
+    ///
+    /// When `false` (default), the controller logs the discrepancy
+    /// loudly and changes nothing — agent kernel state, VMs, and DB
+    /// rows all stay put. Protects production cells from a
+    /// catastrophic auto-teardown if the controller's DB is lost or
+    /// restored from an old backup: the operator inspects, restores
+    /// the DB or flips this flag, then reconciles deliberately.
+    #[serde(default)]
+    pub auto_reconcile_orphan_inventory: bool,
 }
 
 fn default_dns_servers() -> Vec<String> {
@@ -171,9 +209,10 @@ pub struct VniRange {
 /// can reach them. `Tree` is for cluster-internal VIPs that should
 /// never leak onto the LAN — the controller still allocates from the
 /// pool's CIDR, but the agent installs only the per-bridge route, no
-/// proxy-ARP and no BGP advertisement (Phase 1). Phase 2 layers a
-/// trust-domain BGP community on top so different trust_domains
-/// don't mutually learn each other's tree prefixes.
+/// proxy-ARP and no BGP advertisement. Cross-trust-domain isolation
+/// is enforced at the controller's eager-bootstrap fan-out: a tree
+/// cluster's bridge is installed on a host iff that host already
+/// carries a cluster sharing its `trust_domain`.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PoolScope {

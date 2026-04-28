@@ -63,3 +63,16 @@ spec:
   bgp:
     asn: 64512
     routerId: 10.0.0.1
+  # Safety policies. Defaults are conservative; flip individual
+  # fields ON only when you understand the failure mode.
+  safety:
+    # When ON, the controller automatically reconciles agent
+    # inventory against its DB on register — synthesises tombstones
+    # for kernel state the DB doesn't track, and rolls DB rows the
+    # agent doesn't have into the standard teardown pipeline. Useful
+    # in dev/CI where wiping controller.db is the reset workflow.
+    #
+    # When OFF (default), the controller logs every discrepancy
+    # loudly but changes nothing. Production safety: a DB loss must
+    # not cause every running VM to be auto-deleted on reconnect.
+    autoReconcileOrphanInventory: false

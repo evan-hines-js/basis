@@ -77,10 +77,17 @@ async fn run(_cli: Cli) -> anyhow::Result<()> {
     // per watched kind — visible to no one except the watcher itself.
     startup::wait_for_crds(&kube).await?;
 
+    // Resolve trust domain BEFORE starting reconcilers: a reconcile
+    // racing this lookup would create a `BasisCluster` with an empty
+    // trust_domain and silently break isolation. Fail-fast on lookup
+    // error so the pod crashloops instead of running half-configured.
+    let trust_domain = startup::read_trust_domain(&kube).await?;
+
     let clients = Arc::new(BasisClientCache::new(kube.clone()));
     let ctx = Arc::new(ProviderContext {
         client: kube.clone(),
         clients: clients.clone(),
+        trust_domain,
     });
 
     let cluster_task = tokio::spawn(cluster::run(ctx.clone()));

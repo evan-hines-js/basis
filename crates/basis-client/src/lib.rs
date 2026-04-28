@@ -145,8 +145,13 @@ pub struct ClusterRequest {
     /// CIDR (last usable), reachable only from inside the cluster's
     /// bridge; CAPI access goes through the parent cell's API proxy.
     pub apiserver_visibility: basis_proto::ApiserverVisibility,
-    /// Trust-domain label, propagated to BGP communities in Phase 2
-    /// of the network design. Empty (default) means untagged.
+    /// Trust-domain identifier; same semantics as the proto field. The
+    /// agent maps this to a per-tree Linux VRF on every host, so two
+    /// clusters with the same `trust_domain` share a routing table and
+    /// can reach each other while clusters with different
+    /// `trust_domain`s are isolated. Empty string is its own group
+    /// (joins other empty-trust_domain clusters, doesn't merge with
+    /// named ones).
     pub trust_domain: String,
 }
 

@@ -41,8 +41,18 @@ pub struct ClusterSpec {
     #[serde(default, rename = "apiserverVisibility")]
     pub apiserver_visibility: ApiserverVisibility,
 
-    /// Trust-domain label, propagated to BGP communities in Phase 2.
-    /// Empty / unset = untagged.
+    /// Trust-domain identifier; the agent maps this to a per-tree
+    /// Linux VRF so clusters sharing this string can reach each
+    /// other while clusters with different strings are isolated at
+    /// the kernel routing level. Empty / unset is its own group
+    /// (joins other empty-trust_domain clusters, doesn't merge with
+    /// named ones).
+    ///
+    /// CAPI-managed clusters DO NOT set this — the
+    /// basis-capi-provider auto-derives one identifier per
+    /// management cluster and stamps it on every `BasisCluster`.
+    /// This field is the lower-level admin override for direct
+    /// `basisctl apply` workflows.
     #[serde(default, rename = "trustDomain")]
     pub trust_domain: Option<String>,
 }

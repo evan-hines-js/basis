@@ -534,11 +534,15 @@ fn parse_ipv4(s: &str, field: &str) -> anyhow::Result<std::net::Ipv4Addr> {
 /// (apiserver VIP when `APISERVER_PUBLIC` + LB Service block from a
 /// `Lan`-scoped pool) is announced to the cell.
 /// `internal_cluster_vips` (Tree-scoped pool VIPs) are deliberately
-/// omitted from BGP in Phase 1 — their reachability is established
-/// through bridge routes installed by the agent's network reconciler
-/// rather than via underlay routing. Phase 2 will advertise them
-/// with a BGP community derived from `trust_domain` and a
-/// per-neighbor import filter.
+/// omitted from BGP — their reachability is established through
+/// bridge routes installed by the agent's network reconciler in the
+/// cluster's tree-VRF table, rather than via underlay routing.
+/// Trust-domain isolation lives in those VRFs: every host
+/// participating in tree T enslaves T's bridges to a deterministic
+/// per-T Linux VRF and installs T's prefix routes in that VRF's
+/// table; cross-tree traffic from a different tree's bridge fails to
+/// find a route in its own tree's table and is dropped by the
+/// kernel.
 async fn apply_reconcile(
     rt: &AgentRuntime,
     cmd: &ReconcileHostCommand,

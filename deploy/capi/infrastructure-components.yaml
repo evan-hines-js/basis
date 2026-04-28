@@ -47,8 +47,18 @@ spec:
 
               User input is `credentialsRef` (how to reach the basis controller),
               `externalIpPool` (where the LB Service block — and the apiserver
-              VIP, if public — comes from), `apiserverVisibility` (cell-public
-              vs cluster-private), and the optional `trustDomain` label.
+              VIP, if public — comes from), and `apiserverVisibility` (cell-public
+              vs cluster-private).
+
+              Trust-domain assignment is NOT a user-facing field: every
+              `BasisCluster` inherits its trust_domain from the provider
+              instance that creates it (the management cluster's `kube-system`
+              UID, or an explicit `BASIS_TRUST_DOMAIN` env override on the
+              provider Deployment). Two clusters under the same management
+              cluster share a tree and can talk; clusters under different
+              management clusters land in different per-tree VRFs and are
+              isolated at the kernel routing level. Operators never type
+              "trust domain."
 
               `controlPlaneEndpoint`, `vni`, and `cidr` are populated by the
               reconciler after basis allocates them — per CAPI convention, the
@@ -120,14 +130,6 @@ spec:
                   uses this to write the workload cluster's
                   `CiliumLoadBalancerIPPool`. Empty when the cluster requested
                   0 service IPs.
-                type: string
-              trustDomain:
-                description: |-
-                  Trust-domain label, propagated to BGP communities in Phase 2
-                  of the network design so VIPs are only installed on hosts
-                  whose local clusters subscribe to the same trust domain.
-                  Empty / unset = untagged (cell-wide propagation).
-                nullable: true
                 type: string
             required:
             - credentialsRef

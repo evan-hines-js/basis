@@ -45,12 +45,22 @@ fn test_network_config() -> basis_controller::config::NetworkConfig {
             start: 10_000,
             end: 11_000,
         },
-        pools: vec![basis_controller::config::Pool {
-            name: "cell-internal".to_string(),
-            // /27 = 32 addrs total → 30 allocatable (.1..=.30).
-            cidr: "192.168.100.0/27".to_string(),
-            scope: basis_controller::config::PoolScope::Lan,
-        }],
+        pools: vec![
+            basis_controller::config::Pool {
+                name: "cell-internal".to_string(),
+                // /27 = 32 addrs total → 30 allocatable (.1..=.30).
+                cidr: "192.168.100.0/27".to_string(),
+                scope: basis_controller::config::PoolScope::Lan,
+            },
+            // Second pool, Tree-scoped, for trust_domain enforcement
+            // tests. Disjoint CIDR from `cell-internal` so the
+            // overlap check in NetworkConfig::validate is happy.
+            basis_controller::config::Pool {
+                name: "cell-tree".to_string(),
+                cidr: "172.20.0.0/26".to_string(),
+                scope: basis_controller::config::PoolScope::Tree,
+            },
+        ],
     }
 }
 
@@ -62,12 +72,9 @@ struct RunningController {
 }
 
 impl RunningController {
-    async fn start() -> (Self, basis_controller::db::Db) {
-        Self::start_with_reconcile(Duration::from_secs(60)).await
-    }
-
-    async fn start_with_reconcile(
+    async fn start(
         reconcile_interval: Duration,
+        safety: basis_controller::config::SafetyConfig,
     ) -> (Self, basis_controller::db::Db) {
         install_crypto_provider_once().await;
 
@@ -94,6 +101,7 @@ impl RunningController {
                 holod_endpoint: "http://127.0.0.1:50051".to_string(),
                 instance_name: "basis-test".to_string(),
             },
+            safety,
         )
         .with_reconcile_interval(reconcile_interval);
         let server_shutdown = shutdown.clone();
@@ -156,17 +164,23 @@ impl Drop for RunningController {
 }
 
 /// Create a cluster via the CAPI API and return its id + the VIP.
-/// Defaults to `APISERVER_PUBLIC` against the test pool so the VIP is
-/// LAN-routable and assertions can pin it to a known pool address.
-async fn create_cluster(running: &RunningController, name: &str) -> (String, String) {
+/// `APISERVER_PUBLIC` against the named pool, with the requested
+/// trust_domain (`""` for the untagged group). Tests that just want a
+/// cluster on the default Lan pool pass `("cell-internal", "")`.
+async fn create_cluster(
+    running: &RunningController,
+    name: &str,
+    pool: &str,
+    trust_domain: &str,
+) -> (String, String) {
     let mut capi = running.capi_client().await;
     let resp = capi
         .create_cluster(CreateClusterRequest {
             name: name.to_string(),
-            external_ip_pool: "cell-internal".to_string(),
+            external_ip_pool: pool.to_string(),
             external_service_ips: 0,
             apiserver_visibility: ApiserverVisibility::ApiserverPublic as i32,
-            trust_domain: String::new(),
+            trust_domain: trust_domain.to_string(),
         })
         .await
         .unwrap()
@@ -176,20 +190,10 @@ async fn create_cluster(running: &RunningController, name: &str) -> (String, Str
 
 /// Register an agent and consume its RegisterAck, returning the
 /// outbound channel, inbound command stream, host_id, and the initial
-/// reconcile state the controller sent inline with the ack.
+/// reconcile state the controller sent inline with the ack. Pass
+/// `inventory = None` for the common case (fresh agent, no
+/// pre-existing kernel state to report).
 async fn register_agent(
-    running: &RunningController,
-    hostname: &str,
-) -> (
-    mpsc::Sender<AgentMessage>,
-    tonic::Streaming<ControllerCommand>,
-    String,
-    ReconcileHostCommand,
-) {
-    register_agent_with_inventory(running, hostname, None).await
-}
-
-async fn register_agent_with_inventory(
     running: &RunningController,
     hostname: &str,
     inventory: Option<HostInventory>,
@@ -393,8 +397,12 @@ where
 
 #[tokio::test]
 async fn test_create_cluster_public_apiserver_lands_in_pool() {
-    let (running, _db) = RunningController::start().await;
-    let (cluster_id, vip) = create_cluster(&running, "my-cluster").await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, vip) = create_cluster(&running, "my-cluster", "cell-internal", "").await;
 
     assert!(!cluster_id.is_empty());
     // `create_cluster` defaults to APISERVER_PUBLIC against the
@@ -430,7 +438,11 @@ async fn test_create_cluster_private_apiserver_lands_at_top_of_cidr() {
     // APISERVER_PRIVATE puts the apiserver VIP at the last usable
     // address of the cluster CIDR, never advertised cell-wide. The
     // LB block still comes from the named pool.
-    let (running, _db) = RunningController::start().await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
     let mut capi = running.capi_client().await;
     let resp = capi
         .create_cluster(CreateClusterRequest {
@@ -455,8 +467,12 @@ async fn test_create_cluster_private_apiserver_lands_at_top_of_cidr() {
 
 #[tokio::test]
 async fn test_create_cluster_is_idempotent_by_name() {
-    let (running, _db) = RunningController::start().await;
-    let (first_id, first_vip) = create_cluster(&running, "dup").await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (first_id, first_vip) = create_cluster(&running, "dup", "cell-internal", "").await;
 
     let mut capi = running.capi_client().await;
     let resp = capi
@@ -476,10 +492,15 @@ async fn test_create_cluster_is_idempotent_by_name() {
 
 #[tokio::test]
 async fn test_full_create_delete_flow() {
-    let (running, db) = RunningController::start().await;
-    let (cluster_id, _vip) = create_cluster(&running, "test-cluster").await;
+    let (running, db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, _vip) = create_cluster(&running, "test-cluster", "cell-internal", "").await;
 
-    let (agent_tx, mut inbound, _host_id, _initial) = register_agent(&running, "test-host-1").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "test-host-1", None).await;
     let mut capi = running.capi_client().await;
 
     let resp = drive_create_to_running(
@@ -531,9 +552,14 @@ async fn test_full_create_delete_flow() {
 
 #[tokio::test]
 async fn test_delete_cluster_cascades_machine_deletes() {
-    let (running, db) = RunningController::start().await;
-    let (cluster_id, doomed_vip) = create_cluster(&running, "doomed").await;
-    let (agent_tx, mut inbound, _host_id, _initial) = register_agent(&running, "host-a").await;
+    let (running, db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, doomed_vip) = create_cluster(&running, "doomed", "cell-internal", "").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "host-a", None).await;
     let mut capi = running.capi_client().await;
 
     let vm = drive_create_to_running(
@@ -587,8 +613,13 @@ async fn test_delete_cluster_cascades_machine_deletes() {
 
 #[tokio::test]
 async fn test_create_machine_no_agent() {
-    let (running, db) = RunningController::start().await;
-    let (cluster_id, _vip) = create_cluster(&running, "no-agent-cluster").await;
+    let (running, db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, _vip) =
+        create_cluster(&running, "no-agent-cluster", "cell-internal", "").await;
 
     // Pre-seed a host record without a live stream.
     db.upsert_host(&basis_controller::db::HostRow {
@@ -632,8 +663,12 @@ async fn test_create_machine_no_agent() {
 
 #[tokio::test]
 async fn test_create_machine_unknown_cluster_fails() {
-    let (running, _db) = RunningController::start().await;
-    let _agent = register_agent(&running, "any-host").await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let _agent = register_agent(&running, "any-host", None).await;
 
     let mut capi = running.capi_client().await;
     let err = capi
@@ -645,9 +680,14 @@ async fn test_create_machine_unknown_cluster_fails() {
 
 #[tokio::test]
 async fn test_create_machine_agent_reports_failure() {
-    let (running, db) = RunningController::start().await;
-    let (cluster_id, _vip) = create_cluster(&running, "fail-cluster").await;
-    let (agent_tx, mut inbound, _host_id, _initial) = register_agent(&running, "fail-host").await;
+    let (running, db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, _vip) = create_cluster(&running, "fail-cluster", "cell-internal", "").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "fail-host", None).await;
 
     let capi = running.capi_client().await;
     let create_handle = {
@@ -684,7 +724,11 @@ async fn test_create_machine_agent_reports_failure() {
 
 #[tokio::test]
 async fn test_wrong_cn_rejected_from_capi_rpc() {
-    let (running, _db) = RunningController::start().await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
 
     let channel = Endpoint::from_shared(running.endpoint.clone())
         .unwrap()
@@ -704,7 +748,11 @@ async fn test_wrong_cn_rejected_from_capi_rpc() {
 
 #[tokio::test]
 async fn test_capi_cn_cannot_open_agent_stream() {
-    let (running, _db) = RunningController::start().await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
     let mut client = running.agent_client(CAPI_PROVIDER_IDENTITY).await;
     let (_tx, rx) = mpsc::channel::<AgentMessage>(1);
     let err = client
@@ -716,7 +764,11 @@ async fn test_capi_cn_cannot_open_agent_stream() {
 
 #[tokio::test]
 async fn test_agent_cn_must_match_registered_hostname() {
-    let (running, _db) = RunningController::start().await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
     let mut client = running.agent_client("my-hostname").await;
     let (tx, rx) = mpsc::channel::<AgentMessage>(32);
 
@@ -745,8 +797,13 @@ async fn test_agent_cn_must_match_registered_hostname() {
 
 #[tokio::test]
 async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
-    let (running, db) = RunningController::start().await;
-    let (agent_tx, inbound, host_id, _initial) = register_agent(&running, "capacity-host").await;
+    let (running, db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (agent_tx, inbound, host_id, _initial) =
+        register_agent(&running, "capacity-host", None).await;
 
     db.mark_host_unhealthy(&host_id).await.unwrap();
     assert!(!db.get_host(&host_id).await.unwrap().healthy);
@@ -776,10 +833,15 @@ async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
 
 #[tokio::test]
 async fn test_agent_stream_cannot_report_for_other_host() {
-    let (running, db) = RunningController::start().await;
-    let (cluster_id, _vip) = create_cluster(&running, "host-scope-cluster").await;
+    let (running, db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, _vip) =
+        create_cluster(&running, "host-scope-cluster", "cell-internal", "").await;
     let (agent_a_tx, mut agent_a_inbound, host_a_id, _initial_a) =
-        register_agent(&running, "host-a").await;
+        register_agent(&running, "host-a", None).await;
 
     let capi = running.capi_client().await;
     let mut create_handle = {
@@ -790,7 +852,7 @@ async fn test_agent_stream_cannot_report_for_other_host() {
 
     let vm_id = expect_create_vm(&mut agent_a_inbound).await;
     let (agent_b_tx, agent_b_inbound, _host_b_id, _initial_b) =
-        register_agent(&running, "host-b").await;
+        register_agent(&running, "host-b", None).await;
 
     report_vm_state(&agent_b_tx, &vm_id, MachineState::Running, "", false).await;
     // The timeout doubles as a deterministic processing window: if the
@@ -839,9 +901,13 @@ async fn test_agent_stream_cannot_report_for_other_host() {
 
 #[tokio::test]
 async fn test_controller_pushes_periodic_reconcile() {
-    let (running, _db) = RunningController::start_with_reconcile(Duration::from_millis(150)).await;
+    let (running, _db) = RunningController::start(
+        Duration::from_millis(150),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
     let (_agent_tx, mut inbound, _host_id, _initial) =
-        register_agent(&running, "reconcile-host").await;
+        register_agent(&running, "reconcile-host", None).await;
 
     let cmd = tokio::time::timeout(Duration::from_secs(2), inbound.next())
         .await
@@ -860,10 +926,15 @@ async fn test_controller_pushes_periodic_reconcile() {
 
 #[tokio::test]
 async fn test_reconnect_reports_expected_vm_ids_and_clusters() {
-    let (running, _db) = RunningController::start().await;
-    let (cluster_id, _vip) = create_cluster(&running, "reconnect-cluster").await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, _vip) =
+        create_cluster(&running, "reconnect-cluster", "cell-internal", "").await;
     let (agent_tx, mut inbound, host_id, initial1) =
-        register_agent(&running, "reconnect-host").await;
+        register_agent(&running, "reconnect-host", None).await;
     assert!(initial1.clusters.is_empty());
     assert!(initial1.cluster_tombstones.is_empty());
     assert!(initial1.vm_tombstones.is_empty());
@@ -881,7 +952,8 @@ async fn test_reconnect_reports_expected_vm_ids_and_clusters() {
     drop(inbound);
 
     let _ = resp;
-    let (_tx2, _inbound2, host_id2, initial2) = register_agent(&running, "reconnect-host").await;
+    let (_tx2, _inbound2, host_id2, initial2) =
+        register_agent(&running, "reconnect-host", None).await;
     assert_eq!(host_id2, host_id);
     assert!(initial2.vm_tombstones.is_empty(), "no pending VM teardowns",);
     assert!(
@@ -909,9 +981,14 @@ async fn test_reconnect_reports_expected_vm_ids_and_clusters() {
 /// the race and the server's retry loop classifies the outcome.
 #[tokio::test]
 async fn test_concurrent_create_cannot_oversubscribe_host() {
-    let (running, _db) = RunningController::start().await;
-    let (cluster_id, _vip) = create_cluster(&running, "race-cluster").await;
-    let (agent_tx, mut inbound, _host_id, _initial) = register_agent(&running, "race-host").await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, _vip) = create_cluster(&running, "race-cluster", "cell-internal", "").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "race-host", None).await;
     let capi = running.capi_client().await;
 
     // Host reports 16 cpu in `register_agent`. Two 10-cpu requests
@@ -956,16 +1033,17 @@ async fn test_concurrent_create_cannot_oversubscribe_host() {
     );
 }
 
-/// Disaster recovery: agent reconnects after the controller's DB has
-/// been wiped. The controller has no `host_clusters` / `vms` rows for
-/// this host, so a stock reconcile would emit nothing and orphan the
-/// agent's bridges + VMs forever. The inventory the agent carries in
-/// `RegisterHostRequest.current_inventory` lets the controller
-/// synthesise one-shot tombstones for every reported resource it
-/// doesn't know about — exactly the recovery path.
+/// Disaster recovery — auto-cleanup mode. With
+/// `safety.auto_reconcile_orphan_inventory = true` (operator has
+/// deliberately wiped the DB and wants the cell to self-clean on
+/// reconnect), the controller diffs the agent's inventory against
+/// its empty DB and emits one-shot tombstones for every orphan.
 #[tokio::test]
-async fn test_register_synthesises_tombstones_for_orphan_inventory() {
-    let (running, db) = RunningController::start().await;
+async fn test_register_synthesises_tombstones_when_safety_flag_on() {
+    let safety = basis_controller::config::SafetyConfig {
+        auto_reconcile_orphan_inventory: true,
+    };
+    let (running, db) = RunningController::start(Duration::from_secs(60), safety).await;
 
     let inventory = HostInventory {
         vm_ids: vec!["orphan-vm".to_string()],
@@ -975,7 +1053,7 @@ async fn test_register_synthesises_tombstones_for_orphan_inventory() {
         }],
     };
     let (_tx, _inbound, _host_id, initial) =
-        register_agent_with_inventory(&running, "wipe-recovery-host", Some(inventory)).await;
+        register_agent(&running, "wipe-recovery-host", Some(inventory)).await;
 
     // Both the orphan VM and the orphan bridge must come back as
     // tombstones in the inline `initial_state` so the agent tears
@@ -1002,15 +1080,56 @@ async fn test_register_synthesises_tombstones_for_orphan_inventory() {
         .is_empty());
 }
 
+/// Production-safe default: `safety.auto_reconcile_orphan_inventory`
+/// is OFF. An agent reporting inventory the controller doesn't
+/// recognise — exactly what happens when controller.db has been
+/// lost or restored from an old backup — gets an EMPTY tombstone
+/// list, NOT auto-cleanup. The agent's bridges + VMs stay alive
+/// while the operator inspects, restores the DB, or deliberately
+/// flips the flag. This is the safety mechanism that prevents
+/// "DB lost ⇒ every VM auto-deleted on reconnect."
+#[tokio::test]
+async fn test_register_freezes_orphan_inventory_by_default() {
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+
+    let inventory = HostInventory {
+        vm_ids: vec!["alive-vm-the-controller-forgot".to_string()],
+        clusters: vec![InventoryCluster {
+            vni: 99_999,
+            cidr: "10.250.0.0/24".to_string(),
+        }],
+    };
+    let (_tx, _inbound, _host_id, initial) =
+        register_agent(&running, "frozen-host", Some(inventory)).await;
+
+    assert!(
+        initial.vm_tombstones.is_empty(),
+        "default safety must NOT tombstone VMs the controller doesn't recognise",
+    );
+    assert!(
+        initial.cluster_tombstones.is_empty(),
+        "default safety must NOT tombstone bridges the controller doesn't recognise",
+    );
+}
+
 /// Inventory entries that DO match the controller's DB are not
 /// duplicated as tombstones: the agent's bridge for an active
 /// cluster stays in the ACTIVE list, not the cluster_tombstones
 /// list. Same for a VM whose vms row is on this host.
 #[tokio::test]
 async fn test_register_inventory_match_is_not_tombstoned() {
-    let (running, _db) = RunningController::start().await;
-    let (cluster_id, _vip) = create_cluster(&running, "live-cluster").await;
-    let (agent_tx, mut inbound, _host_id, _initial) = register_agent(&running, "live-host").await;
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, _vip) = create_cluster(&running, "live-cluster", "cell-internal", "").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "live-host", None).await;
     let mut capi = running.capi_client().await;
 
     let vm = drive_create_to_running(
@@ -1033,7 +1152,7 @@ async fn test_register_inventory_match_is_not_tombstoned() {
         }],
     };
     let (_tx2, _inbound2, _, initial2) =
-        register_agent_with_inventory(&running, "live-host", Some(inventory)).await;
+        register_agent(&running, "live-host", Some(inventory)).await;
     assert!(
         initial2.vm_tombstones.is_empty(),
         "matching inventory must not be tombstoned",
@@ -1043,4 +1162,173 @@ async fn test_register_inventory_match_is_not_tombstoned() {
         "matching cluster bridge must not be tombstoned",
     );
     assert_eq!(initial2.clusters.len(), 1);
+}
+
+/// Reverse-direction inventory reconcile: when the agent's reported
+/// `current_inventory` is missing a VM the controller's DB has on
+/// this host (host reboot lost the VM, agent crash + restart, etc.),
+/// the controller rolls the live VM into the standard teardown
+/// pipeline so CAPI sees the death. Gated by the safety flag —
+/// freeze when off, reap when on.
+#[tokio::test]
+async fn test_register_reaps_db_running_orphan_when_safety_on() {
+    let safety = basis_controller::config::SafetyConfig {
+        auto_reconcile_orphan_inventory: true,
+    };
+    let (running, db) = RunningController::start(Duration::from_secs(60), safety).await;
+    let (cluster_id, _vip) = create_cluster(&running, "rcl", "cell-internal", "").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "reap-host", None).await;
+    let mut capi = running.capi_client().await;
+
+    let vm = drive_create_to_running(
+        &agent_tx,
+        &mut inbound,
+        &mut capi,
+        basic_machine_req("doomed-vm", &cluster_id),
+    )
+    .await;
+    drop(agent_tx);
+    drop(inbound);
+
+    // Reconnect with inventory that LACKS the VM: agent says it
+    // doesn't have this VM anymore (host reboot, VM died on the host,
+    // etc.). With the safety flag ON, the controller rolls the VM
+    // into the teardown pipeline.
+    let inventory = HostInventory {
+        vm_ids: Vec::new(),
+        clusters: Vec::new(),
+    };
+    let (_tx2, _inbound2, _, initial2) =
+        register_agent(&running, "reap-host", Some(inventory)).await;
+    assert!(
+        initial2.vm_tombstones.iter().any(|id| id == &vm.id),
+        "DB-orphan VM must ride a tombstone in the rebuilt initial_state; got: {:?}",
+        initial2.vm_tombstones,
+    );
+
+    let row = db.get_vm(&vm.id).await.expect("vm row still present");
+    assert_eq!(
+        row.state,
+        basis_proto::MachineState::PendingTeardown as i64,
+        "DB-orphan VM must transition to PENDING_TEARDOWN",
+    );
+}
+
+/// Production-safe default: when the safety flag is OFF, a VM the DB
+/// has but the agent doesn't report stays in its current state. Lets
+/// the operator investigate before any state change.
+#[tokio::test]
+async fn test_register_freezes_db_orphans_by_default() {
+    let (running, db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+    let (cluster_id, _vip) = create_cluster(&running, "freeze-cl", "cell-internal", "").await;
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "freeze-host", None).await;
+    let mut capi = running.capi_client().await;
+
+    let vm = drive_create_to_running(
+        &agent_tx,
+        &mut inbound,
+        &mut capi,
+        basic_machine_req("hopeful-vm", &cluster_id),
+    )
+    .await;
+    drop(agent_tx);
+    drop(inbound);
+
+    let inventory = HostInventory {
+        vm_ids: Vec::new(),
+        clusters: Vec::new(),
+    };
+    let (_tx2, _inbound2, _, initial2) =
+        register_agent(&running, "freeze-host", Some(inventory)).await;
+    assert!(
+        initial2.vm_tombstones.is_empty(),
+        "freeze: no tombstone must be emitted for DB orphans the agent doesn't have",
+    );
+
+    let row = db.get_vm(&vm.id).await.expect("vm row still present");
+    assert_eq!(
+        row.state,
+        basis_proto::MachineState::Running as i64,
+        "freeze: DB-orphan VM must stay in its prior state for operator review",
+    );
+}
+
+/// Tree-cluster fan-out + per-tree VRF metadata. Every tree-scoped
+/// cluster appears in every host's `clusters[]` (so every host
+/// eagerly materialises a bridge for it), but each ClusterState
+/// carries its own `trust_domain`. The agent maps `trust_domain` to a
+/// per-tree Linux VRF and enslaves the bridge to it; cross-tree
+/// traffic dies in the kernel because each VRF table only holds its
+/// own tree's routes.
+///
+/// The host below carries a VM in `alpha` (tenant-a), so `alpha`
+/// shows up with a populated `gateway_ip`/`cidr`. `beta` (tenant-b)
+/// is fanned out as a ghost (empty `gateway_ip`/`cidr`) and carries
+/// `trust_domain = "tenant-b"`. LAN-pool clusters carry an empty
+/// `trust_domain` — the agent leaves their bridges in the main
+/// routing table.
+#[tokio::test]
+async fn test_eager_bootstrap_carries_trust_domain_per_cluster() {
+    let (running, _db) = RunningController::start(
+        Duration::from_secs(60),
+        basis_controller::config::SafetyConfig::default(),
+    )
+    .await;
+
+    let (alpha_id, _) = create_cluster(&running, "alpha", "cell-tree", "tenant-a").await;
+    let (beta_id, _) = create_cluster(&running, "beta", "cell-tree", "tenant-b").await;
+
+    let (agent_tx, mut inbound, _host_id, _initial) =
+        register_agent(&running, "tenant-a-host", None).await;
+    let mut capi = running.capi_client().await;
+    let _vm = drive_create_to_running(
+        &agent_tx,
+        &mut inbound,
+        &mut capi,
+        basic_machine_req("alpha-vm", &alpha_id),
+    )
+    .await;
+    drop(agent_tx);
+    drop(inbound);
+
+    let (_tx2, _inbound2, _, initial) = register_agent(&running, "tenant-a-host", None).await;
+
+    let by_id: std::collections::HashMap<String, &basis_proto::ClusterState> = initial
+        .clusters
+        .iter()
+        .map(|c| (c.cluster_id.clone(), c))
+        .collect();
+
+    let alpha = by_id.get(&alpha_id).expect("alpha must be in clusters[]");
+    assert_eq!(
+        alpha.trust_domain, "tenant-a",
+        "alpha carries its trust_domain"
+    );
+    assert!(
+        !alpha.gateway_ip.is_empty(),
+        "alpha carried by host, has gateway_ip"
+    );
+    assert!(!alpha.cidr.is_empty(), "alpha carried by host, has cidr");
+
+    let beta = by_id
+        .get(&beta_id)
+        .expect("beta must be in clusters[] (ghost-bootstrap fans out unconditionally)");
+    assert_eq!(
+        beta.trust_domain, "tenant-b",
+        "beta carries its trust_domain"
+    );
+    assert!(
+        beta.gateway_ip.is_empty(),
+        "beta is a ghost — no per-host gateway_ip"
+    );
+    assert!(
+        beta.cidr.is_empty(),
+        "beta is a ghost — no cidr (no masquerade)"
+    );
 }
