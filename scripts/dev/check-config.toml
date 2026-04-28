@@ -1,0 +1,51 @@
+# Check Scripts Configuration
+#
+# This file defines allowed exceptions for our code quality checks.
+# Each exception must have a justification explaining why it's acceptable.
+# Patterns are matched against filename (not full path).
+
+[blocking_io]
+# Allowed std::fs, std::thread::sleep, std::io::stdin/stdout in production code
+# Format: "filename_pattern" = "justification"
+# Matches if the filename contains the pattern
+
+[blocking_io.allowed]
+"bootstrap/mod.rs" = "Sync helpers reading embedded chart files at startup"
+"pivot/mod.rs:read_in_cluster_ca" = "Sync helper reading small CA file"
+"provider/mod.rs:render_bootstrap" = "Sync helper reading template at startup"
+"parent/mod.rs:default" = "Default trait is sync, reads config once at startup"
+
+[unsafe_blocks]
+# Allowed unsafe blocks in production code
+# Format: "filename_pattern" = "justification"
+
+[unsafe_blocks.allowed]
+# None currently - keep it that way!
+
+[expect_calls]
+# Configuration for .expect() usage
+max_allowed = 50
+description = "expect() allowed for startup config, doc examples, and truly impossible errors"
+
+[weak_crypto]
+# Allowed weak crypto patterns (should stay empty for FIPS compliance)
+
+[weak_crypto.allowed]
+# None - FIPS compliance requires strong crypto only
+
+[hardcoded_secrets]
+# Patterns that look like secrets but are false positives
+
+[hardcoded_secrets.ignore_patterns]
+patterns = [
+    "example",
+    "sample",
+    "mock",
+    "Mock",
+    "fixture",
+    "test_",
+    "_test",
+    "placeholder",
+    "Example",
+    "Sample",
+]
