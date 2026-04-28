@@ -517,7 +517,7 @@ async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRespon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{NetworkConfig, Pool, VniRange};
+    use crate::config::{NetworkConfig, Pool, PoolScope, VniRange};
     use crate::db::{ClusterIdentity, ClusterRow, HostRow, VmRow};
 
     fn make_host(id: &str, hostname: &str, total_cpu: i64, healthy: bool) -> HostRow {
@@ -569,6 +569,7 @@ mod tests {
             pools: vec![Pool {
                 name: "cell-internal".to_string(),
                 cidr: "192.168.100.0/27".to_string(),
+                scope: PoolScope::Lan,
             }],
         }
     }
@@ -581,7 +582,7 @@ mod tests {
         let row = ClusterRow::from_network(
             ClusterIdentity {
                 id: id.to_string(),
-                name: format!("cluster-{id}"),
+                name: id.to_string(),
                 control_plane_endpoint: "unused-endpoint".to_string(),
                 apiserver_visibility: 0,
                 external_pool: "cell-internal".to_string(),
@@ -688,7 +689,10 @@ mod tests {
         refresh(&metrics, &db).await.unwrap();
         assert_eq!(metrics.vms.with_label_values(&["RUNNING", "c1"]).get(), 1);
 
-        db.delete_vm("v1").await.unwrap();
+        db.mark_vm_pending_teardown("v1").await.unwrap();
+        db.ack_tombstones("h1", &[], &["v1".to_string()])
+            .await
+            .unwrap();
         refresh(&metrics, &db).await.unwrap();
         // After reset, the deleted VM's labels are gone — default for a
         // missing label is 0, but the point is that the metric was

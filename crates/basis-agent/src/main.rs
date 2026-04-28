@@ -42,11 +42,6 @@ const POOL_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
 const ORPHAN_SWEEP_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 const ORPHAN_SWEEP_BUSY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Defense-in-depth grace window for controller-pushed reconcile
-/// commands — a VM younger than this is not deleted on a single push
-/// that omits it.
-const PERIODIC_RECONCILE_GRACE: Duration = Duration::from_secs(120);
-
 #[derive(Parser)]
 #[command(name = "basis-agent", about = "Basis hypervisor agent")]
 struct Cli {
@@ -378,7 +373,7 @@ async fn run_session(
     // controller derives it from the authenticated stream). Drop on
     // the floor; the handshake's side effects on `runtime` are what we
     // care about.
-    handshake(&mut inbound, &runtime).await?;
+    handshake(&mut inbound, &runtime, &msg_tx).await?;
 
     {
         let rt = runtime.read().await;
@@ -411,6 +406,30 @@ async fn send_register(
         })
         .collect();
 
+    // Snapshot the agent's live state so the controller can synthesise
+    // tombstones for orphans on register. Errors here would block the
+    // registration over what's a best-effort housekeeping signal —
+    // log + send an empty inventory instead, and rely on the next
+    // periodic reconcile to converge.
+    let vm_ids: Vec<String> = match rt.agent_db.list_vms().await {
+        Ok(rows) => rows.into_iter().map(|r| r.vm_id).collect(),
+        Err(e) => {
+            warn!(error = %e, "register: list_vms for inventory failed; sending empty");
+            Vec::new()
+        }
+    };
+    let clusters: Vec<InventoryCluster> = match rt.net_mgr.cluster_inventory().await {
+        Ok(pairs) => pairs
+            .into_iter()
+            .map(|(vni, cidr)| InventoryCluster { vni, cidr })
+            .collect(),
+        Err(e) => {
+            warn!(error = %e,
+                "register: cluster_inventory failed; sending empty");
+            Vec::new()
+        }
+    };
+
     sender
         .send(AgentMessage {
             payload: Some(agent_message::Payload::Register(RegisterHostRequest {
@@ -422,6 +441,7 @@ async fn send_register(
                 vtep_address: rt.vtep_address.clone(),
                 rank: rt.spec.rank,
                 labels: rt.spec.labels.clone().into_iter().collect(),
+                current_inventory: Some(HostInventory { vm_ids, clusters }),
             })),
         })
         .await?;
@@ -431,6 +451,7 @@ async fn send_register(
 async fn handshake(
     inbound: &mut Streaming<ControllerCommand>,
     runtime: &Arc<tokio::sync::RwLock<AgentRuntime>>,
+    sender: &mpsc::Sender<AgentMessage>,
 ) -> anyhow::Result<String> {
     let cmd = inbound
         .next()
@@ -449,12 +470,13 @@ async fn handshake(
     let initial = ack.initial_state;
 
     // Apply cluster + VM reconcile and persist the host id while we
-    // hold the read guard.
+    // hold the read guard. Tombstones from the inline initial_state
+    // ack via `sender` here — same path as periodic reconciles.
     {
         let rt = runtime.read().await;
         rt.agent_db.set_host_id(&host_id).await?;
         if let Some(initial) = initial {
-            apply_reconcile(&rt, &initial, Duration::ZERO).await?;
+            apply_reconcile(&rt, &initial, sender).await?;
         }
     }
 
@@ -489,32 +511,78 @@ fn parse_ipv4(s: &str, field: &str) -> anyhow::Result<std::net::Ipv4Addr> {
         .with_context(|| format!("{field} '{s}' is not a valid IPv4 address"))
 }
 
-/// Apply a `ReconcileHostCommand`: build/tear-down per-cluster
-/// bridges to match the command's `clusters`, delete VMs absent
-/// from `expected_vm_ids`, and refresh the BGP advertised prefix
-/// set so the cell knows which cluster VIPs route through this
-/// host. Single path used by the handshake ack, periodic pushes,
-/// and ad-hoc broadcasts.
+/// Apply a `ReconcileHostCommand` and emit a `TombstoneAck` if the
+/// command carried any tombstones. Single path used by the handshake
+/// ack, periodic pushes, and ad-hoc broadcasts.
+///
+/// Reconcile semantics are additive + tombstone-driven:
+///   * `clusters[]` — ensure each exists locally with the right
+///     bridge/VXLAN/FDB/VIP-route state. Untouched clusters not in
+///     this list keep running (no implicit-by-absence delete).
+///   * `cluster_tombstones[]` — explicit per-cluster teardown:
+///     remove that cluster's contribution from proxy-ARP, delete
+///     bridge + VXLAN, drop the per-cluster MASQUERADE rule.
+///   * `vm_tombstones[]` — explicit per-VM teardown.
+///
+/// Successful tombstone application acks back so the controller can
+/// drop the matching DB rows. Failures are swallowed (logged) — the
+/// next reconcile re-emits the same tombstones so we self-heal.
 ///
 /// Cluster overlay CIDRs are intentionally NOT advertised — VM
 /// IPs are private to the cluster's bridge by design (no
 /// inter-cluster L3 reachability). Only the `cluster_vips` set
-/// (apiserver VIP when `APISERVER_PUBLIC` + LB Service block) is
-/// announced to the cell.
+/// (apiserver VIP when `APISERVER_PUBLIC` + LB Service block from a
+/// `Lan`-scoped pool) is announced to the cell.
+/// `internal_cluster_vips` (Tree-scoped pool VIPs) are deliberately
+/// omitted from BGP in Phase 1 — their reachability is established
+/// through bridge routes installed by the agent's network reconciler
+/// rather than via underlay routing. Phase 2 will advertise them
+/// with a BGP community derived from `trust_domain` and a
+/// per-neighbor import filter.
 async fn apply_reconcile(
     rt: &AgentRuntime,
     cmd: &ReconcileHostCommand,
-    vm_delete_grace: Duration,
+    sender: &mpsc::Sender<AgentMessage>,
 ) -> anyhow::Result<()> {
     rt.net_mgr.reconcile_clusters(&cmd.clusters).await?;
-    handlers::reconcile_against_expected(
-        &cmd.expected_vm_ids,
-        &rt.vm_mgr,
-        &rt.net_mgr,
-        &rt.agent_db,
-        vm_delete_grace,
-    )
-    .await?;
+
+    let mut acked_cluster_vnis: Vec<u32> = Vec::with_capacity(cmd.cluster_tombstones.len());
+    for tomb in &cmd.cluster_tombstones {
+        match rt.net_mgr.tombstone_cluster(tomb.vni, &tomb.cidr).await {
+            Ok(()) => acked_cluster_vnis.push(tomb.vni),
+            Err(e) => warn!(
+                vni = tomb.vni, cluster_id = %tomb.cluster_id, error = %e,
+                "tombstone_cluster failed; controller will re-emit on next reconcile",
+            ),
+        }
+    }
+
+    let mut acked_vm_ids: Vec<String> = Vec::with_capacity(cmd.vm_tombstones.len());
+    for vm_id in &cmd.vm_tombstones {
+        match handlers::delete_vm(vm_id, &rt.vm_mgr, &rt.net_mgr, &rt.agent_db).await {
+            Ok(()) => acked_vm_ids.push(vm_id.clone()),
+            Err(e) => warn!(
+                vm_id = %vm_id, error = %e,
+                "VM tombstone teardown failed; controller will re-emit on next reconcile",
+            ),
+        }
+    }
+
+    if !acked_cluster_vnis.is_empty() || !acked_vm_ids.is_empty() {
+        let ack = TombstoneAck {
+            cluster_vnis: acked_cluster_vnis,
+            vm_ids: acked_vm_ids,
+        };
+        let msg = AgentMessage {
+            payload: Some(agent_message::Payload::TombstoneAck(ack)),
+        };
+        if let Err(e) = sender.send(msg).await {
+            warn!(error = %e,
+                "TombstoneAck send failed (stream closed); next reconcile will re-emit \
+                 and we'll re-ack on reconnect");
+        }
+    }
+
     if let Some(speaker) = rt.bgp_speaker.as_ref() {
         let mut prefixes: Vec<ipnet::Ipv4Net> = Vec::new();
         for cluster in &cmd.clusters {
@@ -653,12 +721,8 @@ async fn process_inbound(
                         );
                         spawn_create(*create, rt_snapshot, sender.clone());
                     }
-                    Some(controller_command::Command::DeleteVm(delete)) => {
-                        info!(vm_id = %delete.vm_id, "received DeleteVm");
-                        spawn_delete(delete, rt_snapshot, sender.clone());
-                    }
                     Some(controller_command::Command::ReconcileHost(reconcile_cmd)) => {
-                        spawn_reconcile(*reconcile_cmd, runtime.clone());
+                        spawn_reconcile(*reconcile_cmd, runtime.clone(), sender.clone());
                     }
                     None => {}
                 }
@@ -717,23 +781,14 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
     });
 }
 
-fn spawn_delete(cmd: DeleteVmCommand, rt: TaskContext, sender: mpsc::Sender<AgentMessage>) {
-    tokio::spawn(async move {
-        let (state, err, transient) =
-            match handlers::delete_vm(&cmd.vm_id, &rt.vm_mgr, rt.net_mgr.as_ref(), &rt.agent_db)
-                .await
-            {
-                Ok(()) => (MachineState::Stopped, String::new(), false),
-                Err(e) => (MachineState::Failed, e.to_string(), true),
-            };
-        send_terminal_vm_state(&sender, cmd.vm_id, state, err, transient).await;
-    });
-}
-
-fn spawn_reconcile(cmd: ReconcileHostCommand, runtime: Arc<tokio::sync::RwLock<AgentRuntime>>) {
+fn spawn_reconcile(
+    cmd: ReconcileHostCommand,
+    runtime: Arc<tokio::sync::RwLock<AgentRuntime>>,
+    sender: mpsc::Sender<AgentMessage>,
+) {
     tokio::spawn(async move {
         let rt = runtime.read().await;
-        if let Err(e) = apply_reconcile(&rt, &cmd, PERIODIC_RECONCILE_GRACE).await {
+        if let Err(e) = apply_reconcile(&rt, &cmd, &sender).await {
             warn!(error = %e, "controller-driven reconcile failed");
         }
     });

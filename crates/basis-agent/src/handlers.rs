@@ -1,18 +1,19 @@
 //! VM lifecycle operations on this host.
 //!
-//! One source of truth for "create a VM" and "delete a VM". Called both
-//! by the inbound-command loop (`CreateVmCommand` / `DeleteVmCommand`)
-//! and by the post-register reconciliation path, which must delete any
-//! VMs the controller has forgotten.
+//! One source of truth for "create a VM" and "delete a VM". `create_vm`
+//! is invoked from the inbound `CreateVmCommand` dispatch; `delete_vm`
+//! is invoked from `apply_reconcile` for every entry in
+//! `ReconcileHostCommand.vm_tombstones`. There is no implicit-by-absence
+//! delete path — the controller's tombstone is the single source of
+//! "this VM should be gone."
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use basis_common::time::now_rfc3339;
 use basis_proto::{
     agent_message, AgentMessage, CreateVmCommand, MachineState, ReportVmStateRequest,
 };
-use humantime::parse_rfc3339;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -242,64 +243,6 @@ pub async fn delete_vm(
     Ok(())
 }
 
-/// Apply the controller's authoritative VM list.
-///
-/// Any locally-known VM not in `expected_vm_ids` was forgotten by the
-/// controller — its disk overlay, tap, and GPU bindings are garbage.
-///
-/// `delete_grace` defends against a buggy/incomplete `expected_vm_ids`
-/// push by skipping deletion of VMs younger than the grace window.
-/// Pass `Duration::ZERO` for the post-register reconcile (the agent
-/// has been offline; the controller's view *is* authoritative). Pass
-/// a non-zero grace for periodic pushes so an in-flight CreateMachine
-/// the controller hasn't fully recorded yet can't be wiped out.
-pub async fn reconcile_against_expected(
-    expected_vm_ids: &[String],
-    vm_mgr: &Arc<VmManager>,
-    net_mgr: &NetworkManager,
-    agent_db: &AgentDb,
-    delete_grace: Duration,
-) -> anyhow::Result<()> {
-    let expected: std::collections::HashSet<&str> =
-        expected_vm_ids.iter().map(String::as_str).collect();
-    let now = std::time::SystemTime::now();
-
-    let mut to_delete: Vec<LocalVmRow> = Vec::new();
-    for vm in agent_db.list_vms().await? {
-        if expected.contains(vm.vm_id.as_str()) {
-            continue;
-        }
-        if !delete_grace.is_zero() && younger_than(&vm.created_at, now, delete_grace) {
-            warn!(
-                vm_id = %vm.vm_id,
-                created_at = %vm.created_at,
-                grace_secs = delete_grace.as_secs(),
-                "VM missing from controller list but within grace period; \
-                 deferring delete"
-            );
-            continue;
-        }
-        warn!(vm_id = %vm.vm_id, "VM forgotten by controller, deleting locally");
-        to_delete.push(vm);
-    }
-
-    futures::future::join_all(
-        to_delete
-            .iter()
-            .map(|vm| delete_vm(&vm.vm_id, vm_mgr, net_mgr, agent_db)),
-    )
-    .await;
-    Ok(())
-}
-
-fn younger_than(created_at: &str, now: std::time::SystemTime, grace: Duration) -> bool {
-    parse_rfc3339(created_at)
-        .ok()
-        .and_then(|then| now.duration_since(then).ok())
-        .map(|age| age < grace)
-        .unwrap_or(false)
-}
-
 /// Error returned when the agent→controller channel has been closed.
 /// Callers in one-shot contexts (post-create/delete reporting) should
 /// log + move on; callers in a periodic loop should treat this as the
@@ -357,131 +300,4 @@ pub async fn report_local_vm_states(
         send_vm_state(sender, vm.vm_id, state, err, false).await?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::network::{cluster::ClusterManager, NetworkManager, UplinkBridge};
-
-    fn fake_vm(id: &str) -> LocalVmRow {
-        LocalVmRow {
-            vm_id: id.to_string(),
-            name: format!("vm-{id}"),
-            unit_name: unit_name_for_vm(id),
-            ip_address: "10.0.10.42".to_string(),
-            cpu: 2,
-            memory_mib: 4096,
-            disk_gib: 50,
-            gpu_pci_addresses: "[]".to_string(),
-            extra_disk_gibs: "[]".to_string(),
-            image: "img".to_string(),
-            vni: 10_000,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        }
-    }
-
-    fn old_vm(id: &str) -> LocalVmRow {
-        LocalVmRow {
-            created_at: "2020-01-01T00:00:00Z".to_string(),
-            ..fake_vm(id)
-        }
-    }
-
-    fn fresh_vm(id: &str) -> LocalVmRow {
-        LocalVmRow {
-            created_at: now_rfc3339(),
-            ..fake_vm(id)
-        }
-    }
-
-    fn fixtures() -> (Arc<VmManager>, NetworkManager) {
-        let vm_mgr = Arc::new(VmManager::new(
-            std::env::temp_dir().join("basis-test-reconcile"),
-        ));
-        let uplink = UplinkBridge::new("test-br".to_string(), "lo".to_string(), 9000);
-        let clusters = ClusterManager::new("127.0.0.1".to_string(), 9000, "test-br".to_string());
-        (vm_mgr, NetworkManager::new(uplink, clusters))
-    }
-
-    #[tokio::test]
-    async fn reconcile_deletes_forgotten_vm_records() {
-        let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
-        db.insert_vm(&old_vm("keep")).await.unwrap();
-        db.insert_vm(&old_vm("drop-1")).await.unwrap();
-        db.insert_vm(&old_vm("drop-2")).await.unwrap();
-
-        let (vm_mgr, net_mgr) = fixtures();
-        reconcile_against_expected(
-            &["keep".to_string()],
-            &vm_mgr,
-            &net_mgr,
-            &db,
-            Duration::ZERO,
-        )
-        .await
-        .unwrap();
-
-        let remaining: Vec<String> = db
-            .list_vms()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|v| v.vm_id)
-            .collect();
-        assert_eq!(remaining, vec!["keep".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn reconcile_is_noop_when_everything_expected() {
-        let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
-        db.insert_vm(&old_vm("a")).await.unwrap();
-        db.insert_vm(&old_vm("b")).await.unwrap();
-
-        let (vm_mgr, net_mgr) = fixtures();
-        reconcile_against_expected(
-            &["a".to_string(), "b".to_string()],
-            &vm_mgr,
-            &net_mgr,
-            &db,
-            Duration::ZERO,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(db.list_vms().await.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn reconcile_grace_defers_delete_of_fresh_vms() {
-        let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
-        db.insert_vm(&fresh_vm("just-created")).await.unwrap();
-        db.insert_vm(&old_vm("legitimately-stale")).await.unwrap();
-
-        let (vm_mgr, net_mgr) = fixtures();
-        reconcile_against_expected(&[], &vm_mgr, &net_mgr, &db, Duration::from_secs(60))
-            .await
-            .unwrap();
-
-        let remaining: Vec<String> = db
-            .list_vms()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|v| v.vm_id)
-            .collect();
-        assert_eq!(remaining, vec!["just-created".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn reconcile_zero_grace_deletes_fresh_vms() {
-        let db = AgentDb::open(":memory:".as_ref()).await.unwrap();
-        db.insert_vm(&fresh_vm("just-created")).await.unwrap();
-
-        let (vm_mgr, net_mgr) = fixtures();
-        reconcile_against_expected(&[], &vm_mgr, &net_mgr, &db, Duration::ZERO)
-            .await
-            .unwrap();
-        assert!(db.list_vms().await.unwrap().is_empty());
-    }
 }

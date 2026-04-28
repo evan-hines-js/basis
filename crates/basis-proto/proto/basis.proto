@@ -238,6 +238,10 @@ enum MachineState {
   STOPPING = 3;
   STOPPED = 4;
   FAILED = 5;
+  // Controller has decided this VM should not exist. The vms row is
+  // kept in this state until the agent acks the matching vm_tombstone;
+  // on ack the row is deleted and IP/GPU allocations are released.
+  PENDING_TEARDOWN = 6;
 }
 
 message GPUConstraints {
@@ -258,6 +262,11 @@ message AgentMessage {
     RegisterHostRequest register = 1;
     HeartbeatRequest heartbeat = 2;
     ReportVMStateRequest vm_state = 3;
+    // Acknowledge tombstones the controller asked us to apply. The
+    // controller drops the corresponding pending_teardown rows on
+    // receipt; until ack arrives, every reconcile re-emits the same
+    // tombstones — so loss in flight is self-healing on the next push.
+    TombstoneAck tombstone_ack = 4;
   }
 }
 
@@ -265,29 +274,58 @@ message ControllerCommand {
   string request_id = 1;
   oneof command {
     CreateVMCommand create_vm = 2;
-    DeleteVMCommand delete_vm = 3;
     RegisterHostResponse register_ack = 4;
-    // Authoritative list of VMs + clusters this host should carry.
-    // Fired on every relevant state change (VM create/delete, host
-    // joins or leaves a cluster, peer-set shift) AND periodically so
-    // missed pushes converge. Agent reconciles local state to match —
-    // deletes VMs not in the list, builds bridges for clusters not
-    // yet present, tears down bridges for clusters no longer in the
-    // list, replaces FDB entries to match each cluster's
-    // `vtep_addresses`.
+    // Additive intent: every cluster the host SHOULD carry +
+    // explicit tombstones for resources it should tear down. Absence
+    // is NOT an intent signal: a cluster missing from `clusters` and
+    // also missing from `cluster_tombstones` is left alone (the
+    // controller has lost track of it; conservative wins). Fired on
+    // every relevant state change AND periodically so missed pushes
+    // converge.
+    //
+    // VM teardown also rides this message — `vm_tombstones` is the
+    // single way the controller asks an agent to release a VM. There
+    // is no separate DeleteVm command. Tombstones are re-emitted on
+    // every reconcile until the agent sends a matching `TombstoneAck`,
+    // so an offline agent self-converges on reconnect.
     ReconcileHostCommand reconcile_host = 5;
   }
 }
 
-// The full authoritative view the controller holds of a single host.
-// One message drives three invariants: VM set, cluster set, per-cluster
-// peer VTEPs. There is no separate incremental message — every relevant
-// change re-sends this, and the periodic tick does too, so there's
-// exactly one code path on the agent that turns controller state into
-// host state.
+// Resources the controller is telling the agent to maintain or release.
+// Two lists in symmetry: `clusters[]` says "ensure these exist with
+// this state"; `cluster_tombstones[]` and `vm_tombstones[]` say "tear
+// these down." Anything else on the host is preserved untouched —
+// implicit-tear-down-by-absence is forbidden.
 message ReconcileHostCommand {
-  repeated string expected_vm_ids = 1;
-  repeated ClusterState clusters = 2;
+  repeated ClusterState clusters = 1;
+  // Clusters this host should release: bridge + VXLAN + masquerade +
+  // per-cluster proxy-ARP entries removed. Idempotent re-emission
+  // until acked. Includes `cidr` so the agent can remove the
+  // MASQUERADE rule without consulting its in-memory cache (which
+  // resets on agent restart).
+  repeated ClusterTombstone cluster_tombstones = 2;
+  // VMs this host should release. Single source of VM removal —
+  // there is no implicit "delete VMs not in some expected set."
+  repeated string vm_tombstones = 3;
+}
+
+message ClusterTombstone {
+  uint32 vni = 1;
+  string cluster_id = 2;
+  // Cluster CIDR for the MASQUERADE-rule removal. The agent's
+  // teardown does not depend on local in-memory state for this; the
+  // controller is the source of truth.
+  string cidr = 3;
+}
+
+message TombstoneAck {
+  // VNIs of clusters whose teardown completed. Controller drops the
+  // matching host_clusters(host_id, cluster_id) rows on receipt.
+  repeated uint32 cluster_vnis = 1;
+  // VMs whose teardown completed. Controller drops the matching vms
+  // rows on receipt (their state was PENDING_TEARDOWN).
+  repeated string vm_ids = 2;
 }
 
 message RegisterHostResponse {
@@ -334,13 +372,24 @@ message ClusterState {
   // this cluster. Learning is disabled on the VXLAN device, so this
   // list is the FDB's BUM destination set.
   repeated string vtep_addresses = 6;
-  // Cluster VIPs (apiserver VIP when `APISERVER_PUBLIC` + LB Service
-  // block) as `<addr>/<prefix>` strings. The agent advertises these
-  // via BGP (with self as next-hop) so they route to the cluster
-  // from upstream. Every host carrying the cluster advertises the
-  // same VIP set — kube-vip leader election within the cluster
-  // settles which CP VM owns the apiserver VIP at any moment.
+  // LAN-routable cluster VIPs (apiserver VIP when `APISERVER_PUBLIC`
+  // + LB Service block from a `Lan`-scoped pool) as `<addr>/<prefix>`
+  // strings. The agent advertises these via BGP (with self as
+  // next-hop), proxy-ARPs them onto the uplink, and installs a bridge
+  // route. Every host carrying the cluster advertises the same VIP
+  // set — kube-vip leader election within the cluster settles which
+  // CP VM owns the apiserver VIP at any moment.
   repeated string cluster_vips = 7;
+  // Tree-scoped cluster VIPs (apiserver VIP when `APISERVER_PRIVATE`
+  // + LB Service block from a `Tree`-scoped pool, when configured).
+  // Agent installs the bridge route only — no proxy-ARP on the
+  // uplink, no BGP advertisement in Phase 1. The LAN cannot reach
+  // these; cross-cluster reachability inside the cell flows through
+  // each host's per-cluster bridge (eagerly bootstrapped on every
+  // host for tree-scoped clusters via `ClusterState` entries with
+  // empty `gateway_ip`/`cidr`). Phase 2 will advertise these via BGP
+  // with a community derived from the cluster's `trust_domain`.
+  repeated string internal_cluster_vips = 8;
 }
 
 // --- Agent registration ---
@@ -371,6 +420,30 @@ message RegisterHostRequest {
   // Reported once at registration; change requires a basis-agent
   // restart.
   map<string, string> labels = 8;
+  // Snapshot of every VM and per-cluster bridge the agent has live
+  // locally. The controller diffs this against its own DB and
+  // synthesises one-shot tombstones (in the inline `initial_state`)
+  // for anything the agent reports but the controller doesn't track
+  // — covering the disaster-recovery case where the controller's DB
+  // was wiped while agents continued running. Synthesised tombstones
+  // aren't persisted (no DB row to drop on ack); the agent's
+  // teardown is idempotent so a re-emit on the next register is
+  // harmless if the first ack was lost.
+  HostInventory current_inventory = 9;
+}
+
+message HostInventory {
+  repeated string vm_ids = 1;
+  repeated InventoryCluster clusters = 2;
+}
+
+message InventoryCluster {
+  uint32 vni = 1;
+  // Cluster CIDR as the agent observes it on the live `brc<vni>`
+  // address. Sent so the controller can include it in any synthesised
+  // `ClusterTombstone` — exact MASQUERADE-rule removal works without
+  // the controller having to guess.
+  string cidr = 2;
 }
 
 // Liveness ping. The controller learns *which* host this came from
@@ -415,6 +488,3 @@ message CreateVMCommand {
   uint32 vni = 16;
 }
 
-message DeleteVMCommand {
-  string vm_id = 1;
-}

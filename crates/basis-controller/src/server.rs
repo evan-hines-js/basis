@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,7 +19,9 @@ use basis_common::time::now_rfc3339;
 use basis_common::tls;
 
 use crate::config::{BgpConfig, NetworkConfig, Pool};
-use crate::db::{ClusterIdentity, ClusterRow, Db, DbError, GpuAssignment, VmRow};
+use crate::db::{
+    ClusterIdentity, ClusterRow, Db, DbError, GpuAssignment, VmRow, VM_STATE_PENDING_TEARDOWN,
+};
 use crate::metrics::Metrics;
 use crate::scheduler::{self, ScheduleRequest, SchedulerError};
 
@@ -79,6 +82,50 @@ pub fn provider_id(vm_id: &str) -> String {
     format!("basis://{vm_id}")
 }
 
+/// Classify a cluster's pool-allocated VIPs into LAN-routable vs
+/// tree-scoped lists for `ClusterState.cluster_vips` and
+/// `ClusterState.internal_cluster_vips` respectively.
+///
+/// Pool scope decides which list each VIP goes into:
+/// * `Lan` — advertised cell-wide via BGP, proxy-ARPed onto the
+///   uplink, and bridge route. The LAN can reach the VIP.
+/// * `Tree` — bridge route only, no BGP/proxy-ARP. The LAN can NOT
+///   reach the VIP; cross-cluster reachability within the cell flows
+///   through each host's per-cluster bridge.
+///
+/// `APISERVER_PUBLIC + Tree` is rejected at CreateCluster, so a
+/// public apiserver VIP only ever appears for a Lan pool. The
+/// cluster's overlay CIDR itself is intentionally NOT advertised
+/// either way: VM IPs are private to the cluster's bridge, no
+/// inter-cluster L3.
+///
+/// The caller must resolve the cluster's `external_pool` before
+/// calling this — passing an explicit `&Pool` makes the
+/// "what if the pool was removed from config?" question a
+/// fail-loud at the lookup site rather than a silent fallback here.
+fn classify_cluster_vips(
+    cluster: &ClusterRow,
+    visibility: ApiserverVisibility,
+    pool: &Pool,
+) -> (Vec<String>, Vec<String>) {
+    let mut cluster_vips: Vec<String> = Vec::with_capacity(2);
+    let mut internal_cluster_vips: Vec<String> = Vec::with_capacity(2);
+    if visibility == ApiserverVisibility::ApiserverPublic {
+        if let Ok(vip) = cluster.control_plane_endpoint.parse::<std::net::Ipv4Addr>() {
+            cluster_vips.push(format!("{vip}/32"));
+        }
+    }
+    if !cluster.service_block_cidr.is_empty() {
+        let target = if pool.is_tree() {
+            &mut internal_cluster_vips
+        } else {
+            &mut cluster_vips
+        };
+        target.push(cluster.service_block_cidr.clone());
+    }
+    (cluster_vips, internal_cluster_vips)
+}
+
 /// Agent-reported VM create failure. Carries enough to tell a real
 /// fault apart from a load-shedding signal so the controller can map
 /// the two onto different gRPC status codes and metric labels.
@@ -88,18 +135,12 @@ struct VmFailure {
     transient: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VmOpKind {
-    Create,
-    Delete,
-}
-
-/// Pending create-or-delete waiting for the agent to report terminal VM
-/// state. One map holds both kinds because a vm_id is only ever waiting
-/// on one op at a time.
+/// Pending CreateMachine waiting for the agent to report RUNNING.
+/// Delete is async (mark pending → reconcile re-emits tombstone →
+/// agent acks → DB drops the row), so there's nothing to wait on for
+/// that path.
 struct PendingVmOp {
     tx: oneshot::Sender<Result<(), VmFailure>>,
-    kind: VmOpKind,
     /// Host this op was dispatched to. When the host's agent stream
     /// drops, we remove every entry matching this host_id so the
     /// awaiting RPC fails immediately instead of stalling for the full
@@ -131,10 +172,6 @@ const DEFAULT_AGENT_RECONCILE_INTERVAL: std::time::Duration = std::time::Duratio
 
 /// Total time `CreateMachine` will wait for the agent to report RUNNING.
 const CREATE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Total time `DeleteMachine` / `DeleteCluster` will wait for the agent
-/// to confirm teardown.
-const DELETE_MACHINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl BasisServer {
     pub fn new(
@@ -235,37 +272,25 @@ struct SharedCtx {
 
 impl SharedCtx {
     /// Assemble the full authoritative `ReconcileHostCommand` for a
-    /// host from DB state. Single source of truth: register-ack,
-    /// periodic tick, and after-change broadcasts all go through here.
+    /// host. Tombstone-driven: clusters[] is the set of (host, cluster)
+    /// rows in state ACTIVE; cluster_tombstones[] is the set in state
+    /// PENDING_TEARDOWN; vm_tombstones[] is every vms row on this host
+    /// with state PENDING_TEARDOWN. The agent reconciles additively
+    /// against clusters[] and explicitly tears down tombstones — there
+    /// is no implicit-by-absence delete, so a transient empty snapshot
+    /// (CAPI churn, controller restart mid-flow) doesn't tear down any
+    /// host state. Same shape on every emission path: register-ack,
+    /// periodic tick, and after-change broadcasts.
     async fn build_reconcile_command(
         &self,
         host_id: &str,
     ) -> Result<ReconcileHostCommand, DbError> {
-        let expected_vm_ids = self.db.list_vm_ids_on_host(host_id).await?;
-        let clusters = self.db.list_host_clusters(host_id).await?;
-        let mut cluster_states = Vec::with_capacity(clusters.len());
-        for cluster in clusters {
-            // A host carries a cluster only when it has ≥1 VM in it,
-            // and `ensure_host_bridge_ip` runs before `insert_vm` —
-            // so the mapping must exist. Treat its absence as DB
-            // corruption.
-            let gateway_ip = self
-                .db
-                .get_host_bridge_ip(&cluster.id, host_id)
-                .await?
-                .ok_or_else(|| {
-                    DbError::Malformed(format!(
-                        "cluster {} host {host_id} has VMs but no bridge IP mapping",
-                        cluster.id
-                    ))
-                })?;
-            // External (pool-allocated) allocations — the LB Service
-            // block and, when `apiserver_visibility = PUBLIC`, the
-            // apiserver VIP — need explicit BGP advertisement by every
-            // host carrying the cluster. The cluster's overlay CIDR
-            // itself is intentionally NOT advertised: VM IPs are
-            // private to the cluster's bridge, no inter-cluster L3.
-            let mut cluster_vips: Vec<String> = Vec::with_capacity(2);
+        let active_memberships = self.db.list_active_host_clusters(host_id).await?;
+        let mut cluster_states = Vec::with_capacity(active_memberships.len());
+        let mut carried: HashSet<String> = HashSet::with_capacity(active_memberships.len());
+        for membership in active_memberships {
+            carried.insert(membership.id.clone());
+            let cluster = membership.cluster();
             let visibility = ApiserverVisibility::try_from(cluster.apiserver_visibility as i32)
                 .map_err(|_| {
                     DbError::Malformed(format!(
@@ -273,28 +298,180 @@ impl SharedCtx {
                         cluster.id, cluster.apiserver_visibility,
                     ))
                 })?;
-            if visibility == ApiserverVisibility::ApiserverPublic {
-                if let Ok(vip) = cluster.control_plane_endpoint.parse::<std::net::Ipv4Addr>() {
-                    cluster_vips.push(format!("{vip}/32"));
-                }
-            }
-            if !cluster.service_block_cidr.is_empty() {
-                cluster_vips.push(cluster.service_block_cidr.clone());
-            }
+            // Fail loud when a stored cluster references a pool that
+            // is no longer in the controller config: the operator
+            // either removed/renamed the pool or the DB lost sync.
+            // Either way, silently treating the cluster as Lan would
+            // hide a real misconfiguration.
+            let pool = self
+                .network
+                .pool_by_name(&cluster.external_pool)
+                .ok_or_else(|| {
+                    DbError::Malformed(format!(
+                        "cluster {} references pool '{}' which is not defined in network.pools \
+                     (config drift — restore the pool entry or update the cluster)",
+                        cluster.id, cluster.external_pool,
+                    ))
+                })?;
+            let (cluster_vips, internal_cluster_vips) =
+                classify_cluster_vips(&cluster, visibility, pool);
             cluster_states.push(ClusterState {
                 cluster_id: cluster.id.clone(),
                 vni: cluster.vni as u32,
                 cidr: cluster.cidr.clone(),
-                gateway_ip,
+                gateway_ip: membership.bridge_ip.clone(),
                 prefix_len: cluster.prefix_len as u32,
                 vtep_addresses: self.db.list_cluster_vteps(&cluster.id).await?,
                 cluster_vips,
+                internal_cluster_vips,
             });
         }
+
+        // Eager bootstrap of tree-scoped clusters this host does not
+        // carry. Tree pool VIPs are reachable only over per-cluster
+        // bridges and are *not* advertised on the LAN, so a VM in
+        // cluster A on host H needs `<B.vip> dev brcB` on H even if
+        // no VM of cluster B runs on H. Emitting a ghost
+        // `ClusterState` (empty `cidr`/`gateway_ip`) drives the
+        // agent's existing `ensure_cluster_inner` to create the
+        // bridge + VXLAN with the right peer FDB; the bridge route
+        // is installed because `internal_cluster_vips` is populated.
+        // Cluster cidr/gateway/MASQUERADE are deliberately skipped —
+        // those only matter for hosts running VMs of the cluster.
+        for cluster in self.db.list_clusters().await? {
+            if carried.contains(&cluster.id) {
+                continue;
+            }
+            let pool = self
+                .network
+                .pool_by_name(&cluster.external_pool)
+                .ok_or_else(|| {
+                    DbError::Malformed(format!(
+                        "cluster {} references pool '{}' which is not defined in network.pools \
+                     (config drift — restore the pool entry or update the cluster)",
+                        cluster.id, cluster.external_pool,
+                    ))
+                })?;
+            if !pool.is_tree() {
+                continue;
+            }
+            let mut internal_cluster_vips: Vec<String> = Vec::with_capacity(1);
+            // APISERVER_PUBLIC is rejected at CreateCluster for tree
+            // pools, so apiserver VIPs never need fan-out — only the
+            // LB Service block does.
+            if !cluster.service_block_cidr.is_empty() {
+                internal_cluster_vips.push(cluster.service_block_cidr.clone());
+            }
+            cluster_states.push(ClusterState {
+                cluster_id: cluster.id.clone(),
+                vni: cluster.vni as u32,
+                cidr: String::new(),
+                gateway_ip: String::new(),
+                prefix_len: 0,
+                vtep_addresses: self.db.list_cluster_vteps(&cluster.id).await?,
+                cluster_vips: Vec::new(),
+                internal_cluster_vips,
+            });
+        }
+
+        let cluster_tombstones = self
+            .db
+            .list_pending_cluster_tombstones(host_id)
+            .await?
+            .into_iter()
+            .map(|t| ClusterTombstone {
+                vni: t.vni as u32,
+                cluster_id: t.cluster_id,
+                cidr: t.cidr,
+            })
+            .collect();
+        let vm_tombstones = self.db.list_pending_vm_tombstones(host_id).await?;
+
         Ok(ReconcileHostCommand {
-            expected_vm_ids,
             clusters: cluster_states,
+            cluster_tombstones,
+            vm_tombstones,
         })
+    }
+
+    /// Diff `inventory` against the DB and append synthesised
+    /// tombstones to `cmd.cluster_tombstones` / `cmd.vm_tombstones`
+    /// for any kernel state the agent reports but the controller
+    /// doesn't track.
+    ///
+    /// Synthesised tombstones aren't backed by DB rows — there's
+    /// nothing to drop on ack — so re-emitting them on a subsequent
+    /// register (if the first ack was lost) just produces another
+    /// idempotent no-op teardown on the agent side. The agent's
+    /// `delete_vm` / `tombstone_cluster` tear-down paths are
+    /// idempotent; missing local state is the desired end state.
+    ///
+    /// This is the controller's only escape hatch for the
+    /// "controller DB wiped while agents kept running" disaster-
+    /// recovery flow. Without it, a fresh controller would see no
+    /// host_clusters / vms rows for the host and emit an empty
+    /// reconcile, leaving every bridge/VM as an orphan forever.
+    async fn extend_with_orphan_tombstones(
+        &self,
+        host_id: &str,
+        inventory: &HostInventory,
+        cmd: &mut ReconcileHostCommand,
+    ) -> Result<(), DbError> {
+        // VMs the agent reports that aren't in `vms` for THIS host
+        // become synthetic vm_tombstones. A vms row on a different
+        // host_id (the controller has moved/re-recorded the VM
+        // elsewhere) also counts as orphan from this host's
+        // perspective — keep the local copy from squatting.
+        let mut already_tombstoned: HashSet<String> = cmd.vm_tombstones.iter().cloned().collect();
+        for vm_id in &inventory.vm_ids {
+            if already_tombstoned.contains(vm_id) {
+                continue;
+            }
+            let owned_here = match self.db.get_vm(vm_id).await {
+                Ok(row) => row.host_id == host_id,
+                Err(DbError::NotFound(_)) => false,
+                Err(e) => return Err(e),
+            };
+            if !owned_here {
+                cmd.vm_tombstones.push(vm_id.clone());
+                already_tombstoned.insert(vm_id.clone());
+            }
+        }
+
+        // Cluster bridges the agent reports that the controller has
+        // no host_clusters row for (in either ACTIVE or PENDING
+        // state) become synthetic cluster_tombstones. The agent's
+        // reported cidr is the source of truth for the MASQUERADE-
+        // rule removal — the controller may not even have a clusters
+        // row for that vni after a wipe.
+        let mut tracked_vnis: HashSet<u32> = self
+            .db
+            .list_active_host_clusters(host_id)
+            .await?
+            .iter()
+            .map(|m| m.vni as u32)
+            .collect();
+        for t in &self.db.list_pending_cluster_tombstones(host_id).await? {
+            tracked_vnis.insert(t.vni as u32);
+        }
+        let mut already_t_vnis: HashSet<u32> =
+            cmd.cluster_tombstones.iter().map(|t| t.vni).collect();
+        for inv_cluster in &inventory.clusters {
+            if tracked_vnis.contains(&inv_cluster.vni) || already_t_vnis.contains(&inv_cluster.vni)
+            {
+                continue;
+            }
+            cmd.cluster_tombstones.push(ClusterTombstone {
+                vni: inv_cluster.vni,
+                // The controller has no cluster_id for this orphan;
+                // empty is fine — the agent only uses vni + cidr for
+                // teardown, cluster_id is for logging/diagnostics.
+                cluster_id: String::new(),
+                cidr: inv_cluster.cidr.clone(),
+            });
+            already_t_vnis.insert(inv_cluster.vni);
+        }
+        Ok(())
     }
 
     /// Send a fresh reconcile to the given host if its agent is
@@ -421,26 +598,35 @@ impl BasisApiService {
             .map_err(db_status)
     }
 
+    /// Roll a failed CreateMachine back into the tombstone-driven
+    /// teardown pipeline. Mark the VM pending teardown (no-op if its
+    /// row never made it in), mark its host_cluster pending teardown
+    /// iff this was the last live VM there, then nudge the host so the
+    /// next reconcile carries the tombstones. Allocations + the vms
+    /// row drain via the agent's TombstoneAck like every other delete.
     async fn cleanup_failed_vm(&self, vm_id: &str, cluster_id: &str, host_id: &str) {
-        if let Err(e) = self.shared.db.release_vm_ips(vm_id).await {
-            warn!(vm_id, error = %e, "cleanup: release IPs");
+        match self.shared.db.mark_vm_pending_teardown(vm_id).await {
+            Ok(()) => {}
+            // No vms row means insert_vm never landed (e.g. capacity
+            // race lost). The orphan ip_allocations entry is released
+            // below; nothing else to do.
+            Err(DbError::NotFound(_)) => {}
+            Err(e) => warn!(vm_id, error = %e, "cleanup: mark VM pending teardown"),
         }
-        if let Err(e) = self.shared.db.delete_vm(vm_id).await {
-            warn!(vm_id, error = %e, "cleanup: delete VM row");
+        if let Err(e) = self.shared.db.release_vm_ips(vm_id).await {
+            warn!(vm_id, error = %e, "cleanup: release VM IPs");
         }
         if let Err(e) = self
             .shared
             .db
-            .release_host_bridge_ip_if_idle(cluster_id, host_id)
+            .mark_host_cluster_pending_teardown(cluster_id, host_id)
             .await
         {
-            warn!(vm_id, cluster_id, host_id, error = %e, "cleanup: release host bridge IP");
+            warn!(
+                vm_id, cluster_id, host_id, error = %e,
+                "cleanup: mark host_cluster pending teardown",
+            );
         }
-        self.shared.broadcast_cluster(cluster_id).await;
-        // If this failure left the host without any VM in the cluster,
-        // `broadcast_cluster` won't reach it — push directly so the
-        // host tears the cluster's bridge/VXLAN down and frees its
-        // bridge IP before the next periodic reconcile tick.
         self.shared.push_reconcile(host_id).await;
     }
 
@@ -448,123 +634,50 @@ impl BasisApiService {
         &self,
         vm_id: &str,
         host_id: &str,
-        kind: VmOpKind,
     ) -> oneshot::Receiver<Result<(), VmFailure>> {
         let (tx, rx) = oneshot::channel();
         self.pending_ops.insert(
             vm_id.to_string(),
             PendingVmOp {
                 tx,
-                kind,
                 host_id: host_id.to_string(),
             },
         );
         rx
     }
 
-    /// Tear down a single VM synchronously: notify the agent, wait
-    /// for terminal state, release resources. The synchronous
-    /// confirmation is what bounds queue depth under load.
-    async fn teardown_vm(&self, vm: &VmRow) -> Result<(), Status> {
+    /// Initiate teardown of a single VM. Asynchronous: marks the vms
+    /// row PENDING_TEARDOWN, also marks the (host, cluster) row
+    /// PENDING_TEARDOWN if this was the last live VM for that pair,
+    /// then nudges the agent with a reconcile push. The agent's
+    /// `TombstoneAck` is what eventually drops the row + releases
+    /// allocations — so a disconnected agent is fine, the next
+    /// reconcile (periodic or on reconnect) re-emits the tombstone
+    /// idempotently.
+    ///
+    /// DeleteMachine returns success once the intent is durably
+    /// recorded. Callers that need to observe the eventual deletion
+    /// poll `GetMachine` (state transitions ACTIVE → PENDING_TEARDOWN
+    /// → 404 once acked).
+    async fn initiate_vm_teardown(&self, vm: &VmRow) -> Result<(), Status> {
         self.shared
             .db
-            .update_vm_state(&vm.id, MachineState::Stopping as i64, "", &now_rfc3339())
+            .mark_vm_pending_teardown(&vm.id)
             .await
             .map_err(db_status)?;
-
-        let Some(agent) = self.shared.agents.get(&vm.host_id) else {
-            info!(host_id = %vm.host_id, vm_id = %vm.id,
-                "DeleteVm: agent not connected; returning Unavailable");
-            return Err(Status::unavailable(format!(
-                "host '{}' agent not connected",
-                vm.host_id
-            )));
-        };
-
-        let wait_rx = self.register_pending_op(&vm.id, &vm.host_id, VmOpKind::Delete);
-
-        let cmd = ControllerCommand {
-            request_id: vm.id.clone(),
-            command: Some(controller_command::Command::DeleteVm(DeleteVmCommand {
-                vm_id: vm.id.clone(),
-            })),
-        };
-        if agent.command_tx.send(cmd).await.is_err() {
-            self.pending_ops.remove(&vm.id);
-            info!(host_id = %vm.host_id, vm_id = %vm.id,
-                "DeleteVm: agent stream closed before command delivered");
-            return Err(Status::unavailable("agent stream closed"));
-        }
-        drop(agent);
-
-        let cluster_id = vm.cluster_id.clone();
-
-        match tokio::time::timeout(DELETE_MACHINE_TIMEOUT, wait_rx).await {
-            Ok(Ok(Ok(()))) => {
-                if let Err(e) = self.shared.db.release_vm_ips(&vm.id).await {
-                    warn!(vm_id = %vm.id, error = %e, "failed to release VM IPs during teardown");
-                }
-                self.shared.db.delete_vm(&vm.id).await.map_err(db_status)?;
-                if let Err(e) = self
-                    .shared
-                    .db
-                    .release_host_bridge_ip_if_idle(&cluster_id, &vm.host_id)
-                    .await
-                {
-                    warn!(
-                        vm_id = %vm.id, cluster_id = %cluster_id, host_id = %vm.host_id, error = %e,
-                        "failed to release host bridge IP during teardown"
-                    );
-                }
-                self.shared.broadcast_cluster(&cluster_id).await;
-                // `broadcast_cluster` only reaches hosts that still
-                // carry a VM in this cluster. If this delete was the
-                // last VM for (host, cluster), the host itself is no
-                // longer in that list — push directly so it tears the
-                // cluster's bridge/VXLAN down and frees its bridge IP
-                // before the next periodic reconcile tick.
-                self.shared.push_reconcile(&vm.host_id).await;
-                info!(vm_id = %vm.id, host_id = %vm.host_id, "DeleteMachine: agent confirmed STOPPED");
-                Ok(())
-            }
-            Ok(Ok(Err(failure))) if failure.transient => {
-                warn!(
-                    vm_id = %vm.id, host_id = %vm.host_id, error = %failure.message,
-                    "DeleteMachine: agent shed for backpressure (transient)"
-                );
-                Err(Status::unavailable(format!(
-                    "agent busy, retry: {}",
-                    failure.message
-                )))
-            }
-            Ok(Ok(Err(failure))) => {
-                warn!(
-                    vm_id = %vm.id, host_id = %vm.host_id, error = %failure.message,
-                    "DeleteMachine: agent reported FAILED"
-                );
-                Err(Status::internal(format!(
-                    "VM deletion failed: {}",
-                    failure.message
-                )))
-            }
-            Ok(Err(_)) => {
-                warn!(vm_id = %vm.id, host_id = %vm.host_id,
-                    "DeleteMachine: agent disconnected during deletion");
-                Err(Status::unavailable("agent disconnected during VM deletion"))
-            }
-            Err(_) => {
-                self.pending_ops.remove(&vm.id);
-                warn!(
-                    vm_id = %vm.id, host_id = %vm.host_id,
-                    timeout_s = DELETE_MACHINE_TIMEOUT.as_secs(),
-                    "DeleteMachine: timed out waiting for agent confirmation"
-                );
-                Err(Status::deadline_exceeded(format!(
-                    "VM deletion timed out ({}s)",
-                    DELETE_MACHINE_TIMEOUT.as_secs()
-                )))
-            }
-        }
+        // Marking the host_clusters row idempotent — only flips to
+        // pending if no live VMs remain for (host, cluster). If a
+        // sibling VM is still ACTIVE on the same host+cluster, this
+        // is a no-op and the cluster bridge stays put.
+        self.shared
+            .db
+            .mark_host_cluster_pending_teardown(&vm.cluster_id, &vm.host_id)
+            .await
+            .map_err(db_status)?;
+        self.shared.push_reconcile(&vm.host_id).await;
+        info!(vm_id = %vm.id, host_id = %vm.host_id, cluster_id = %vm.cluster_id,
+              "DeleteMachine: marked PENDING_TEARDOWN; tombstone will fire on next reconcile");
+        Ok(())
     }
 
     /// Run one scheduling pass. Reads `(hosts, usage)` off the reader
@@ -852,6 +965,31 @@ impl basis_server::Basis for BasisApiService {
         // Fail fast on a bad pool name before allocating anything.
         let pool = self.resolve_pool(&req.external_ip_pool)?;
 
+        // Tree-scoped pools are LAN-invisible; a public apiserver VIP
+        // needs to be reachable from the LAN, so the combination is
+        // never useful and is rejected at create time so the operator
+        // gets a clear error rather than a silent unreachable apiserver.
+        if pool.is_tree() && visibility == ApiserverVisibility::ApiserverPublic {
+            return Err(Status::invalid_argument(format!(
+                "pool '{}' is tree-scoped (cell-internal); public apiserver VIPs require a Lan-scoped pool",
+                pool.name,
+            )));
+        }
+        // Phase 1 leniency: tree pools without a `trust_domain` work
+        // (they're cell-internal, not yet trust-domain-isolated).
+        // Phase 2 will turn this into a hard error once BGP communities
+        // enforce per-trust-domain scoping. Warn so the operator is on
+        // notice now.
+        if pool.is_tree() && req.trust_domain.is_empty() {
+            warn!(
+                cluster = %req.name,
+                pool = %pool.name,
+                "tree-scoped pool used without trust_domain — VIPs will not be \
+                 trust-domain-isolated until trust_domain is set (Phase 2 will \
+                 reject this configuration)"
+            );
+        }
+
         // Idempotent by name.
         if let Some(existing) = self
             .shared
@@ -1000,30 +1138,45 @@ impl basis_server::Basis for BasisApiService {
             .await
             .map_err(db_status)?;
 
+        // Mark every VM of this cluster pending teardown. Each one
+        // becomes a `vm_tombstone` on the next reconcile to its host.
         let vms = self
             .shared
             .db
             .list_vms(Some(&req.cluster_id))
             .await
             .map_err(db_status)?;
-        info!(cluster_id = %req.cluster_id, vm_count = vms.len(), "DeleteCluster: cascading VM deletes");
-        futures::future::try_join_all(vms.iter().map(|vm| self.teardown_vm(vm))).await?;
-
-        if let Err(e) = self.shared.db.release_cluster_ips(&req.cluster_id).await {
-            warn!(cluster_id = %req.cluster_id, error = %e,
-                "failed to release cluster VIPs during DeleteCluster");
+        for vm in &vms {
+            if let Err(e) = self.shared.db.mark_vm_pending_teardown(&vm.id).await {
+                warn!(vm_id = %vm.id, error = %e,
+                    "DeleteCluster: failed to mark VM pending teardown");
+            }
         }
-        // Deleting the cluster row releases its (vni, cidr) pair back
-        // to the per-cell allocator: the next `allocate_cluster_network`
-        // reads `clusters` for taken VNIs/CIDRs, so removing the row
-        // is sufficient.
-        self.shared
+
+        // Mark every (host, cluster) row pending teardown. Returns the
+        // set of hosts whose reconcile state needs nudging.
+        let affected_hosts = self
+            .shared
             .db
-            .delete_cluster(&req.cluster_id)
+            .mark_cluster_pending_teardown_all_hosts(&req.cluster_id)
             .await
             .map_err(db_status)?;
+        for host_id in &affected_hosts {
+            self.shared.push_reconcile(host_id).await;
+        }
 
-        info!(cluster_id = %req.cluster_id, "DeleteCluster complete");
+        info!(
+            cluster_id = %req.cluster_id,
+            vms_pending = vms.len(),
+            hosts_pending = affected_hosts.len(),
+            "DeleteCluster: tombstones queued; cluster row + VIP allocations \
+             release once all hosts ack",
+        );
+        // Cluster row + VIP allocations stay until the last ack drops
+        // the final host_clusters row (handled by `ack_tombstones`),
+        // so the controller is consistent at every snapshot: a
+        // half-acked cluster never has its cluster row vanish out
+        // from under in-flight reconcile pushes.
         Ok(Response::new(DeleteClusterResponse {}))
     }
 
@@ -1179,15 +1332,18 @@ impl basis_server::Basis for BasisApiService {
         let host_id = vm.host_id.clone();
         let ip_address = vm.ip_address.clone();
 
-        // VM row now exists, so the host is registered as carrying
-        // this cluster — `release_host_bridge_ip_if_idle` running
-        // from a concurrent delete will see VM count ≥ 1 and leave
-        // the mapping alone. Find-or-allocate the host's bridge IP
-        // here.
+        // VM row now exists; flip the (host, cluster) row to ACTIVE
+        // (or insert it if first VM of this cluster on this host).
+        // If the row was sitting in PENDING_TEARDOWN (last sibling
+        // VM was just deleted but the agent hasn't acked yet),
+        // resurrection-cancels-tombstone fires here: the row goes
+        // back to ACTIVE and the pending tombstone is dropped before
+        // it ever leaves the controller — exactly what makes CAPI
+        // delete-then-recreate churn benign.
         let host_gateway_ip = match self
             .shared
             .db
-            .ensure_host_bridge_ip(&cluster, &host_id)
+            .ensure_host_cluster_active(&cluster, &host_id)
             .await
         {
             Ok(ip) => ip,
@@ -1216,7 +1372,7 @@ impl basis_server::Basis for BasisApiService {
             )));
         };
 
-        let wait_rx = self.register_pending_op(&vm_id, &host_id, VmOpKind::Create);
+        let wait_rx = self.register_pending_op(&vm_id, &host_id);
 
         let cmd = ControllerCommand {
             request_id: vm_id.clone(),
@@ -1340,7 +1496,13 @@ impl basis_server::Basis for BasisApiService {
         let req = request.into_inner();
         info!(vm_id = %req.id, "DeleteMachine received");
         let vm = self.shared.db.get_vm(&req.id).await.map_err(db_status)?;
-        self.teardown_vm(&vm).await?;
+        // Idempotent: a VM already pending teardown just nudges the
+        // host again so the tombstone re-fires on the next reconcile.
+        if vm.state != VM_STATE_PENDING_TEARDOWN {
+            self.initiate_vm_teardown(&vm).await?;
+        } else {
+            self.shared.push_reconcile(&vm.host_id).await;
+        }
         Ok(Response::new(DeleteMachineResponse {}))
     }
 
@@ -1439,13 +1601,22 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
 
         let (command_tx, command_rx) = mpsc::channel::<ControllerCommand>(32);
 
-        // Initial reconcile — agent uses this to build bridges + tear
-        // down forgotten VMs before processing any CreateVm.
-        let initial_state = self
+        // Initial reconcile — agent uses this to build bridges +
+        // process tombstones before accepting any CreateVm. The
+        // inventory the agent reported gets diffed against the DB
+        // and any orphans (kernel state the controller doesn't track)
+        // become one-shot synthesised tombstones in this reply.
+        let mut initial_state = self
             .shared
             .build_reconcile_command(&host_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(inv) = register.current_inventory.as_ref() {
+            self.shared
+                .extend_with_orphan_tombstones(&host_id, inv, &mut initial_state)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
 
         command_tx
             .send(ControllerCommand {
@@ -1622,21 +1793,6 @@ impl BasisAgentService {
     }
 }
 
-/// Look up the kind of pending op waiting on `vm_id`, but only if the
-/// op was registered against `host_id`. Returning `None` for a wrong-
-/// host match (rather than the kind) is what stops a misbehaving
-/// stream from satisfying a wait that belongs to a different host.
-fn pending_op_kind_for(
-    pending_ops: &DashMap<String, PendingVmOp>,
-    vm_id: &str,
-    host_id: &str,
-) -> Option<VmOpKind> {
-    pending_ops
-        .get(vm_id)
-        .filter(|p| p.host_id == host_id)
-        .map(|p| p.kind)
-}
-
 async fn handle_agent_message(
     shared: &SharedCtx,
     pending_ops: &DashMap<String, PendingVmOp>,
@@ -1680,10 +1836,18 @@ async fn handle_agent_message(
                 return Ok(());
             }
 
-            shared
-                .db
-                .update_vm_state(&report.vm_id, state as i64, &report.error_message, &now)
-                .await?;
+            // Don't overwrite a PENDING_TEARDOWN with a stale reading
+            // — once the controller decides a VM is going away, only
+            // the agent's TombstoneAck (which deletes the row) should
+            // change its state. Otherwise a slow VmState report racing
+            // a DeleteMachine could resurrect the row to RUNNING and
+            // leak it.
+            if prev.state != VM_STATE_PENDING_TEARDOWN {
+                shared
+                    .db
+                    .update_vm_state(&report.vm_id, state as i64, &report.error_message, &now)
+                    .await?;
+            }
 
             if state == MachineState::Running {
                 let first_time_running = prev.state != MachineState::Running as i64;
@@ -1699,14 +1863,22 @@ async fn handle_agent_message(
                 }
             }
 
-            let pending_kind = pending_op_kind_for(pending_ops, &report.vm_id, host_id);
-            let resolves = matches!(
-                (pending_kind, state),
-                (Some(VmOpKind::Create), MachineState::Running)
-                    | (Some(VmOpKind::Delete), MachineState::Stopped)
-                    | (Some(_), MachineState::Failed)
-            );
+            // Resolve any pending CreateMachine waiting on this VM —
+            // create is the only synchronous flow now; delete is
+            // tombstone-driven and resolves via TombstoneAck.
+            let resolves = matches!(state, MachineState::Running | MachineState::Failed);
             if resolves {
+                if let Some(pending) = pending_ops.get(&report.vm_id) {
+                    if pending.host_id != host_id {
+                        warn!(
+                            stream_host_id = %host_id,
+                            vm_id = %report.vm_id,
+                            registered_host_id = %pending.host_id,
+                            "ignoring VM state report from wrong host for pending op",
+                        );
+                        return Ok(());
+                    }
+                }
                 if let Some((_, pending)) = pending_ops.remove(&report.vm_id) {
                     let result = if state == MachineState::Failed {
                         Err(VmFailure {
@@ -1718,6 +1890,24 @@ async fn handle_agent_message(
                     };
                     let _ = pending.tx.send(result);
                 }
+            }
+        }
+        Some(agent_message::Payload::TombstoneAck(ack)) => {
+            // The agent has fully torn down these resources. Drop the
+            // matching DB rows (host_clusters / vms) and release any
+            // remaining IP/GPU allocations. Atomic per-host so a
+            // partial ack can't leave half-deleted state.
+            if let Err(e) = shared
+                .db
+                .ack_tombstones(host_id, &ack.cluster_vnis, &ack.vm_ids)
+                .await
+            {
+                warn!(
+                    host_id, error = %e,
+                    cluster_vnis = ?ack.cluster_vnis, vm_ids = ?ack.vm_ids,
+                    "TombstoneAck: failed to drop pending rows; \
+                     next reconcile will re-emit and the agent will re-ack",
+                );
             }
         }
         Some(agent_message::Payload::Register(_)) => {
@@ -1799,5 +1989,85 @@ fn vm_to_create_response(vm: &VmRow) -> CreateMachineResponse {
         provider_id: provider_id(&vm.id),
         ip_address: vm.ip_address.clone(),
         host: vm.host_id.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Pool, PoolScope};
+
+    fn cluster_with(
+        external_pool: &str,
+        visibility_public: bool,
+        service_block: &str,
+    ) -> ClusterRow {
+        ClusterRow {
+            id: "c1".to_string(),
+            name: "cluster".to_string(),
+            vni: 10_000,
+            cidr: "10.0.0.0/24".to_string(),
+            bridge_range_start: "10.0.0.1".to_string(),
+            bridge_range_end: "10.0.0.32".to_string(),
+            vm_range_start: "10.0.0.33".to_string(),
+            vm_range_end: "10.0.0.254".to_string(),
+            prefix_len: 24,
+            control_plane_endpoint: "10.100.0.10".to_string(),
+            apiserver_visibility: if visibility_public { 0 } else { 1 },
+            external_pool: external_pool.to_string(),
+            service_block_cidr: service_block.to_string(),
+            trust_domain: String::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn pool(name: &str, scope: PoolScope) -> Pool {
+        Pool {
+            name: name.to_string(),
+            cidr: "192.168.0.0/24".to_string(),
+            scope,
+        }
+    }
+
+    /// Lan pool + apiserver-public: both the apiserver /32 and the
+    /// service block go to `cluster_vips`. Nothing in
+    /// `internal_cluster_vips`.
+    #[test]
+    fn classify_lan_public_puts_everything_in_cluster_vips() {
+        let cluster = cluster_with("cell-public", true, "192.168.0.16/28");
+        let p = pool("cell-public", PoolScope::Lan);
+        let (lan, tree) = classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPublic, &p);
+        assert_eq!(
+            lan,
+            vec!["10.100.0.10/32".to_string(), "192.168.0.16/28".to_string()]
+        );
+        assert!(tree.is_empty());
+    }
+
+    /// Tree pool + apiserver-private: the service block lives in
+    /// `internal_cluster_vips`; the apiserver VIP is in `cluster.cidr`
+    /// and never appears in either list.
+    #[test]
+    fn classify_tree_private_routes_service_block_to_internal() {
+        let cluster = cluster_with("cell-internal", false, "10.250.0.16/28");
+        let p = pool("cell-internal", PoolScope::Tree);
+        let (lan, tree) =
+            classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPrivate, &p);
+        assert!(lan.is_empty());
+        assert_eq!(tree, vec!["10.250.0.16/28".to_string()]);
+    }
+
+    /// Lan pool + apiserver-private + zero LB IPs: nothing pool-allocated
+    /// is advertised. Only the cluster's overlay is reachable; the
+    /// apiserver VIP is inside `cluster.cidr` and stays private to the
+    /// cluster's bridge.
+    #[test]
+    fn classify_empty_service_block_emits_nothing() {
+        let cluster = cluster_with("cell-public", false, "");
+        let p = pool("cell-public", PoolScope::Lan);
+        let (lan, tree) =
+            classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPrivate, &p);
+        assert!(lan.is_empty());
+        assert!(tree.is_empty());
     }
 }

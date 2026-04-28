@@ -85,6 +85,21 @@ impl NetworkManager {
         self.clusters.reconcile(desired).await
     }
 
+    /// Tear down a cluster's network state in response to a
+    /// `ClusterTombstone` from the controller. See
+    /// [`ClusterManager::tombstone_cluster`] for the semantics.
+    pub async fn tombstone_cluster(&self, vni: u32, cidr: &str) -> Result<(), NetworkError> {
+        self.clusters.tombstone_cluster(vni, cidr).await
+    }
+
+    /// Snapshot of every cluster the agent has live locally as
+    /// `(vni, cidr)` pairs. Sent in `RegisterHostRequest.current_inventory`
+    /// so the controller can synthesise tombstones for orphans after a
+    /// disaster-recovery scenario.
+    pub async fn cluster_inventory(&self) -> Result<Vec<(u32, String)>, NetworkError> {
+        self.clusters.inventory().await
+    }
+
     /// Pre-connect cluster bootstrap: bring the bridge + VXLAN up
     /// with an empty FDB so a cold-booted VM can attach its TAP
     /// before the controller reconcile lands.

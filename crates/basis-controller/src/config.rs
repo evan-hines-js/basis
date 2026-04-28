@@ -165,19 +165,43 @@ pub struct VniRange {
     pub end: u32,
 }
 
+/// Reachability scope for a pool's allocated VIPs. `Lan` is the
+/// default and matches every existing config: prefixes are advertised
+/// cell-wide via BGP and proxy-ARPed onto the uplink so LAN clients
+/// can reach them. `Tree` is for cluster-internal VIPs that should
+/// never leak onto the LAN — the controller still allocates from the
+/// pool's CIDR, but the agent installs only the per-bridge route, no
+/// proxy-ARP and no BGP advertisement (Phase 1). Phase 2 layers a
+/// trust-domain BGP community on top so different trust_domains
+/// don't mutually learn each other's tree prefixes.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PoolScope {
+    #[default]
+    Lan,
+    Tree,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Pool {
     /// Unique, user-chosen name. Referenced by `BasisCluster.spec`.
     /// Must not be empty.
     pub name: String,
-    /// CIDR slice basis owns within the LAN. Both the pool's name and
-    /// the addresses it allocates come from here — the allocator
-    /// walks `[network+1, broadcast-1]` (skipping network and
-    /// broadcast). Carve smaller CIDRs to express "basis only owns
-    /// part of this subnet"; non-power-of-two ranges become multiple
-    /// pool entries.
+    /// CIDR slice basis owns. For `Lan`-scoped pools this must be
+    /// LAN-routable space; for `Tree`-scoped pools this should be
+    /// RFC1918 space outside the LAN's broadcast domain so the LAN
+    /// never tries to ARP for it. The allocator walks
+    /// `[network+1, broadcast-1]` (skipping network and broadcast).
+    /// Carve smaller CIDRs to express "basis only owns part of this
+    /// subnet"; non-power-of-two ranges become multiple pool entries.
     pub cidr: String,
+    /// Whether VIPs from this pool are LAN-routable (`Lan`, default)
+    /// or restricted to per-cluster bridges within the cell (`Tree`).
+    /// Omitting `scope` keeps every existing config validating
+    /// untouched.
+    #[serde(default)]
+    pub scope: PoolScope,
 }
 
 fn default_cluster_prefix() -> u8 {
@@ -305,6 +329,13 @@ impl NetworkConfig {
         if self.pools.is_empty() {
             anyhow::bail!("network.pools must contain at least one entry");
         }
+        if !self.pools.iter().any(|p| !p.is_tree()) {
+            anyhow::bail!(
+                "network.pools must contain at least one Lan-scoped pool \
+                 (every cell needs at least one LAN-routable pool for public \
+                 cluster apiserver VIPs)"
+            );
+        }
         let mut names: HashSet<&str> = HashSet::with_capacity(self.pools.len());
         let mut nets: Vec<ipnet::Ipv4Net> = Vec::with_capacity(self.pools.len());
         for pool in &self.pools {
@@ -360,6 +391,10 @@ impl NetworkConfig {
 }
 
 impl Pool {
+    pub fn is_tree(&self) -> bool {
+        matches!(self.scope, PoolScope::Tree)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.name.is_empty() {
             anyhow::bail!("pool name must not be empty");
@@ -538,5 +573,41 @@ spec:
         assert!(spec.network.pool_by_name("cell-internal").is_some());
         assert!(spec.network.pool_by_name("nonexistent").is_none());
         assert!(spec.network.pool_by_name("").is_none());
+    }
+
+    /// Pools default to `Lan` scope when `scope:` is omitted — every
+    /// existing config keeps validating without a YAML edit.
+    #[test]
+    fn pool_scope_defaults_to_lan() {
+        let spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
+        assert_eq!(spec.network.pools[0].scope, PoolScope::Lan);
+        assert!(!spec.network.pools[0].is_tree());
+    }
+
+    /// Adding `scope: tree` to a pool entry parses and round-trips.
+    #[test]
+    fn pool_scope_tree_deserializes() {
+        let yaml = base_yaml().replace(
+            "      - name: cell-internal\n        cidr: 192.168.100.0/24",
+            "      - name: cell-public\n        cidr: 192.168.100.0/24\n      - name: cell-internal\n        cidr: 172.16.0.0/24\n        scope: tree",
+        );
+        let spec = BasisControllerSpec::load(write(&yaml).path()).unwrap();
+        let by_name = |n| spec.network.pools.iter().find(|p| p.name == n).unwrap();
+        assert_eq!(by_name("cell-public").scope, PoolScope::Lan);
+        assert_eq!(by_name("cell-internal").scope, PoolScope::Tree);
+        assert!(by_name("cell-internal").is_tree());
+        assert!(spec.validate().is_ok());
+    }
+
+    /// At least one Lan-scoped pool must exist — every cell needs one
+    /// LAN-routable pool for public cluster apiserver VIPs. A config
+    /// with only Tree pools is rejected up-front.
+    #[test]
+    fn rejects_all_tree_pools() {
+        let mut spec = BasisControllerSpec::load(write(&base_yaml()).path()).unwrap();
+        spec.network.pools[0].scope = PoolScope::Tree;
+        spec.network.pools[0].cidr = "10.250.0.0/24".to_string();
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one Lan-scoped pool"), "got: {err}");
     }
 }

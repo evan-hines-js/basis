@@ -183,18 +183,34 @@ impl Db {
         .execute(&self.writer)
         .await?;
 
-        // Per-(cluster, host) bridge IP. Every hypervisor carrying a
-        // VM in a cluster owns a unique address from the cluster's
-        // `bridge_range` and assigns it to its local `brc<vni>`. VMs
-        // use their own host's bridge IP as default gateway so
-        // cross-host replies routing back through the gateway land on
-        // the originating hypervisor — anycast on a shared IP would
-        // require EVPN-style ARP suppression we don't have yet.
+        // Per-(cluster, host) membership + bridge IP, plus the
+        // tombstone state machine that drives reconcile emission.
+        //
+        // Every hypervisor carrying a VM in a cluster owns a unique
+        // address from the cluster's `bridge_range` and assigns it to
+        // its local `brc<vni>`. VMs use their own host's bridge IP as
+        // default gateway so cross-host replies routing back through
+        // the gateway land on the originating hypervisor — anycast on
+        // a shared IP would require EVPN-style ARP suppression we
+        // don't have yet.
+        //
+        // `state` tracks the tombstone lifecycle:
+        //   * 0 (ACTIVE): host should carry the cluster. Emitted in
+        //     `ReconcileHostCommand.clusters[]`.
+        //   * 1 (PENDING_TEARDOWN): the last VM of the cluster on
+        //     this host has been removed (or DeleteCluster ran).
+        //     Emitted in `ReconcileHostCommand.cluster_tombstones[]`.
+        //     Row deleted on `TombstoneAck`. A fresh CreateMachine
+        //     for the same (host, cluster) flips state back to ACTIVE
+        //     before any tombstone fires — resurrection cancels
+        //     teardown, which absorbs CAPI delete-then-recreate
+        //     churn without flapping bridges.
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS cluster_host_bridges (
+            "CREATE TABLE IF NOT EXISTS host_clusters (
                 cluster_id TEXT NOT NULL REFERENCES clusters(id),
-                host_id TEXT NOT NULL,
+                host_id TEXT NOT NULL REFERENCES hosts(id),
                 ip_address TEXT NOT NULL,
+                state INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (cluster_id, host_id),
                 UNIQUE (cluster_id, ip_address)
             )",
@@ -432,14 +448,17 @@ impl Db {
         Ok(())
     }
 
-    // --- Per-(cluster, host) bridge IPs ---
+    // --- Per-(host, cluster) membership + tombstone lifecycle ---
 
-    /// Find-or-allocate the bridge IP this host uses for VMs in
-    /// `cluster`. Idempotent: repeat calls for the same (cluster,
-    /// host) return the same IP. On first call for the pair, picks
-    /// the lowest free address in the cluster's `bridge_range` and
-    /// inserts the mapping.
-    pub async fn ensure_host_bridge_ip(
+    /// Find-or-(re)activate the (host, cluster) row, returning the
+    /// host's bridge IP for that cluster. On first call for a pair,
+    /// picks the lowest free address in the cluster's `bridge_range`
+    /// and inserts the row in state ACTIVE. On a row that's already
+    /// PENDING_TEARDOWN, flips state back to ACTIVE and returns the
+    /// pre-existing IP — resurrection cancels the pending tombstone
+    /// without ever emitting it on the wire. This is what absorbs
+    /// CAPI delete-then-recreate churn cleanly.
+    pub async fn ensure_host_cluster_active(
         &self,
         cluster: &ClusterRow,
         host_id: &str,
@@ -447,9 +466,13 @@ impl Db {
         let range = cluster.bridge_range()?;
         let mut tx = self.writer.begin().await?;
 
+        // Existing row: bump back to ACTIVE if it was pending teardown
+        // and return its IP unchanged. Same code path for plain ACTIVE
+        // — UPDATE is a no-op there.
         if let Some((ip,)) = sqlx::query_as::<_, (String,)>(
-            "SELECT ip_address FROM cluster_host_bridges \
-             WHERE cluster_id = ? AND host_id = ?",
+            "UPDATE host_clusters SET state = 0
+             WHERE cluster_id = ? AND host_id = ?
+             RETURNING ip_address",
         )
         .bind(&cluster.id)
         .bind(host_id)
@@ -474,13 +497,13 @@ impl Db {
                   WHERE printf('%d.%d.%d.%d',
                                (n >> 24) & 255, (n >> 16) & 255,
                                (n >>  8) & 255,  n        & 255)
-                        NOT IN (SELECT ip_address FROM cluster_host_bridges
+                        NOT IN (SELECT ip_address FROM host_clusters
                                 WHERE cluster_id = ?)
                   ORDER BY n
                   LIMIT 1
               )
-            INSERT INTO cluster_host_bridges (cluster_id, host_id, ip_address)
-            SELECT ?, ?, ip FROM picked
+            INSERT INTO host_clusters (cluster_id, host_id, ip_address, state)
+            SELECT ?, ?, ip, 0 FROM picked
             RETURNING ip_address
             "#,
         )
@@ -504,50 +527,88 @@ impl Db {
         })
     }
 
-    /// Bridge IP this host uses for the given cluster, if any. Called
-    /// by `build_reconcile_command` — a host should always have a
-    /// bridge IP for every cluster it carries a VM in, but the lookup
-    /// is tolerant of the brief window between a VM delete and the
-    /// mapping release.
-    pub async fn get_host_bridge_ip(
-        &self,
-        cluster_id: &str,
-        host_id: &str,
-    ) -> Result<Option<String>, DbError> {
-        Ok(sqlx::query_scalar::<_, String>(
-            "SELECT ip_address FROM cluster_host_bridges \
-             WHERE cluster_id = ? AND host_id = ?",
-        )
-        .bind(cluster_id)
-        .bind(host_id)
-        .fetch_optional(&self.reader)
-        .await?)
-    }
-
-    /// Release the bridge IP for (cluster, host) iff no VMs remain on
-    /// that host in that cluster. Caller invokes this after every VM
-    /// delete; on the last VM for a (host, cluster) the bridge mapping
-    /// drops and the address is available for reuse.
-    pub async fn release_host_bridge_ip_if_idle(
+    /// Mark (host, cluster) as PENDING_TEARDOWN iff no live VMs of the
+    /// cluster remain on the host. Idempotent: an already-pending row
+    /// stays pending; a missing row is a no-op (cluster was never
+    /// scheduled here, or already acked away). Live VMs are those NOT
+    /// in PENDING_TEARDOWN — a VM still being torn down doesn't keep
+    /// its host's cluster row pinned, since both will tombstone
+    /// together on the same reconcile.
+    pub async fn mark_host_cluster_pending_teardown(
         &self,
         cluster_id: &str,
         host_id: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "DELETE FROM cluster_host_bridges \
-             WHERE cluster_id = ? AND host_id = ? \
+            "UPDATE host_clusters SET state = 1
+             WHERE cluster_id = ? AND host_id = ?
                AND NOT EXISTS (
                    SELECT 1 FROM vms
                    WHERE host_id = ? AND cluster_id = ?
+                     AND state != ?
                )",
         )
         .bind(cluster_id)
         .bind(host_id)
         .bind(host_id)
         .bind(cluster_id)
+        .bind(VM_STATE_PENDING_TEARDOWN)
         .execute(&self.writer)
         .await?;
         Ok(())
+    }
+
+    /// Mark every (host, cluster) row across all hosts pending teardown.
+    /// Used by DeleteCluster — the cluster is going away cell-wide so
+    /// every host carrying it must release its bridge.
+    pub async fn mark_cluster_pending_teardown_all_hosts(
+        &self,
+        cluster_id: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let hosts: Vec<String> = sqlx::query_scalar(
+            "UPDATE host_clusters SET state = 1
+             WHERE cluster_id = ?
+             RETURNING host_id",
+        )
+        .bind(cluster_id)
+        .fetch_all(&self.writer)
+        .await?;
+        Ok(hosts)
+    }
+
+    /// Active (state=ACTIVE) host_clusters rows for `host_id` joined
+    /// with their cluster — drives `ReconcileHostCommand.clusters[]`.
+    pub async fn list_active_host_clusters(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<HostClusterMembership>, DbError> {
+        Ok(sqlx::query_as::<_, HostClusterMembership>(
+            "SELECT c.*, hc.ip_address AS bridge_ip
+             FROM clusters c
+             JOIN host_clusters hc ON hc.cluster_id = c.id
+             WHERE hc.host_id = ? AND hc.state = 0",
+        )
+        .bind(host_id)
+        .fetch_all(&self.reader)
+        .await?)
+    }
+
+    /// Pending-teardown host_clusters rows for `host_id` — drives
+    /// `ReconcileHostCommand.cluster_tombstones[]`. Returns
+    /// (cluster_id, vni, cidr) for the agent's teardown path.
+    pub async fn list_pending_cluster_tombstones(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<PendingClusterTombstone>, DbError> {
+        Ok(sqlx::query_as::<_, PendingClusterTombstone>(
+            "SELECT c.id AS cluster_id, c.vni, c.cidr
+             FROM clusters c
+             JOIN host_clusters hc ON hc.cluster_id = c.id
+             WHERE hc.host_id = ? AND hc.state = 1",
+        )
+        .bind(host_id)
+        .fetch_all(&self.reader)
+        .await?)
     }
 
     /// Allocate an aligned `count`-sized block to a cluster from the
@@ -793,17 +854,16 @@ impl Db {
         )
     }
 
+    /// Hard-delete a cluster row. Caller is responsible for ensuring
+    /// every (host, cluster) row has already been tombstoned and acked
+    /// — DeleteCluster's flow marks each host pending and waits for
+    /// acks before invoking this. The FK on host_clusters fires
+    /// noisily if you skip that step, which is the desired behaviour.
     pub async fn delete_cluster(&self, id: &str) -> Result<(), DbError> {
-        let mut tx = self.writer.begin().await?;
-        sqlx::query("DELETE FROM cluster_host_bridges WHERE cluster_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
         sqlx::query("DELETE FROM clusters WHERE id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&self.writer)
             .await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -813,30 +873,20 @@ impl Db {
             .await?)
     }
 
-    /// VTEP addresses of every host currently carrying a VM in this
-    /// cluster. Drives the agent-side FDB reconcile.
+    /// VTEP addresses of every host with an ACTIVE host_clusters row
+    /// for this cluster. Drives the agent-side FDB reconcile (BUM
+    /// destinations). PENDING_TEARDOWN hosts are excluded — they're
+    /// in the process of releasing the cluster and shouldn't be
+    /// flooded with new traffic.
     pub async fn list_cluster_vteps(&self, cluster_id: &str) -> Result<Vec<String>, DbError> {
-        let rows: Vec<(String,)> = sqlx::query_as(
+        Ok(sqlx::query_scalar(
             "SELECT DISTINCT h.vtep_address
-             FROM vms v JOIN hosts h ON v.host_id = h.id
-             WHERE v.cluster_id = ? AND h.vtep_address != ''",
+             FROM host_clusters hc
+             JOIN hosts h ON h.id = hc.host_id
+             WHERE hc.cluster_id = ? AND hc.state = 0
+               AND h.vtep_address != ''",
         )
         .bind(cluster_id)
-        .fetch_all(&self.reader)
-        .await?;
-        Ok(rows.into_iter().map(|(v,)| v).collect())
-    }
-
-    /// Every cluster this host currently carries (≥1 VM scheduled
-    /// here). Drives the per-host `ReconcileHostCommand.clusters`
-    /// list.
-    pub async fn list_host_clusters(&self, host_id: &str) -> Result<Vec<ClusterRow>, DbError> {
-        Ok(sqlx::query_as::<_, ClusterRow>(
-            "SELECT DISTINCT c.* FROM clusters c
-             JOIN vms v ON v.cluster_id = c.id
-             WHERE v.host_id = ?",
-        )
-        .bind(host_id)
         .fetch_all(&self.reader)
         .await?)
     }
@@ -1229,11 +1279,129 @@ impl Db {
         Ok(())
     }
 
-    pub async fn delete_vm(&self, id: &str) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM vms WHERE id = ?")
-            .bind(id)
+    /// Mark a VM as PENDING_TEARDOWN. The vms row is *not* deleted —
+    /// it's kept so the controller's reconcile keeps re-emitting the
+    /// `vm_tombstones[]` entry until the agent acks. On ack, the row
+    /// is deleted via `ack_tombstones` and IP/GPU allocations are
+    /// released.
+    pub async fn mark_vm_pending_teardown(&self, vm_id: &str) -> Result<(), DbError> {
+        let now = basis_common::time::now_rfc3339();
+        let result = sqlx::query("UPDATE vms SET state = ?, updated_at = ? WHERE id = ?")
+            .bind(VM_STATE_PENDING_TEARDOWN)
+            .bind(&now)
+            .bind(vm_id)
             .execute(&self.writer)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("vm '{vm_id}'")));
+        }
+        Ok(())
+    }
+
+    /// VM IDs on `host_id` whose state is PENDING_TEARDOWN — drives
+    /// `ReconcileHostCommand.vm_tombstones[]`.
+    pub async fn list_pending_vm_tombstones(&self, host_id: &str) -> Result<Vec<String>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT id FROM vms WHERE host_id = ? AND state = ?")
+                .bind(host_id)
+                .bind(VM_STATE_PENDING_TEARDOWN)
+                .fetch_all(&self.reader)
+                .await?,
+        )
+    }
+
+    /// Apply a `TombstoneAck` from the agent atomically: drop the
+    /// matching pending host_clusters and vms rows, releasing their
+    /// IP/GPU allocations. Each list is filtered to actually-pending
+    /// rows so a stale ack (e.g. from a re-emitted tombstone the
+    /// controller already cleared) is a no-op rather than a corruption.
+    pub async fn ack_tombstones(
+        &self,
+        host_id: &str,
+        cluster_vnis: &[u32],
+        vm_ids: &[String],
+    ) -> Result<(), DbError> {
+        if cluster_vnis.is_empty() && vm_ids.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.writer.begin().await?;
+
+        // VMs first: deleting the vm row before the host_cluster row
+        // means the (host_cluster, vm) FK invariant ("a host_cluster
+        // row cannot have live VMs") holds throughout. ip_allocations
+        // entries scoped to the vm are released via release_vm_ips.
+        for vm_id in vm_ids {
+            sqlx::query("DELETE FROM ip_allocations WHERE vm_id = ?")
+                .bind(vm_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM vms WHERE id = ? AND host_id = ? AND state = ?")
+                .bind(vm_id)
+                .bind(host_id)
+                .bind(VM_STATE_PENDING_TEARDOWN)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // Cluster tombstones: delete only rows that are actually
+        // PENDING_TEARDOWN — defends against an ack that races a
+        // resurrection (the row went ACTIVE again before the ack
+        // landed; we don't want to drop it). After the row is gone,
+        // if the cluster has zero remaining host_clusters rows AND
+        // zero vms rows, it's fully drained — release its VIP
+        // allocations and delete the cluster row. This is the only
+        // path that completes a DeleteCluster.
+        let mut drained_clusters: Vec<String> = Vec::new();
+        for vni in cluster_vnis {
+            let cluster_id: Option<String> =
+                sqlx::query_scalar("SELECT id FROM clusters WHERE vni = ?")
+                    .bind(*vni as i64)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(cluster_id) = cluster_id else {
+                continue;
+            };
+
+            sqlx::query(
+                "DELETE FROM host_clusters
+                 WHERE host_id = ? AND state = 1 AND cluster_id = ?",
+            )
+            .bind(host_id)
+            .bind(&cluster_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Cascade: drop the cluster + its VIP allocations once
+            // every host has released and every VM is gone.
+            let remaining: i64 = sqlx::query_scalar(
+                "SELECT
+                    (SELECT COUNT(*) FROM host_clusters WHERE cluster_id = ?) +
+                    (SELECT COUNT(*) FROM vms WHERE cluster_id = ?)",
+            )
+            .bind(&cluster_id)
+            .bind(&cluster_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if remaining == 0 {
+                sqlx::query("DELETE FROM ip_allocations WHERE cluster_id = ?")
+                    .bind(&cluster_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM clusters WHERE id = ?")
+                    .bind(&cluster_id)
+                    .execute(&mut *tx)
+                    .await?;
+                drained_clusters.push(cluster_id);
+            }
+        }
+
+        tx.commit().await?;
+        if !drained_clusters.is_empty() {
+            tracing::info!(
+                clusters = ?drained_clusters,
+                "tombstone ack drained final host_clusters rows; cluster + VIP allocations released",
+            );
+        }
         Ok(())
     }
 
@@ -1461,6 +1629,67 @@ pub struct HostUsage {
     pub vms_by_cluster: HashMap<String, u32>,
 }
 
+/// Wire-format value of `MachineState::PENDING_TEARDOWN` — the VM
+/// row is being kept alive solely so the controller's reconcile
+/// keeps re-emitting the matching `vm_tombstones[]` entry until the
+/// agent acks. Centralised so SQL filters and proto conversions
+/// agree on a single number.
+pub const VM_STATE_PENDING_TEARDOWN: i64 = basis_proto::MachineState::PendingTeardown as i64;
+
+/// Active host_clusters row joined with the cluster — drives
+/// `ReconcileHostCommand.clusters[]`. The `bridge_ip` is this host's
+/// gateway IP for the cluster's overlay (carved from `bridge_range`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HostClusterMembership {
+    pub id: String,
+    pub name: String,
+    pub vni: i64,
+    pub cidr: String,
+    pub bridge_range_start: String,
+    pub bridge_range_end: String,
+    pub vm_range_start: String,
+    pub vm_range_end: String,
+    pub prefix_len: i64,
+    pub control_plane_endpoint: String,
+    pub apiserver_visibility: i64,
+    pub external_pool: String,
+    pub service_block_cidr: String,
+    pub trust_domain: String,
+    pub created_at: String,
+    pub bridge_ip: String,
+}
+
+impl HostClusterMembership {
+    pub fn cluster(&self) -> ClusterRow {
+        ClusterRow {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            vni: self.vni,
+            cidr: self.cidr.clone(),
+            bridge_range_start: self.bridge_range_start.clone(),
+            bridge_range_end: self.bridge_range_end.clone(),
+            vm_range_start: self.vm_range_start.clone(),
+            vm_range_end: self.vm_range_end.clone(),
+            prefix_len: self.prefix_len,
+            control_plane_endpoint: self.control_plane_endpoint.clone(),
+            apiserver_visibility: self.apiserver_visibility,
+            external_pool: self.external_pool.clone(),
+            service_block_cidr: self.service_block_cidr.clone(),
+            trust_domain: self.trust_domain.clone(),
+            created_at: self.created_at.clone(),
+        }
+    }
+}
+
+/// Pending-teardown projection — the controller emits one of these
+/// per row in `ReconcileHostCommand.cluster_tombstones[]`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PendingClusterTombstone {
+    pub cluster_id: String,
+    pub vni: i64,
+    pub cidr: String,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClusterRow {
     pub id: String,
@@ -1594,7 +1823,7 @@ impl ParsedRange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{NetworkConfig, Pool, VniRange};
+    use crate::config::{NetworkConfig, Pool, PoolScope, VniRange};
 
     async fn test_db() -> Db {
         Db::open(":memory:".as_ref(), 1.0).await.unwrap()
@@ -1613,6 +1842,7 @@ mod tests {
             pools: vec![Pool {
                 name: "cell-internal".to_string(),
                 cidr: "192.168.100.0/27".to_string(),
+                scope: PoolScope::Lan,
             }],
         }
     }
@@ -1754,32 +1984,49 @@ mod tests {
         assert_eq!(ip, n.vm_start.to_string());
     }
 
+    /// Find the bridge IP `host_id` was given for `cluster_id`, looking
+    /// at active host_clusters rows only — the same path
+    /// `build_reconcile_command` takes. Returns `None` when there's no
+    /// row (or the row is in PENDING_TEARDOWN, which is exposed via a
+    /// separate query in production).
+    async fn active_bridge_ip(db: &Db, cluster_id: &str, host_id: &str) -> Option<String> {
+        db.list_active_host_clusters(host_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == cluster_id)
+            .map(|m| m.bridge_ip)
+    }
+
     #[tokio::test]
     async fn host_bridge_ip_is_unique_and_idempotent() {
         let db = test_db().await;
+        let mut h1 = make_host("h1", "node-1");
+        h1.vtep_address = "10.100.0.1".to_string();
+        db.upsert_host(&h1).await.unwrap();
+        let mut h2 = make_host("h2", "node-2");
+        h2.vtep_address = "10.100.0.2".to_string();
+        db.upsert_host(&h2).await.unwrap();
         let net = make_net_config();
         let n = db.allocate_cluster_network(&net).await.unwrap();
         let cluster = make_cluster("c1", "c1", n, "unused");
         db.insert_cluster(&cluster).await.unwrap();
 
-        let ip_h1 = db.ensure_host_bridge_ip(&cluster, "h1").await.unwrap();
-        let ip_h2 = db.ensure_host_bridge_ip(&cluster, "h2").await.unwrap();
+        let ip_h1 = db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
+        let ip_h2 = db.ensure_host_cluster_active(&cluster, "h2").await.unwrap();
         assert_ne!(ip_h1, ip_h2);
         assert_eq!(ip_h1, n.bridge_start.to_string());
 
         // Idempotent for the same host.
-        let ip_h1_again = db.ensure_host_bridge_ip(&cluster, "h1").await.unwrap();
+        let ip_h1_again = db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
         assert_eq!(ip_h1, ip_h1_again);
 
-        assert_eq!(
-            db.get_host_bridge_ip("c1", "h1").await.unwrap(),
-            Some(ip_h1.clone()),
-        );
-        assert_eq!(db.get_host_bridge_ip("c1", "missing").await.unwrap(), None);
+        assert_eq!(active_bridge_ip(&db, "c1", "h1").await, Some(ip_h1.clone()));
+        assert_eq!(active_bridge_ip(&db, "c1", "missing").await, None);
     }
 
     #[tokio::test]
-    async fn host_bridge_ip_release_only_when_idle() {
+    async fn host_cluster_pending_teardown_skips_when_live_vms_remain() {
         let db = test_db().await;
         let mut host = make_host("h1", "node-1");
         host.vtep_address = "10.100.0.1".to_string();
@@ -1790,42 +2037,91 @@ mod tests {
         let cluster = make_cluster("c1", "c1", n, "unused");
         db.insert_cluster(&cluster).await.unwrap();
 
-        let ip = db.ensure_host_bridge_ip(&cluster, "h1").await.unwrap();
+        let ip = db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
         let vm_ip = db.allocate_cluster_vm_ip(&cluster, "v1").await.unwrap();
         db.insert_vm(&make_vm("v1", "h1", "c1", &vm_ip), &[])
             .await
             .unwrap();
 
-        // Still has a VM → release is a no-op.
-        db.release_host_bridge_ip_if_idle("c1", "h1").await.unwrap();
-        assert_eq!(
-            db.get_host_bridge_ip("c1", "h1").await.unwrap(),
-            Some(ip.clone())
-        );
+        // Live VM remains → mark_pending_teardown is a no-op (state
+        // stays ACTIVE), so list_active still surfaces this row.
+        db.mark_host_cluster_pending_teardown("c1", "h1")
+            .await
+            .unwrap();
+        assert_eq!(active_bridge_ip(&db, "c1", "h1").await, Some(ip.clone()));
 
-        // Last VM gone → release drops the mapping, freeing the IP.
-        db.delete_vm("v1").await.unwrap();
-        db.release_host_bridge_ip_if_idle("c1", "h1").await.unwrap();
-        assert_eq!(db.get_host_bridge_ip("c1", "h1").await.unwrap(), None);
+        // Tombstoning the VM detaches the live-VM gate, so the next
+        // mark_pending_teardown flips state to PENDING_TEARDOWN —
+        // active query now skips, pending query surfaces it.
+        db.mark_vm_pending_teardown("v1").await.unwrap();
+        db.mark_host_cluster_pending_teardown("c1", "h1")
+            .await
+            .unwrap();
+        assert_eq!(active_bridge_ip(&db, "c1", "h1").await, None);
+        let pending = db.list_pending_cluster_tombstones("h1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].cluster_id, "c1");
 
-        // A later host can reuse the address.
-        let mut h2 = make_host("h2", "node-2");
-        h2.vtep_address = "10.100.0.2".to_string();
-        db.upsert_host(&h2).await.unwrap();
-        let ip2 = db.ensure_host_bridge_ip(&cluster, "h2").await.unwrap();
-        assert_eq!(ip2, ip, "released IP must be reusable");
+        // Ack drops both the vm row and the host_clusters row, releasing
+        // the IP for reuse.
+        db.ack_tombstones("h1", &[n.vni], &["v1".to_string()])
+            .await
+            .unwrap();
+        // The cluster row is also gone after the last host released —
+        // ack_tombstones cascades.
+        assert!(db.get_cluster("c1").await.is_err());
     }
 
     #[tokio::test]
-    async fn delete_cluster_cascades_bridge_mappings() {
+    async fn ensure_host_cluster_active_resurrects_pending_teardown() {
         let db = test_db().await;
+        let mut host = make_host("h1", "node-1");
+        host.vtep_address = "10.100.0.1".to_string();
+        db.upsert_host(&host).await.unwrap();
+
         let net = make_net_config();
         let n = db.allocate_cluster_network(&net).await.unwrap();
         let cluster = make_cluster("c1", "c1", n, "unused");
         db.insert_cluster(&cluster).await.unwrap();
-        db.ensure_host_bridge_ip(&cluster, "h1").await.unwrap();
-        db.delete_cluster("c1").await.unwrap();
-        assert_eq!(db.get_host_bridge_ip("c1", "h1").await.unwrap(), None);
+
+        // First VM lands → row ACTIVE.
+        let original_ip = db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
+        let vm1_ip = db.allocate_cluster_vm_ip(&cluster, "v1").await.unwrap();
+        db.insert_vm(&make_vm("v1", "h1", "c1", &vm1_ip), &[])
+            .await
+            .unwrap();
+
+        // VM goes pending → host_cluster also goes pending.
+        db.mark_vm_pending_teardown("v1").await.unwrap();
+        db.mark_host_cluster_pending_teardown("c1", "h1")
+            .await
+            .unwrap();
+        assert!(db
+            .list_pending_cluster_tombstones("h1")
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.cluster_id == "c1"));
+
+        // CAPI delete-then-recreate races: a new VM lands on the same
+        // (host, cluster) before the agent acks the tombstone. The
+        // resurrection-cancels-tombstone path flips the row back to
+        // ACTIVE without ever emitting a tombstone.
+        let resurrected_ip = db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
+        assert_eq!(
+            resurrected_ip, original_ip,
+            "resurrection keeps the same bridge IP — no flap",
+        );
+        assert!(db
+            .list_pending_cluster_tombstones("h1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            active_bridge_ip(&db, "c1", "h1").await,
+            Some(original_ip),
+            "row is back in ACTIVE",
+        );
     }
 
     #[tokio::test]
@@ -1875,7 +2171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_cluster_vteps_derives_from_vm_placements() {
+    async fn list_cluster_vteps_tracks_active_host_clusters() {
         let db = test_db().await;
         let mut h1 = make_host("h1", "node-1");
         h1.vtep_address = "10.100.0.1".to_string();
@@ -1891,10 +2187,13 @@ mod tests {
 
         assert!(db.list_cluster_vteps("c1").await.unwrap().is_empty());
 
+        // Each host transitions to ACTIVE for the cluster on first
+        // VM placement — that's when it joins the BUM destination set.
         let vm_ip_1 = db.allocate_cluster_vm_ip(&cluster, "v1").await.unwrap();
         db.insert_vm(&make_vm("v1", "h1", "c1", &vm_ip_1), &[])
             .await
             .unwrap();
+        db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
         assert_eq!(
             db.list_cluster_vteps("c1").await.unwrap(),
             vec!["10.100.0.1".to_string()]
@@ -1904,6 +2203,7 @@ mod tests {
         db.insert_vm(&make_vm("v2", "h2", "c1", &vm_ip_2), &[])
             .await
             .unwrap();
+        db.ensure_host_cluster_active(&cluster, "h2").await.unwrap();
         let mut vteps = db.list_cluster_vteps("c1").await.unwrap();
         vteps.sort();
         assert_eq!(
@@ -1911,7 +2211,13 @@ mod tests {
             vec!["10.100.0.1".to_string(), "10.100.0.2".to_string()]
         );
 
-        db.delete_vm("v1").await.unwrap();
+        // Mark VM pending then mark host_cluster pending — same path
+        // initiate_vm_teardown takes. Pending hosts drop out of the
+        // BUM set so peer FDBs stop flooding them.
+        db.mark_vm_pending_teardown("v1").await.unwrap();
+        db.mark_host_cluster_pending_teardown("c1", "h1")
+            .await
+            .unwrap();
         assert_eq!(
             db.list_cluster_vteps("c1").await.unwrap(),
             vec!["10.100.0.2".to_string()]
@@ -2034,7 +2340,12 @@ mod tests {
         db.insert_vm(&make_vm("v1", "h1", "c1", "10.0.0.9"), &[gpu])
             .await
             .unwrap();
-        db.delete_vm("v1").await.unwrap();
+        // Ack-driven teardown drops the vm row + cascades vm_gpus
+        // via FK ON DELETE CASCADE.
+        db.mark_vm_pending_teardown("v1").await.unwrap();
+        db.ack_tombstones("h1", &[], &["v1".to_string()])
+            .await
+            .unwrap();
         assert!(db.gpus_for_vm("v1").await.unwrap().is_empty());
 
         // Same PCI address is free again — a successor placement

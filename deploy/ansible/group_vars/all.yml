@@ -109,22 +109,33 @@ basis_leaf_validity_days: 365
 # space that does NOT need to match the physical LAN (the VXLAN outer
 # IP is the host's uplink address, the inner is cluster-space).
 #
-# `pools` are uplink-routable LAN ranges. A cluster's
-# `externalIpPool` names one of these and gets its LoadBalancer
-# Service block carved from it; the apiserver VIP also comes from
-# the pool when `apiserverVisibility: Public` (the default — required
-# for the root mgmt cluster), or from the cluster's own CIDR (last
-# usable) when `apiserverVisibility: Private` (workload clusters
-# behind Lattice's API proxy).
+# Pools are named address ranges a cluster's `externalIpPool` selects
+# at create time. Each pool has a `scope` that decides the dataplane
+# treatment of allocated VIPs:
 #
-# Pool CIDRs must be pairwise disjoint. The two-pool model assumes
-# distinct LAN segments (typically separate VLANs / IP subnets):
-#   * cell-internal — workload clusters' LoadBalancer blocks (and
-#     workload apiserver VIPs that opted into Public visibility).
-#     Stays inside the cell; not advertised externally.
-#   * cell-public   — root/management cluster's apiserver VIP and any
-#     externally-reachable VIPs. Reachable from operator laptops,
-#     bootstrap kind clusters, and the customer upstream.
+#   * scope: lan (default) — LAN-routable. The agent advertises the
+#     pool's prefixes via BGP, proxy-ARPs them onto the uplink, and
+#     installs the bridge route. Reachable from the LAN.
+#     Required for any cluster with `apiserverVisibility: Public`,
+#     because a public apiserver VIP only makes sense if the LAN can
+#     reach it.
+#
+#   * scope: tree — cell-internal. The agent installs the bridge
+#     route on every host (every host eagerly bootstraps an empty
+#     `brc<vni>` for every tree-scoped cluster) but does NOT proxy-ARP
+#     and does NOT advertise via BGP. The LAN cannot reach these
+#     VIPs; cross-cluster reachability inside the cell flows over
+#     each host's per-cluster bridge. Carve from RFC1918 space outside
+#     the LAN broadcast domain so the LAN never tries to ARP for it.
+#
+# Pool CIDRs must be pairwise disjoint and disjoint from
+# `cluster_supernet`. The two-pool model assumes:
+#   * cell-public   — LAN-routable. Hosts the root/management cluster
+#     apiserver VIP and any cluster opting into `Public` visibility.
+#   * cell-internal — tree-scoped. Hosts workload clusters' LB blocks
+#     (and `Private` apiservers automatically, which sit inside the
+#     cluster CIDR rather than this pool, but the pool still hosts
+#     LB Service blocks for those clusters). Never reaches the LAN.
 #
 # `default_external_service_ips` is the cell-wide default block size
 # for Cilium LoadBalancer Services. Must be a power of two. Override
@@ -135,22 +146,32 @@ basis_leaf_validity_days: 365
 basis_network:
   cluster_supernet: 10.100.0.0/16
   default_external_service_ips: 16
-  # Each pool is the LAN slice basis owns, expressed as a single CIDR.
-  # The allocator walks the host range (skip network + broadcast) and
-  # picks an aligned /N out of it for service blocks. For a shared
-  # subnet where basis only owns part of it, carve a smaller CIDR
-  # matching that slice — the cidr IS the exclusion mechanism, so
-  # picking `.192/27` excludes the LAN gateway at `.1`.
+  # Each pool is an address slice basis owns, expressed as a single
+  # CIDR. The allocator walks the host range (skip network +
+  # broadcast) and picks an aligned /N out of it for service blocks.
+  # For a shared LAN subnet where basis only owns part of it, carve a
+  # smaller CIDR matching that slice — the cidr IS the exclusion
+  # mechanism, so picking `.192/27` excludes the LAN gateway at `.1`.
   # Non-power-of-two ranges become multiple pool entries.
   pools:
-    # /26 → 64 addrs, 62 allocatable. Sized for the cell-wide
-    # default_external_service_ips=16: a /27 has only 30 allocatable
-    # addresses with no aligned /28 inside (the only candidates clip
-    # the parent /27's network or broadcast), so the allocator can't
-    # place a Service block there. /26 leaves room for one apiserver
-    # VIP plus a /28 Service block per cluster, plus headroom.
+    # LAN-routable pool. /26 → 64 addrs, 62 allocatable. Sized for
+    # the cell-wide default_external_service_ips=16: a /27 has only
+    # 30 allocatable addresses with no aligned /28 inside (the only
+    # candidates clip the parent /27's network or broadcast), so the
+    # allocator can't place a Service block there. /26 leaves room
+    # for one apiserver VIP plus a /28 Service block per cluster,
+    # plus headroom.
     - name: cell-public
       cidr: 10.0.0.192/26
+    # Cell-internal pool. RFC1918 carve well outside the LAN's
+    # broadcast domain. /24 = 254 allocatable, room for many workload
+    # clusters' LB blocks. The agent installs bridge routes on every
+    # host (eager bootstrap of `brc<vni>` for every tree-scoped
+    # cluster) but never proxy-ARPs onto the uplink and never
+    # advertises via BGP — the LAN cannot reach this range.
+    - name: cell-internal
+      cidr: 172.20.0.0/24
+      scope: tree
 
 # Credentials for private OCI registries basis-agent pulls VM images
 # from. Override in host/group vars or vault when deploying against

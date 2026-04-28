@@ -49,6 +49,7 @@ fn test_network_config() -> basis_controller::config::NetworkConfig {
             name: "cell-internal".to_string(),
             // /27 = 32 addrs total → 30 allocatable (.1..=.30).
             cidr: "192.168.100.0/27".to_string(),
+            scope: basis_controller::config::PoolScope::Lan,
         }],
     }
 }
@@ -185,6 +186,19 @@ async fn register_agent(
     String,
     ReconcileHostCommand,
 ) {
+    register_agent_with_inventory(running, hostname, None).await
+}
+
+async fn register_agent_with_inventory(
+    running: &RunningController,
+    hostname: &str,
+    inventory: Option<HostInventory>,
+) -> (
+    mpsc::Sender<AgentMessage>,
+    tonic::Streaming<ControllerCommand>,
+    String,
+    ReconcileHostCommand,
+) {
     let mut client = running.agent_client(hostname).await;
     let (tx, rx) = mpsc::channel::<AgentMessage>(32);
 
@@ -198,6 +212,7 @@ async fn register_agent(
             vtep_address: "10.100.0.1".to_string(),
             rank: 0,
             labels: std::collections::HashMap::new(),
+            current_inventory: inventory,
         })),
     })
     .await
@@ -254,53 +269,73 @@ async fn drive_create_to_running(
     create_handle.await.unwrap().unwrap().into_inner()
 }
 
-/// Drive DeleteMachine: agent receives DeleteVm, reports STOPPED,
-/// DeleteMachine returns.
-async fn drive_delete_to_stopped(
+/// Drive a DeleteMachine RPC end-to-end under the tombstone model:
+/// the RPC returns immediately, and the controller follows up with a
+/// reconcile push carrying `vm_tombstones[]`. Ack the tombstones,
+/// then wait until the vm row is fully cleared from the DB.
+async fn drive_delete_via_tombstone(
+    db: &basis_controller::db::Db,
     agent_tx: &mpsc::Sender<AgentMessage>,
     inbound: &mut tonic::Streaming<ControllerCommand>,
+    vm_id: &str,
     delete: impl std::future::Future<Output = Result<tonic::Response<DeleteMachineResponse>, tonic::Status>>
         + Send
         + 'static,
 ) -> tonic::Response<DeleteMachineResponse> {
     let handle = tokio::spawn(delete);
-    let vm_id = expect_delete_vm(inbound).await;
-    report_vm_state(agent_tx, &vm_id, MachineState::Stopped, "", false).await;
-    handle.await.unwrap().unwrap()
+    let resp = handle.await.unwrap().unwrap();
+    consume_tombstones_until_gone(db, agent_tx, inbound, std::iter::once(vm_id.to_string())).await;
+    resp
 }
 
-/// Drive DeleteCluster: consume cascading DeleteVm + any interleaved
-/// ReconcileHost pushes, sending STOPPED for each delete.
-async fn drive_delete_cluster_to_stopped(
+/// Consume reconcile pushes from `inbound`, ack any tombstones they
+/// carry, until every vm_id in `expected_vms` has been removed from
+/// the DB (i.e. `get_vm` returns NotFound). The controller re-emits
+/// tombstones on every reconcile until acked, so this loop is
+/// bounded by the number of reconcile pushes rather than time.
+async fn consume_tombstones_until_gone(
+    db: &basis_controller::db::Db,
     agent_tx: &mpsc::Sender<AgentMessage>,
     inbound: &mut tonic::Streaming<ControllerCommand>,
-    delete: impl std::future::Future<Output = Result<tonic::Response<DeleteClusterResponse>, tonic::Status>>
-        + Send
-        + 'static,
-) -> tonic::Response<DeleteClusterResponse> {
-    let handle = tokio::spawn(delete);
-    tokio::pin!(handle);
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut handle => {
-                return result.unwrap().unwrap();
+    expected_vms: impl IntoIterator<Item = String>,
+) {
+    let mut remaining: std::collections::HashSet<String> = expected_vms.into_iter().collect();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let mut still_present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for id in &remaining {
+            if db.get_vm(id).await.is_ok() {
+                still_present.insert(id.clone());
             }
-            cmd = inbound.next() => {
-                let cmd = cmd.unwrap().unwrap();
-                match &cmd.command {
-                    Some(controller_command::Command::DeleteVm(c)) => {
-                        let vm_id = c.vm_id.clone();
-                        report_vm_state(agent_tx, &vm_id, MachineState::Stopped, "", false).await;
-                    }
-                    Some(controller_command::Command::ReconcileHost(_)) => {
-                        // Membership update; nothing for the test to do.
-                    }
-                    other => panic!("expected DeleteVm during cluster cascade, got {:?}", other),
-                }
+        }
+        remaining = still_present;
+        if remaining.is_empty() {
+            return;
+        }
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), inbound.next()).await;
+        let cmd = match cmd {
+            Ok(Some(Ok(c))) => c,
+            _ => continue,
+        };
+        if let Some(controller_command::Command::ReconcileHost(rc)) = cmd.command {
+            if !rc.cluster_tombstones.is_empty() || !rc.vm_tombstones.is_empty() {
+                let ack = TombstoneAck {
+                    cluster_vnis: rc.cluster_tombstones.iter().map(|t| t.vni).collect(),
+                    vm_ids: rc.vm_tombstones.clone(),
+                };
+                agent_tx
+                    .send(AgentMessage {
+                        payload: Some(agent_message::Payload::TombstoneAck(ack)),
+                    })
+                    .await
+                    .unwrap();
+                // Give the controller a moment to process the ack
+                // before the next round-trip.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
     }
+    panic!("vms not torn down within deadline: {:?}", remaining);
 }
 
 /// Consume inbound commands until we see a CreateVm; return its vm_id.
@@ -313,17 +348,6 @@ async fn expect_create_vm(inbound: &mut tonic::Streaming<ControllerCommand>) -> 
             Some(controller_command::Command::CreateVm(c)) => return c.vm_id.clone(),
             Some(controller_command::Command::ReconcileHost(_)) => continue,
             other => panic!("expected CreateVm, got {:?}", other),
-        }
-    }
-}
-
-async fn expect_delete_vm(inbound: &mut tonic::Streaming<ControllerCommand>) -> String {
-    loop {
-        let cmd = inbound.next().await.unwrap().unwrap();
-        match &cmd.command {
-            Some(controller_command::Command::DeleteVm(c)) => return c.vm_id.clone(),
-            Some(controller_command::Command::ReconcileHost(_)) => continue,
-            other => panic!("expected DeleteVm, got {:?}", other),
         }
     }
 }
@@ -494,12 +518,13 @@ async fn test_full_create_delete_flow() {
     let vm_id = resp.id.clone();
     let delete_fut = {
         let mut capi = capi.clone();
+        let vm_id = vm_id.clone();
         async move {
             capi.delete_machine(DeleteMachineRequest { id: vm_id })
                 .await
         }
     };
-    drive_delete_to_stopped(&agent_tx, &mut inbound, delete_fut).await;
+    drive_delete_via_tombstone(&db, &agent_tx, &mut inbound, &vm_id, delete_fut).await;
 
     assert!(db.get_vm(&resp.id).await.is_err());
 }
@@ -527,7 +552,9 @@ async fn test_delete_cluster_cascades_machine_deletes() {
                 .await
         }
     };
-    drive_delete_cluster_to_stopped(&agent_tx, &mut inbound, delete_fut).await;
+    let _ = tokio::spawn(delete_fut).await.unwrap().unwrap();
+    consume_tombstones_until_gone(&db, &agent_tx, &mut inbound, std::iter::once(vm.id.clone()))
+        .await;
 
     assert!(db.get_vm(&vm.id).await.is_err());
     assert_eq!(
@@ -586,19 +613,20 @@ async fn test_create_machine_no_agent() {
         .await;
     assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
 
-    assert!(
-        db.get_vm_by_name(&cluster_id, "orphan-vm")
-            .await
-            .unwrap()
-            .is_none(),
-        "VM row should be cleaned up when no agent is connected"
-    );
+    // Tombstone model: rows are kept in PENDING_TEARDOWN until the
+    // agent acks. Here no agent ever connected, so the row sits in
+    // PENDING_TEARDOWN — representing the controller's intent to
+    // release the resources. The next agent reconnect (or operator
+    // gc) is what finalises the delete.
+    let row = db
+        .get_vm_by_name(&cluster_id, "orphan-vm")
+        .await
+        .unwrap()
+        .expect("vm row remains in PENDING_TEARDOWN until acked");
     assert_eq!(
-        db.get_host_bridge_ip(&cluster_id, "ghost-host")
-            .await
-            .unwrap(),
-        None,
-        "host bridge IP should be cleaned up when no VM remains"
+        row.state,
+        basis_proto::MachineState::PendingTeardown as i64,
+        "failed CreateMachine must mark the VM PENDING_TEARDOWN, not RUNNING/FAILED",
     );
 }
 
@@ -646,10 +674,12 @@ async fn test_create_machine_agent_reports_failure() {
     assert_eq!(err.code(), tonic::Code::Internal);
     assert!(err.message().contains("disk image pull failed"));
 
-    assert!(
-        db.get_vm(&vm_id).await.is_err(),
-        "VM record should be deleted after failure"
-    );
+    // Same model as the no-agent case: the row stays in
+    // PENDING_TEARDOWN until the agent acks the resulting tombstone.
+    // The mock agent in this test never processes tombstones, so the
+    // row remains visible — verify the tombstone-state, not absence.
+    let row = db.get_vm(&vm_id).await.expect("vm row remains pending");
+    assert_eq!(row.state, basis_proto::MachineState::PendingTeardown as i64,);
 }
 
 #[tokio::test]
@@ -700,6 +730,7 @@ async fn test_agent_cn_must_match_registered_hostname() {
             vtep_address: "10.100.0.1".to_string(),
             rank: 0,
             labels: std::collections::HashMap::new(),
+            current_inventory: None,
         })),
     })
     .await
@@ -819,8 +850,9 @@ async fn test_controller_pushes_periodic_reconcile() {
         .unwrap();
     match cmd.command {
         Some(controller_command::Command::ReconcileHost(r)) => {
-            assert!(r.expected_vm_ids.is_empty());
             assert!(r.clusters.is_empty(), "no VMs → no cluster membership");
+            assert!(r.cluster_tombstones.is_empty());
+            assert!(r.vm_tombstones.is_empty());
         }
         other => panic!("expected ReconcileHost, got {other:?}"),
     }
@@ -832,8 +864,9 @@ async fn test_reconnect_reports_expected_vm_ids_and_clusters() {
     let (cluster_id, _vip) = create_cluster(&running, "reconnect-cluster").await;
     let (agent_tx, mut inbound, host_id, initial1) =
         register_agent(&running, "reconnect-host").await;
-    assert!(initial1.expected_vm_ids.is_empty());
     assert!(initial1.clusters.is_empty());
+    assert!(initial1.cluster_tombstones.is_empty());
+    assert!(initial1.vm_tombstones.is_empty());
 
     let mut capi = running.capi_client().await;
     let resp = drive_create_to_running(
@@ -847,13 +880,18 @@ async fn test_reconnect_reports_expected_vm_ids_and_clusters() {
     drop(agent_tx);
     drop(inbound);
 
+    let _ = resp;
     let (_tx2, _inbound2, host_id2, initial2) = register_agent(&running, "reconnect-host").await;
     assert_eq!(host_id2, host_id);
-    assert_eq!(initial2.expected_vm_ids, vec![resp.id]);
+    assert!(initial2.vm_tombstones.is_empty(), "no pending VM teardowns",);
+    assert!(
+        initial2.cluster_tombstones.is_empty(),
+        "no pending cluster teardowns",
+    );
     assert_eq!(
         initial2.clusters.len(),
         1,
-        "host has one cluster's worth of VMs"
+        "host's active cluster membership rehydrates on reconnect",
     );
     let cluster_state = &initial2.clusters[0];
     assert_eq!(cluster_state.vni, 10_000);
@@ -916,4 +954,93 @@ async fn test_concurrent_create_cannot_oversubscribe_host() {
         tonic::Code::ResourceExhausted,
         "loser must surface scheduler exhaustion, got: {loser_status:?}"
     );
+}
+
+/// Disaster recovery: agent reconnects after the controller's DB has
+/// been wiped. The controller has no `host_clusters` / `vms` rows for
+/// this host, so a stock reconcile would emit nothing and orphan the
+/// agent's bridges + VMs forever. The inventory the agent carries in
+/// `RegisterHostRequest.current_inventory` lets the controller
+/// synthesise one-shot tombstones for every reported resource it
+/// doesn't know about — exactly the recovery path.
+#[tokio::test]
+async fn test_register_synthesises_tombstones_for_orphan_inventory() {
+    let (running, db) = RunningController::start().await;
+
+    let inventory = HostInventory {
+        vm_ids: vec!["orphan-vm".to_string()],
+        clusters: vec![InventoryCluster {
+            vni: 99_999,
+            cidr: "10.250.0.0/24".to_string(),
+        }],
+    };
+    let (_tx, _inbound, _host_id, initial) =
+        register_agent_with_inventory(&running, "wipe-recovery-host", Some(inventory)).await;
+
+    // Both the orphan VM and the orphan bridge must come back as
+    // tombstones in the inline `initial_state` so the agent tears
+    // them down before doing anything else.
+    assert_eq!(initial.vm_tombstones, vec!["orphan-vm".to_string()]);
+    assert_eq!(initial.cluster_tombstones.len(), 1);
+    assert_eq!(initial.cluster_tombstones[0].vni, 99_999);
+    assert_eq!(initial.cluster_tombstones[0].cidr, "10.250.0.0/24");
+
+    // Synthetic tombstones don't create persistent rows: nothing was
+    // pending before, nothing is pending after.
+    let pending_clusters = db
+        .list_pending_cluster_tombstones("wipe-recovery-host")
+        .await
+        .unwrap_or_default();
+    assert!(
+        pending_clusters.is_empty(),
+        "synthesised tombstones must not leak DB state",
+    );
+    assert!(db
+        .list_pending_vm_tombstones("wipe-recovery-host")
+        .await
+        .unwrap_or_default()
+        .is_empty());
+}
+
+/// Inventory entries that DO match the controller's DB are not
+/// duplicated as tombstones: the agent's bridge for an active
+/// cluster stays in the ACTIVE list, not the cluster_tombstones
+/// list. Same for a VM whose vms row is on this host.
+#[tokio::test]
+async fn test_register_inventory_match_is_not_tombstoned() {
+    let (running, _db) = RunningController::start().await;
+    let (cluster_id, _vip) = create_cluster(&running, "live-cluster").await;
+    let (agent_tx, mut inbound, _host_id, _initial) = register_agent(&running, "live-host").await;
+    let mut capi = running.capi_client().await;
+
+    let vm = drive_create_to_running(
+        &agent_tx,
+        &mut inbound,
+        &mut capi,
+        basic_machine_req("live-vm", &cluster_id),
+    )
+    .await;
+    drop(agent_tx);
+    drop(inbound);
+
+    // Agent reconnects reporting accurate inventory matching the DB.
+    // Nothing should be tombstoned.
+    let inventory = HostInventory {
+        vm_ids: vec![vm.id.clone()],
+        clusters: vec![InventoryCluster {
+            vni: 10_000,
+            cidr: "10.0.0.0/24".to_string(),
+        }],
+    };
+    let (_tx2, _inbound2, _, initial2) =
+        register_agent_with_inventory(&running, "live-host", Some(inventory)).await;
+    assert!(
+        initial2.vm_tombstones.is_empty(),
+        "matching inventory must not be tombstoned",
+    );
+    assert!(
+        initial2.cluster_tombstones.is_empty(),
+        "matching cluster bridge must not be tombstoned",
+    );
+    assert_eq!(initial2.clusters.len(), 1);
 }

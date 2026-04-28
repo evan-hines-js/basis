@@ -25,6 +25,9 @@ spec:
 {% for pool in basis_network.pools %}
       - name: {{ pool.name }}
         cidr: {{ pool.cidr }}
+{% if pool.scope is defined %}
+        scope: {{ pool.scope }}
+{% endif %}
 {% endfor %}
 {% if basis_dns_servers is defined %}
   dnsServers:

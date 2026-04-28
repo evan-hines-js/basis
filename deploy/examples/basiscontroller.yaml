@@ -24,17 +24,31 @@ spec:
     # reserved for per-host bridge IPs. One per hypervisor carrying a
     # VM in the cluster.
     bridgeReserve: 32
-    # Named LAN-routable pools. A cluster's `externalIpPool` picks
-    # which pool its LoadBalancer Service block (and apiserver VIP,
-    # when `apiserverVisibility: Public`) is carved from. Required:
-    # every cluster names exactly one.
+    # Named pools. A cluster's `externalIpPool` picks which pool its
+    # LoadBalancer Service block (and apiserver VIP, when
+    # `apiserverVisibility: Public`) is carved from. Required: every
+    # cluster names exactly one.
+    #
+    # Pool `scope` decides dataplane treatment:
+    #   * lan (default) — LAN-routable. Agent advertises via BGP and
+    #     proxy-ARPs onto the uplink. Required for any cluster with
+    #     `apiserverVisibility: Public`.
+    #   * tree          — cell-internal. Agent installs bridge routes
+    #     on every host so cross-cluster traffic flows over the
+    #     overlay, but does not proxy-ARP and does not advertise via
+    #     BGP. The LAN cannot reach these VIPs. Carve from RFC1918
+    #     space outside the LAN.
     pools:
-      # Each pool is the LAN slice basis owns, expressed as a single
-      # CIDR. Allocations walk the host range (skip network +
-      # broadcast). Carve smaller CIDRs to express partial-subnet
-      # ownership.
+      # LAN-routable. Hosts public apiserver VIPs and externally-
+      # reachable LB Service blocks. Required: at least one pool
+      # in the cell must be LAN-scoped.
+      - name: cell-public
+        cidr: 192.168.1.192/26      # 64 addrs → 62 allocatable
+      # Cell-internal. Hosts private workload clusters' LB blocks
+      # without exposing them on the LAN.
       - name: cell-internal
-        cidr: 192.168.1.240/28      # 16 addrs → 14 allocatable
+        cidr: 172.20.0.0/24         # 256 addrs → 254 allocatable
+        scope: tree
     # Cell-wide default for the per-cluster Cilium LB Service block.
     # Must be a power of two. Override per-cluster via
     # `BasisCluster.spec.externalServiceIps` for the rare case.

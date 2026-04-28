@@ -38,20 +38,21 @@ pub fn vxlan_name(vni: u32) -> String {
     format!("{VXLAN_PREFIX}{vni}")
 }
 
-/// What this host has materialised for a given cluster. Only the
-/// MASQUERADE-rule CIDR is cached in memory; prefix routes and
-/// proxy-ARP entries are reconciled against kernel state on every
-/// pass (`list_kernel_prefix_routes` + `list_kernel_proxy_arp`) so a
-/// fresh agent process recovers stale entries left by a prior run
-/// instead of leaking them forever. The MASQUERADE cidr is kept here
-/// only because there's no cheap way to reverse-derive it from
-/// iptables at teardown — for desired clusters it's filled from
-/// `ClusterState.cidr` each reconcile, and for clusters rediscovered
-/// from the kernel after restart it's read back from the bridge's
-/// own IPv4 address (gateway IP + prefix → network address).
-#[derive(Debug, Default)]
+/// What this host has materialised for a given cluster. Tracks the
+/// per-cluster contributions so that on tombstone we can subtract
+/// just this cluster's prefix routes + proxy-ARP entries rather than
+/// rediscovering them from kernel state (which would conflate
+/// contributions from other clusters on the same uplink).
+///
+/// The `cidr` field also lets a stale-bridge recovery path (kernel
+/// has `brc<vni>` but we don't yet) read the masquerade CIDR back
+/// off the bridge's own address. For brand-new clusters it's filled
+/// from `ClusterState.cidr` each reconcile.
+#[derive(Debug, Default, Clone)]
 struct ClusterLive {
     cidr: Option<String>,
+    prefixes: BTreeSet<String>,
+    proxy_arp_addrs: BTreeSet<String>,
 }
 
 pub struct ClusterManager {
@@ -81,88 +82,117 @@ impl ClusterManager {
         self.uplink_mtu - VXLAN_OVERHEAD
     }
 
-    /// Apply the controller's authoritative cluster list. After this
-    /// returns, every cluster in `desired` has a bridge + VXLAN +
-    /// matching FDB + MASQUERADE rule + advertised prefix routes +
-    /// proxy-ARP entries, and no extras exist *anywhere on the host*
-    /// — including in kernel state left by a prior agent process.
+    /// Snapshot of every cluster the agent currently has materialised
+    /// on this host: the live `(vni, cidr)` pairs from in-memory state,
+    /// merged with any `brc<vni>` bridges the kernel still has but the
+    /// agent doesn't yet know about (e.g. on a fresh process startup).
+    /// Drives the inventory the agent sends in `RegisterHostRequest`.
+    pub async fn inventory(&self) -> Result<Vec<(u32, String)>, NetworkError> {
+        let live = self.live.lock().await;
+        let mut out: HashMap<u32, String> = live
+            .iter()
+            .filter_map(|(vni, c)| c.cidr.as_ref().map(|cidr| (*vni, cidr.clone())))
+            .collect();
+        for vni in list_kernel_cluster_vnis().await? {
+            if let std::collections::hash_map::Entry::Vacant(v) = out.entry(vni) {
+                if let Some(cidr) = read_bridge_cluster_cidr(&bridge_name(vni)).await? {
+                    v.insert(cidr);
+                }
+            }
+        }
+        let mut ordered: Vec<(u32, String)> = out.into_iter().collect();
+        ordered.sort_by_key(|(vni, _)| *vni);
+        Ok(ordered)
+    }
+
+    /// Apply the controller's authoritative cluster list — additively.
     ///
-    /// Reconciliation is authoritative against the kernel rather than
-    /// against in-memory bookkeeping. The earlier in-memory diff turned
-    /// into a leak across agent restarts: routes/ARP installed by the
-    /// prior process were invisible to the new process's empty diff
-    /// state, so they were never deleted. Concretely a service block
-    /// re-allocated from one cluster to another (after the first
-    /// cluster's delete-then-recreate with a different block) would
-    /// leave a stale `<old_block> dev <old_brc>` route around;
-    /// longest-prefix match would then deliver traffic for the new
-    /// owner's IPs into the wrong overlay.
+    /// For every cluster in `desired`: ensure bridge + VXLAN + MASQUERADE
+    /// + FDB + the cluster's contribution to per-bridge prefix routes
+    /// and uplink proxy-ARP. **Absence is not an intent signal** — a
+    /// VNI present in `live` but missing from `desired` is left alone;
+    /// teardown only happens via `tombstone_cluster`. This is what makes
+    /// a transient empty `desired` (CAPI churn, controller race) safe:
+    /// no host state is removed without an explicit tombstone.
+    ///
+    /// Per-cluster contributions are tracked in `ClusterLive` so:
+    ///   1. The per-bridge prefix-route diff sees only THIS cluster's
+    ///      previous contribution as `current`, so re-allocations
+    ///      within the cluster (LB block re-carve) clean up cleanly,
+    ///      but contributions from a sibling cluster on a different
+    ///      bridge are never touched.
+    ///   2. The proxy-ARP global diff is computed by union over all
+    ///      live clusters' contributions — `tombstone_cluster` later
+    ///      subtracts out its own contribution and the next reconcile
+    ///      hits the diff cleanly.
     pub async fn reconcile(&self, desired: &[ClusterState]) -> Result<(), NetworkError> {
         let mut live = self.live.lock().await;
-        let desired_vnis: HashSet<u32> = desired.iter().map(|c| c.vni).collect();
 
         // Recover from a fresh process: any `brc<vni>` bridge on the
-        // kernel that we aren't tracking gets seeded so the diff below
-        // includes it. Without this, stale bridges + their attached
-        // routes + their MASQUERADE rules would survive the agent
-        // restart unnoticed (the original bug).
+        // kernel that we aren't tracking gets seeded with its own cidr
+        // (read off the bridge's IP) so subsequent tombstones can
+        // remove the masquerade rule. Per-cluster prefix/proxy-arp
+        // contributions are seeded empty — on the next reconcile pass
+        // for that cluster, `desired` repopulates them and the kernel
+        // diff converges.
         for vni in list_kernel_cluster_vnis().await? {
             if let Entry::Vacant(v) = live.entry(vni) {
                 let cidr = read_bridge_cluster_cidr(&bridge_name(vni)).await?;
-                v.insert(ClusterLive { cidr });
+                v.insert(ClusterLive {
+                    cidr,
+                    prefixes: BTreeSet::new(),
+                    proxy_arp_addrs: BTreeSet::new(),
+                });
             }
         }
 
-        // Build the desired prefix-route set per cluster + the global
-        // proxy-ARP set (proxy-ARP entries all share the uplink, so
-        // they're reconciled against a single kernel set rather than
-        // per-cluster).
-        let mut desired_prefixes_by_vni: HashMap<u32, BTreeSet<String>> = HashMap::new();
-        let mut desired_proxy_arp: BTreeSet<String> = BTreeSet::new();
-        for cluster in desired {
-            let (prefixes, addrs) = expand_prefixes(&cluster.cluster_vips);
-            desired_prefixes_by_vni.insert(cluster.vni, prefixes);
-            desired_proxy_arp.extend(addrs);
-        }
-
-        // Materialise the dataplane for every desired cluster: bridge,
-        // VXLAN, bridge address, MASQUERADE, FDB. All idempotent.
         for cluster in desired {
             self.ensure_cluster_inner(cluster).await?;
-            let cidr = if cluster.cidr.is_empty() {
+
+            // Compute this cluster's desired contributions:
+            //   * `cluster_vips` — Lan-scoped: bridge route AND proxy-ARP
+            //     onto the uplink (so LAN clients can reach the VIP).
+            //   * `internal_cluster_vips` — Tree-scoped: bridge route only,
+            //     no proxy-ARP (the LAN must not reach the VIP).
+            let (lan_prefixes, lan_addrs) = expand_prefixes(&cluster.cluster_vips);
+            let (tree_prefixes, _) = expand_prefixes(&cluster.internal_cluster_vips);
+            let mut want_prefixes = lan_prefixes;
+            want_prefixes.extend(tree_prefixes);
+
+            // Per-bridge prefix-route diff scoped to this cluster.
+            // Reading the kernel up-front catches stale entries
+            // (re-carved LB block) without ever touching another
+            // cluster's bridge.
+            let bridge = bridge_name(cluster.vni);
+            let kernel_prefixes = list_kernel_prefix_routes(&bridge).await?;
+            for stale in kernel_prefixes.difference(&want_prefixes) {
+                if let Err(e) = del_prefix_route(stale, &bridge).await {
+                    warn!(prefix = %stale, vni = cluster.vni, error = %e, "prefix route del");
+                }
+            }
+            for new in want_prefixes.difference(&kernel_prefixes) {
+                add_prefix_route(new, &bridge).await?;
+            }
+
+            let entry = live.entry(cluster.vni).or_default();
+            entry.cidr = if cluster.cidr.is_empty() {
                 None
             } else {
                 Some(cluster.cidr.clone())
             };
-            live.entry(cluster.vni).or_default().cidr = cidr;
+            entry.prefixes = want_prefixes;
+            entry.proxy_arp_addrs = lan_addrs;
         }
 
-        // Reconcile prefix routes per bridge against kernel reality.
-        // Iterating over `live` (which now includes both desired vnis
-        // AND any rediscovered stale ones) means a stale bridge gets
-        // its routes flushed before the bridge itself is torn down
-        // below.
-        let vnis: Vec<u32> = live.keys().copied().collect();
-        for vni in vnis {
-            let bridge = bridge_name(vni);
-            let current = list_kernel_prefix_routes(&bridge).await?;
-            let want = desired_prefixes_by_vni
-                .get(&vni)
-                .cloned()
-                .unwrap_or_default();
-            for stale in current.difference(&want) {
-                if let Err(e) = del_prefix_route(stale, &bridge).await {
-                    warn!(prefix = %stale, vni, error = %e, "prefix route del");
-                }
-            }
-            for new in want.difference(&current) {
-                add_prefix_route(new, &bridge).await?;
-            }
-        }
-
-        // Reconcile proxy-ARP globally against kernel reality. basis
-        // owns the host's network, so any proxy-ARP entry on the
-        // uplink that we don't currently want is an old leak.
+        // Proxy-ARP is global on the uplink, so the desired set is the
+        // union over every live cluster's contribution. Diff against
+        // kernel: add anything missing, remove anything that no longer
+        // belongs to ANY cluster (e.g. a tombstone subtracted out the
+        // last contribution before this reconcile call).
+        let desired_proxy_arp: BTreeSet<String> = live
+            .values()
+            .flat_map(|c| c.proxy_arp_addrs.iter().cloned())
+            .collect();
         let current_proxy_arp = list_kernel_proxy_arp(&self.uplink_bridge).await?;
         for stale in current_proxy_arp.difference(&desired_proxy_arp) {
             if let Err(e) = del_proxy_arp(stale, &self.uplink_bridge).await {
@@ -173,28 +203,65 @@ impl ClusterManager {
             add_proxy_arp(new, &self.uplink_bridge).await?;
         }
 
-        // Tear down bridges/VXLANs for vnis no longer desired. Routes
-        // for these vnis were already cleared above; here we just kill
-        // the MASQUERADE rule + the links. Missing devices are the
-        // desired state — log and move on.
-        let stale_vnis: Vec<u32> = live
-            .iter()
-            .filter(|(vni, _)| !desired_vnis.contains(vni))
-            .map(|(vni, _)| *vni)
-            .collect();
-        for vni in stale_vnis {
-            let entry = live.remove(&vni).expect("vni was just listed from live");
-            if let Some(cidr) = entry.cidr.as_deref() {
-                remove_cluster_masquerade(cidr, &self.uplink_bridge).await;
-            }
-            if let Err(e) = run_cmd("ip", &["link", "delete", &vxlan_name(vni)]).await {
-                warn!(vni, error = %e, "vxlan delete");
-            }
-            if let Err(e) = run_cmd("ip", &["link", "delete", &bridge_name(vni)]).await {
-                warn!(vni, error = %e, "bridge delete");
+        Ok(())
+    }
+
+    /// Tear down a single cluster: drop its prefix routes (the bridge
+    /// going away takes them with it), remove the per-cluster
+    /// MASQUERADE rule, delete VXLAN + bridge, then remove the
+    /// cluster's proxy-ARP contributions from the uplink. Idempotent —
+    /// `ip link delete` on a missing link logs and continues, so a
+    /// re-emitted tombstone after a successful teardown is a no-op.
+    ///
+    /// `cidr` is supplied by the controller (`ClusterTombstone.cidr`)
+    /// rather than read from local state so the masquerade removal
+    /// works even if the agent's `live` map lost track of the cluster
+    /// (e.g. agent restart after the controller already marked the
+    /// cluster pending teardown).
+    pub async fn tombstone_cluster(&self, vni: u32, cidr: &str) -> Result<(), NetworkError> {
+        let mut live = self.live.lock().await;
+
+        // Subtract proxy-ARP contributions BEFORE the bridge teardown
+        // so `del_proxy_arp` on entries we own actually fires (kernel
+        // accepts the delete regardless, but ordering keeps the diff
+        // clean for any concurrent reconcile observer).
+        let removed = live.remove(&vni);
+        if let Some(entry) = removed.as_ref() {
+            for addr in &entry.proxy_arp_addrs {
+                // Only remove if no other cluster contributes the same
+                // address (shouldn't happen — VIPs are globally unique
+                // — but the check is cheap and protects against
+                // controller bugs).
+                let still_wanted = live
+                    .values()
+                    .any(|other| other.proxy_arp_addrs.contains(addr));
+                if !still_wanted {
+                    if let Err(e) = del_proxy_arp(addr, &self.uplink_bridge).await {
+                        warn!(addr = %addr, error = %e, "proxy-arp del during tombstone");
+                    }
+                }
             }
         }
 
+        // Pick the cidr to use for masquerade removal: prefer the
+        // controller-supplied value (authoritative), fall back to what
+        // we cached locally. Empty in both cases means the rule was
+        // never installed (ghost-bootstrap cluster), so skip.
+        let masq_cidr = if !cidr.is_empty() {
+            Some(cidr.to_string())
+        } else {
+            removed.and_then(|c| c.cidr)
+        };
+        if let Some(c) = masq_cidr {
+            remove_cluster_masquerade(&c, &self.uplink_bridge).await;
+        }
+
+        if let Err(e) = run_cmd("ip", &["link", "delete", &vxlan_name(vni)]).await {
+            warn!(vni, error = %e, "tombstone: vxlan delete (already gone?)");
+        }
+        if let Err(e) = run_cmd("ip", &["link", "delete", &bridge_name(vni)]).await {
+            warn!(vni, error = %e, "tombstone: bridge delete (already gone?)");
+        }
         Ok(())
     }
 
@@ -226,6 +293,7 @@ impl ClusterManager {
             vtep_addresses: Vec::new(),
             cidr: String::new(),
             cluster_vips: Vec::new(),
+            internal_cluster_vips: Vec::new(),
         })
         .await?;
         self.live.lock().await.entry(vni).or_default();
@@ -549,5 +617,56 @@ mod tests {
     #[test]
     fn bridge_and_vxlan_names_differ() {
         assert_ne!(bridge_name(1), vxlan_name(1));
+    }
+
+    /// `/32` is the apiserver-VIP shape: one prefix, one host
+    /// address. Proxy-ARP for the address makes the LAN reach it.
+    #[test]
+    fn expand_prefixes_slash_32_yields_one_addr() {
+        let (prefixes, addrs) = expand_prefixes(&["10.0.0.5/32".to_string()]);
+        assert_eq!(prefixes.len(), 1);
+        assert!(prefixes.contains("10.0.0.5/32"));
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs.contains("10.0.0.5"));
+    }
+
+    /// `/28` is the typical LB Service block shape. `Ipv4Net::hosts()`
+    /// excludes network and broadcast, so the proxy-ARP set has 14
+    /// entries — the LAN-reachable usable addresses.
+    #[test]
+    fn expand_prefixes_slash_28_yields_fourteen_addrs() {
+        let (prefixes, addrs) = expand_prefixes(&["10.0.0.16/28".to_string()]);
+        assert_eq!(prefixes.len(), 1);
+        assert!(prefixes.contains("10.0.0.16/28"));
+        assert_eq!(addrs.len(), 14);
+        assert!(addrs.contains("10.0.0.17"));
+        assert!(addrs.contains("10.0.0.30"));
+        assert!(!addrs.contains("10.0.0.16"));
+        assert!(!addrs.contains("10.0.0.31"));
+    }
+
+    /// Unparseable entries are dropped (logged at warn). Mixed inputs
+    /// keep the good ones — a malformed advertisement can't take down
+    /// the entire reconcile pass.
+    #[test]
+    fn expand_prefixes_drops_unparseable_keeps_rest() {
+        let (prefixes, addrs) = expand_prefixes(&[
+            "10.0.0.1/32".to_string(),
+            "not-a-cidr".to_string(),
+            "10.0.0.32/28".to_string(),
+        ]);
+        assert_eq!(prefixes.len(), 2);
+        assert!(prefixes.contains("10.0.0.1/32"));
+        assert!(prefixes.contains("10.0.0.32/28"));
+        assert_eq!(addrs.len(), 1 + 14);
+    }
+
+    /// Empty input is the cold-start case (`ensure_bootstrap` ships an
+    /// empty ClusterState before the first controller reconcile lands).
+    #[test]
+    fn expand_prefixes_empty_input_is_empty_output() {
+        let (prefixes, addrs) = expand_prefixes(&[]);
+        assert!(prefixes.is_empty());
+        assert!(addrs.is_empty());
     }
 }
