@@ -7,6 +7,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# `basis_agent_rust_log` (group_vars) selects the level. Default
+# enables trace on the dataplane + VM-spawn modules so the
+# `journalctl -u basis-agent` bundle includes prefix-route /
+# proxy-ARP / GARP / VIP-owner decisions and the cloud-hypervisor
+# invocation.
+Environment="RUST_LOG={{ basis_agent_rust_log }}"
 ExecStart=/usr/local/bin/basis-agent --config /etc/basis/host.yaml
 # SIGHUP triggers a config reload. `systemctl reload basis-agent` after
 # editing /etc/basis/host.yaml.

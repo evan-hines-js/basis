@@ -275,3 +275,18 @@ cloud_hypervisor_url: "https://github.com/cloud-hypervisor/cloud-hypervisor/rele
 # guests directly with `cloud-hypervisor --kernel --initramfs` using the
 # kernel+initrd shipped as OCI layers alongside each node image. The
 # firmware blob would only be needed if we switched to EFI boot.
+
+# RUST_LOG injected into the basis-agent and basis-controller systemd
+# units. INFO baseline plus TRACE on the modules whose events make up
+# the debug bundle:
+#
+#   * `basis_agent::vm` — cloud-hypervisor invocation (NIC `--net`,
+#     each `--disk`, vfio bindings) at VM spawn.
+#   * `basis_agent::network::cluster` — per-cluster reconcile
+#     decision, prefix-route add/del, proxy-ARP add/del, GARP burst.
+#   * `basis_controller::server` — per-cluster classification (owner,
+#     carriers, visibility, pool) on each reconcile build.
+#   * `basis_controller::db` — LAN-VIP owner re-elections (prev → new,
+#     carrier set at the change).
+basis_agent_rust_log: "info,basis_agent::vm=trace,basis_agent::network::cluster=trace"
+basis_controller_rust_log: "info,basis_controller::server=trace,basis_controller::db=trace"

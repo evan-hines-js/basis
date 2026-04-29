@@ -33,7 +33,7 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, trace};
 
 use basis_proto::CreateVmCommand;
 
@@ -158,6 +158,11 @@ impl VmManager {
         // MAC address (this very string) so the kernel-assigned name
         // is irrelevant.
         let primary_mac = primary_mac(&cmd.vm_id);
+        let net_spec = NetSpec {
+            tap: primary_tap.to_string(),
+            mac: primary_mac.clone(),
+            vcpus: cmd.cpu,
+        };
         let mut ch_args = vec![
             format!("--api-socket={}", socket_path.to_string_lossy()),
             format!("--cpus=boot={}", cmd.cpu),
@@ -170,7 +175,7 @@ impl VmManager {
             // timeouts and kicks off leader flaps.
             "--cmdline=root=/dev/vda1 ro console=ttyS0 transparent_hugepage=never".to_string(),
             "--net".to_string(),
-            format!("tap={primary_tap},mac={primary_mac}"),
+            net_spec.to_string(),
             "--serial=tty".to_string(),
             "--console=off".to_string(),
             "--disk".to_string(),
@@ -211,6 +216,20 @@ impl VmManager {
         // unit visible in `systemctl` after cloud-hypervisor exits so we
         // can read its journal and exit status — essential for debugging
         // a VM that crashed at boot.
+        info!(vm_id = %cmd.vm_id, unit = %unit_name, "spawning cloud-hypervisor via systemd-run");
+        trace!(
+            vm_id = %cmd.vm_id,
+            unit = %unit_name,
+            cpu = cmd.cpu,
+            memory_mib = cmd.memory_mib,
+            primary_tap = %primary_tap,
+            primary_mac = %primary_mac,
+            extra_disks = boot.extra_disks.len(),
+            vfio = vfio_devices.len(),
+            ch_args = ?ch_args,
+            "cloud-hypervisor invocation",
+        );
+
         let mut args = vec![
             format!("--unit={unit_name}"),
             "--service-type=exec".to_string(),
@@ -220,8 +239,6 @@ impl VmManager {
             "cloud-hypervisor".to_string(),
         ];
         args.extend(ch_args);
-
-        info!(vm_id = %cmd.vm_id, unit = %unit_name, "spawning cloud-hypervisor via systemd-run");
 
         let output = Command::new("systemd-run")
             .args(&args)
@@ -433,10 +450,9 @@ pub fn unit_name_for_vm(vm_id: &str) -> String {
 ///   image. Needs durability tunings (`direct=on`, `image_type=raw`)
 ///   and multi-queue virtio-blk for guest fsyncs (etcd WAL).
 /// * [`DiskSpec::Data`] — backed by a linear LV in the data VG. Same
-///   durability tunings as rootfs *plus* `discard=unmap` so guest
-///   `blkdiscard` / fstrim reaches the underlying NVMe through dm-
-///   linear (no metadata indirection). Bluestore on dm-thin would
-///   double-book allocation; linear is one-table-lookup pass-through.
+///   `--disk` tunings as rootfs. Linear backing keeps TRIM/discard
+///   passthrough as a one-table-lookup so Bluestore on dm-thin can
+///   reclaim space without double-booking.
 /// * [`DiskSpec::CloudInit`] — read-once cidata ISO. No tuning; the
 ///   guest reads it once at first boot and never again.
 ///
@@ -464,10 +480,37 @@ impl fmt::Display for DiskSpec {
             Self::Rootfs { path, vcpus } | Self::Data { path, vcpus } => write!(
                 f,
                 "path={},image_type=raw,direct=on,num_queues={vcpus},queue_size=256",
-                path.display()
+                path.display(),
             ),
             Self::CloudInit { path } => write!(f, "path={}", path.display()),
         }
+    }
+}
+
+/// One cloud-hypervisor `--net` argument. Mirrors [`DiskSpec`] for the
+/// same reason: centralise tuning so it can't drift across call sites.
+///
+/// `num_queues` is RX+TX combined per cloud-hypervisor's grammar, so
+/// `2 * vcpus` provisions one queue pair per guest vCPU. Pairs with
+/// [`crate::network::ensure_tap_on_bridge`], which creates the tap
+/// with IFF_MULTI_QUEUE so the cloud-hypervisor open with these
+/// queue counts succeeds.
+pub struct NetSpec {
+    pub tap: String,
+    pub mac: String,
+    pub vcpus: u32,
+}
+
+impl fmt::Display for NetSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Floor at one queue pair so a 0-vCPU command emits a valid
+        // `num_queues=2` rather than 0.
+        let Self { tap, mac, vcpus } = self;
+        let num_queues = 2 * vcpus.max(&1);
+        write!(
+            f,
+            "tap={tap},mac={mac},num_queues={num_queues},queue_size=256",
+        )
     }
 }
 
@@ -547,5 +590,37 @@ mod tests {
         }
         .to_string();
         assert_eq!(cidata, "path=/var/lib/basis/vms/x/cidata.iso");
+    }
+
+    /// `num_queues` scales as 2*vcpus (cloud-hypervisor counts RX+TX
+    /// combined): one queue pair per guest vCPU.
+    #[test]
+    fn net_spec_emits_multi_queue() {
+        let net = NetSpec {
+            tap: "tap-x".to_string(),
+            mac: "52:54:00:aa:bb:cc".to_string(),
+            vcpus: 8,
+        }
+        .to_string();
+        assert_eq!(
+            net,
+            "tap=tap-x,mac=52:54:00:aa:bb:cc,num_queues=16,queue_size=256",
+        );
+    }
+
+    /// Floor at one queue pair so a 0-vCPU command can't produce an
+    /// invalid `num_queues=0`.
+    #[test]
+    fn net_spec_floors_zero_vcpus_to_one_pair() {
+        let net = NetSpec {
+            tap: "tap-x".to_string(),
+            mac: "52:54:00:aa:bb:cc".to_string(),
+            vcpus: 0,
+        }
+        .to_string();
+        assert_eq!(
+            net,
+            "tap=tap-x,mac=52:54:00:aa:bb:cc,num_queues=2,queue_size=256",
+        );
     }
 }

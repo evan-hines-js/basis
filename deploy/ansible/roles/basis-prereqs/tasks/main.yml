@@ -92,6 +92,30 @@
   # reflects the bridge-owned IP rather than the pre-reboot state.
   ansible.builtin.setup:
   when: _basis_rebooted is defined and _basis_rebooted is changed
+
+# basis-agent enslaves each cluster bridge (brc<vni>) to a per-trust-domain
+# VRF (bvrf-*). With the default tcp/udp_l3mdev_accept=0, sockets opened in
+# the default VRF cannot match traffic arriving on a VRF-bound interface,
+# so the host kernel RSTs its own outgoing TCP to cluster CIDRs (e.g.
+# `ssh root@10.100.x.y` from the hypervisor: SYN out, SYN-ACK back, RST).
+# ICMP is unaffected, which makes this look like a TCP-only failure.
+- name: Allow default-VRF sockets to talk to VRF-bound bridges
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/60-basis-vrf.conf
+    content: |
+      # Managed by basis-prereqs. Required for host-originated traffic
+      # to cluster CIDRs because basis-agent enslaves brc<vni> to a VRF.
+      net.ipv4.tcp_l3mdev_accept = 1
+      net.ipv4.udp_l3mdev_accept = 1
+    owner: root
+    group: root
+    mode: "0644"
+  register: _basis_vrf_sysctl
+
+- name: Apply VRF sysctls now
+  ansible.builtin.command: sysctl -p /etc/sysctl.d/60-basis-vrf.conf
+  when: _basis_vrf_sysctl.changed
+  changed_when: true
 # ------------------------------------------------------------------------
 
 # On Proxmox hosts, `pve-qemu-kvm` provides qemu-img and an apt-hook
@@ -268,6 +292,29 @@
     enabled: true
     state: started
   when: basis_data_file_entries | length > 0
+
+# Remove the loopback unit when a host transitions from file-backed
+# to pure-block-device inventory. Without this, the stale unit stays
+# enabled and re-binds the now-orphan basis-data.img on every boot.
+- name: basis-data — stop + disable loopback unit when no file entries
+  ansible.builtin.systemd:
+    name: basis-data-loopback.service
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: basis_data_file_entries | length == 0
+
+- name: basis-data — remove stale loopback unit + reload
+  ansible.builtin.file:
+    path: /etc/systemd/system/basis-data-loopback.service
+    state: absent
+  register: loopback_unit_removed
+  when: basis_data_file_entries | length == 0
+
+- name: basis-data — daemon-reload after unit removal
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: loopback_unit_removed.changed | default(false)
 
 # After the unit has run, every configured file has a loop binding.
 # Resolve every entry (file-backed or block-device) to the actual

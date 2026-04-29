@@ -219,9 +219,17 @@ pub async fn delete_vm(
     // the row is gone.
     let record = agent_db.get_vm(vm_id).await.ok().flatten();
 
-    if let Err(e) = agent_db.delete_vm(vm_id).await {
-        warn!(vm_id, error = %e, "failed to remove local VM record");
+    // Stop cloud-hypervisor BEFORE touching its tap or LVs — the
+    // process holds open fds on both, and yanking them out from
+    // under it produces EBADFD storms (visible as `net: rx: failed
+    // reading from tap` on every queue) right before exit. The
+    // remove_vm_lv comment below already enforces this for storage;
+    // tap follows the same principle.
+    if let Err(e) = vm_mgr.delete_vm(vm_id).await {
+        warn!(vm_id, error = %e, "failed to stop VM");
     }
+
+    net_mgr.detach_vm_taps(vm_id).await;
 
     if let Some(record) = record {
         match record.gpus() {
@@ -239,13 +247,8 @@ pub async fn delete_vm(
         }
     }
 
-    net_mgr.detach_vm_taps(vm_id).await;
-
-    if let Err(e) = vm_mgr.delete_vm(vm_id).await {
-        warn!(vm_id, error = %e, "failed to stop VM");
-    }
-    // lvremove comes last: cloud-hypervisor holds its LVs exclusively
-    // until its process exits.
+    // lvremove after process exit; cloud-hypervisor holds its LVs
+    // exclusively until then.
     storage.remove_vm_lv(vm_id).await.map_err(|e| {
         warn!(vm_id, error = %e, "VM delete failed at lvremove; caller will retry");
         anyhow::Error::from(e)
@@ -254,6 +257,16 @@ pub async fn delete_vm(
         warn!(vm_id, error = %e, "VM delete failed removing data disks; caller will retry");
         anyhow::Error::from(e)
     })?;
+
+    // DB row removal LAST: if the agent crashes mid-teardown, a
+    // surviving row drives `reconcile_on_startup` to resume the
+    // delete (or restart the VM if disks/units survived). Removing
+    // the row first would lose the only handle on the in-progress
+    // teardown.
+    if let Err(e) = agent_db.delete_vm(vm_id).await {
+        warn!(vm_id, error = %e, "failed to remove local VM record");
+    }
+
     info!(vm_id, "VM deleted");
     Ok(())
 }

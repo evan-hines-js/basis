@@ -13,7 +13,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use basis_common::gpu::GpuInfo;
 use basis_common::time::now_rfc3339;
@@ -420,6 +420,17 @@ impl SharedCtx {
             let owner_host_id = self.db.elect_lan_vip_owner(&cluster.id, &carriers).await?;
             let (cluster_vips, internal_cluster_vips) =
                 classify_cluster_vips(&cluster, visibility, pool, &owner_host_id);
+            trace!(
+                cluster_id = %cluster.id,
+                vni = cluster.vni,
+                carriers = ?carriers,
+                owner = %owner_host_id,
+                visibility = ?visibility,
+                pool = %cluster.external_pool,
+                lan_vips = cluster_vips.len(),
+                tree_vips = internal_cluster_vips.len(),
+                "cluster reconcile classification",
+            );
             cluster_states.push(ClusterState {
                 cluster_id: cluster.id.clone(),
                 vni: cluster.vni as u32,
@@ -438,12 +449,14 @@ impl SharedCtx {
         // bridges and are *not* advertised on the LAN, so a VM in
         // cluster A on host H needs `<B.vip> dev brcB` on H even if
         // no VM of cluster B runs on H. Emitting a ghost
-        // `ClusterState` (empty `cidr`/`gateway_ip`) drives the
-        // agent's existing `ensure_cluster_inner` to create the
-        // bridge + VXLAN with the right peer FDB; the bridge route
-        // is installed because `internal_cluster_vips` is populated.
-        // Cluster cidr/gateway/MASQUERADE are deliberately skipped —
-        // those only matter for hosts running VMs of the cluster.
+        // `ClusterState` (`cidr` populated, `gateway_ip` empty) drives
+        // the agent's existing `ensure_cluster_inner` to create the
+        // bridge + VXLAN with the right peer FDB and install a
+        // transit-scope link route for `cidr` in the cluster's VRF
+        // table — required so a LAN-VIP VM on H replying to a source
+        // in cluster B's CIDR has a non-default route in the VRF and
+        // doesn't leak out the uplink. `gateway_ip` and MASQUERADE
+        // are skipped because no VM of B runs here.
         //
         // Trust-domain isolation is enforced on the agent side via
         // per-tree Linux VRFs — every `brc<vni>` is enslaved to the
@@ -489,7 +502,7 @@ impl SharedCtx {
             cluster_states.push(ClusterState {
                 cluster_id: cluster.id.clone(),
                 vni: cluster.vni as u32,
-                cidr: String::new(),
+                cidr: cluster.cidr.clone(),
                 gateway_ip: String::new(),
                 prefix_len: 0,
                 vtep_addresses: self.db.list_cluster_vteps(&cluster.id).await?,

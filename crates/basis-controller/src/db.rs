@@ -4,6 +4,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use tracing::trace;
 
 use basis_common::gpu::GpuInfo;
 
@@ -959,9 +960,10 @@ impl Db {
                 .fetch_optional(&self.reader)
                 .await?;
 
-        if let Some(prev) = prev {
-            if carriers.iter().any(|h| h == &prev) {
-                return Ok(prev);
+        let prev_owner = prev.clone();
+        if let Some(p) = prev {
+            if carriers.iter().any(|h| h == &p) {
+                return Ok(p);
             }
         }
 
@@ -979,6 +981,13 @@ impl Db {
         .bind(&now)
         .execute(&self.writer)
         .await?;
+        trace!(
+            cluster_id,
+            prev_owner = ?prev_owner,
+            new_owner = %new_owner,
+            carriers = ?carriers,
+            "lan-vip owner re-elected",
+        );
         Ok(new_owner)
     }
 

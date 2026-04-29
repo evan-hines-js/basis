@@ -69,8 +69,9 @@
   notify: restart basis-controller
 
 - name: Install systemd unit
-  ansible.builtin.copy:
-    src: "{{ basis_repo_root }}/deploy/systemd/basis-controller.service"
+  # Templated so the unit picks up `basis_controller_rust_log`.
+  ansible.builtin.template:
+    src: basis-controller.service.j2
     dest: /etc/systemd/system/basis-controller.service
     owner: root
     group: root

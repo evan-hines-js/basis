@@ -1,25 +1,30 @@
 ---
-# poweredge-md (10.0.0.206): four 186 GB enterprise SSDs (sdb-sde)
-# previously held `ent-zfspool`, now repurposed as a single LVM-thin
-# pool for VM disks. The OS lives on sda (pve-root); sdf/sdg are not
-# part of the pool.
+# poweredge-md (10.0.0.206).
 #
-# `wipefs -a /dev/sdb /dev/sdc /dev/sdd /dev/sde` was run after
-# `zpool destroy ent-zfspool` before the first apply.
+# Rootfs thin pool (basis VG): four 186 GB enterprise SSDs (sdb-sde),
+# previously held `ent-zfspool`, now a single LVM-thin pool. The OS
+# lives on sda (pve-root); sdf/sdg are not part of the pool.
+#
+# Data VG (basis-data): backed by `/dev/pve/basis-data`, a thick LV
+# carved out of the OS disk's `pve` VG after destroying the unused
+# `pve-data` thinpool that PVE auto-provisions but we never used.
+# Gives ~320 GiB of data capacity, sized to fit a 250 GiB-class
+# worker dataDisk plus headroom. Sparse loopback was a temporary
+# fixture that capped data placement at 120 GiB.
+#
+# First-apply prep (run once on the host):
+#   zpool destroy ent-zfspool
+#   wipefs -a /dev/sdb /dev/sdc /dev/sdd /dev/sde
+#   lvremove -y pve/data
+#   lvcreate -n basis-data -L 320G pve
 basis_lvm_devices:
   - /dev/sdb
   - /dev/sdc
   - /dev/sdd
   - /dev/sde
 
-# basis-data VG: e2e backed by a 120G sparse loopback on the OS root
-# (sda). The four SSDs above are the rootfs thin pool; sdf/sdg are
-# untouched and reserved for other PVE workloads. Sparse loopback
-# tracks actual bluestore writes (near-zero in e2e). Production hosts
-# would list a dedicated NVMe / partition here instead.
 basis_lvm_data_devices:
-  - file: /var/lib/basis/basis-data.img
-    size: 120G
+  - /dev/pve/basis-data
 
 # Network config (cluster_supernet, pools, default_external_service_ips)
 # lives in group_vars/all.yml — it's a cell-wide concern, not per-host.

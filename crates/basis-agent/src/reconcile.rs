@@ -11,7 +11,7 @@ use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
 use crate::lvm::Storage;
 use crate::metrics;
-use crate::network::{primary_tap_name, NetworkManager};
+use crate::network::NetworkManager;
 use crate::vm::{BootArtifacts, VmManager};
 
 /// Max number of VMs the agent restarts in parallel after a node reboot.
@@ -124,27 +124,6 @@ impl<'a> GarbageCollectable for LvCollector<'a> {
     async fn reclaim(&self, vm_id: &str) -> anyhow::Result<()> {
         self.storage.remove_vm_lv(vm_id).await?;
         self.storage.remove_vm_data_disks(vm_id).await?;
-        Ok(())
-    }
-}
-
-/// TAP devices whose name doesn't map back to any known vm_id. Tap
-/// names are a hash of vm_id so we can't reverse one; the caller
-/// passes the expected name set computed from known vm_ids via
-/// `primary_tap_name`.
-struct TapCollector<'a> {
-    net_mgr: &'a NetworkManager,
-}
-
-impl<'a> GarbageCollectable for TapCollector<'a> {
-    fn kind(&self) -> &'static str {
-        "tap"
-    }
-    async fn list(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self.net_mgr.list_agent_taps().await?)
-    }
-    async fn reclaim(&self, tap_name: &str) -> anyhow::Result<()> {
-        self.net_mgr.delete_tap_by_name(tap_name).await?;
         Ok(())
     }
 }
@@ -285,16 +264,15 @@ pub async fn sweep_orphans(
     let lvs = LvCollector { storage };
     let lv_reclaimed = collect(&lvs, known_ids, ORPHAN_LV_BATCH).await;
 
-    // Expected TAP names = primary for every known vm_id. Anything
-    // else returned by list_agent_taps is an orphan.
-    let mut expected_taps: HashSet<String> = HashSet::with_capacity(known_ids.len());
-    for id in known_ids {
-        expected_taps.insert(primary_tap_name(id));
-    }
-    let taps = TapCollector { net_mgr };
-    let tap_reclaimed = collect(&taps, &expected_taps, usize::MAX).await;
-
-    unit_reclaimed + lv_reclaimed + tap_reclaimed
+    // Taps are deliberately NOT swept here. Taps are owned by the VM
+    // lifecycle: `create_vm_inner` writes the agent DB row before
+    // `attach_vm_primary` creates the tap, and `delete_vm` stops
+    // cloud-hypervisor before detaching the tap. So a tap without a
+    // matching DB row is structurally impossible. The only way to
+    // produce one is wiping `agent.db` out from under live VMs —
+    // recovered from on the next register via the controller's
+    // `RegisterHostResponse.initial_state`, not by a defensive sweep.
+    unit_reclaimed + lv_reclaimed
 }
 
 /// Live orphan sweep — gathers authoritative sets on its own and

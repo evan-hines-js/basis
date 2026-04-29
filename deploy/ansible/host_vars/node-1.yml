@@ -1,27 +1,37 @@
 ---
-# 10.0.0.97: PVE host. /dev/sdf (931 GiB) sits in PVE's `data` VG but
-# the storage.cfg pins that VG to a different node — so on this host
-# the drive is idle. We claim the whole disk for basis.
+# 10.0.0.97: PVE host.
+#
+# Rootfs thin pool (basis VG): /dev/sdf (931 GiB), the only spinning
+# 1 TB drive on the host, sits in PVE's `data` VG but the storage.cfg
+# pins that VG to a different node — idle here, claimed by basis.
+#
+# Data VG (basis-data): two PVs giving ~381 GiB total —
+#   * /dev/pve/basis-data — 120 GiB thick LV in the OS disk's `pve` VG,
+#     carved out of the freed extents after destroying the unused
+#     `pve-data` thinpool that PVE auto-provisioned but we never used.
+#   * /dev/sdb4 — ~261 GiB partition spanning the previously
+#     unallocated tail of sdb (sdb3 ends at ~185 GiB on a 447 GiB disk).
+# The four 200 GB SATA SSDs (sda/sdc/sdd/sde) host an active PVE
+# zpool (`ent-zfspool` with the build VM's root disks), so they stay
+# untouched.
 #
 # First-apply prep (run once on the host):
-#   vgremove -y data
-#   wipefs -a /dev/sdf
+#   vgremove -y data && wipefs -a /dev/sdf
+#   sed -i.bak '/^lvmthin: local-lvm$/,/^$/d' /etc/pve/storage.cfg
+#   lvremove -y pve/data
+#   lvcreate --yes -n basis-data -L 120G pve
+#   sgdisk -n 4:0:0 /dev/sdb && partx -a /dev/sdb
+#   sed -i.bak 's/^\s*# scan_lvs = 0$/\tscan_lvs = 1/' /etc/lvm/lvm.conf
 basis_lvm_devices:
   - /dev/sdf
 
-# basis-data VG: this PVE host has no spare physical disk, so back
-# the data VG with a 120G sparse loopback file on the OS root.
-# basis-prereqs truncates the file, binds it via losetup, and
-# persists the binding through basis-data-loopback.service. Sparse
-# means actual disk usage tracks bluestore writes (near-zero in e2e
-# since Rook/Ceph doesn't drive real workload during the test).
-# Production hosts list dedicated NVMes here instead.
 basis_lvm_data_devices:
-  - file: /var/lib/basis/basis-data.img
-    size: 120G
+  - /dev/pve/basis-data
+  - /dev/sdb4
 
-# Single SATA drive shared with PVE — only good enough for workers.
-# CP with `prefers: tier=fast` falls back here if no fast host is up;
-# workers with `requires: tier=slow` land here exclusively.
+# Spinning 1 TB rootfs disk — fine for workers but slower than the
+# enterprise SSDs on node-2. CP with `prefers: tier=fast` falls back
+# here if no fast host is up; workers with `requires: tier=slow`
+# land here exclusively.
 basis_host_labels:
   tier: slow

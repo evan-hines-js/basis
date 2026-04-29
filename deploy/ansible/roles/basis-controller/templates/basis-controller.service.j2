@@ -5,6 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# `basis_controller_rust_log` (group_vars) selects the level.
+# Default enables trace on placement / reconcile / VIP-owner
+# election so the controller side of the bundle pairs with the
+# agent's dataplane trace.
+Environment="RUST_LOG={{ basis_controller_rust_log }}"
 ExecStart=/usr/local/bin/basis-controller --config /etc/basis/basiscontroller.yaml
 Restart=on-failure
 RestartSec=5s

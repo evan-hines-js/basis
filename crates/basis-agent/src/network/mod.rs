@@ -121,15 +121,7 @@ impl NetworkManager {
 
     /// Best-effort delete of the VM's TAP.
     pub async fn detach_vm_taps(&self, vm_id: &str) {
-        let _ = delete_tap_by_name(&primary_tap_name(vm_id)).await;
-    }
-
-    pub async fn list_agent_taps(&self) -> Result<Vec<String>, NetworkError> {
-        list_agent_taps().await
-    }
-
-    pub async fn delete_tap_by_name(&self, name: &str) -> Result<(), NetworkError> {
-        delete_tap_by_name(name).await
+        delete_tap_by_name(&primary_tap_name(vm_id)).await;
     }
 }
 
@@ -320,80 +312,51 @@ impl UplinkBridge {
     }
 }
 
-/// True iff `name` matches the agent's TAP shape: `bas` followed by
-/// 10 hex chars. Prevents the orphan sweep from mistaking `basis0`
-/// (the uplink bridge) for an agent tap.
-fn is_agent_managed_tap(name: &str) -> bool {
-    const PREFIX_LEN: usize = 3;
-    const HASH_LEN: usize = 10;
-    if name.len() != PREFIX_LEN + HASH_LEN {
-        return false;
-    }
-    let (prefix, suffix) = name.split_at(PREFIX_LEN);
-    prefix == PRIMARY_TAP_PREFIX && suffix.chars().all(|c| c.is_ascii_hexdigit())
+/// True iff `name` is a current link in the host's network namespace.
+/// Shared between the tap-ensure path here and the VRF path in
+/// `cluster.rs`.
+pub(crate) async fn link_exists(name: &str) -> Result<bool, NetworkError> {
+    Ok(Command::new("ip")
+        .args(["link", "show", name])
+        .output()
+        .await?
+        .status
+        .success())
 }
 
-pub(crate) async fn create_and_attach_tap(tap: &str, bridge: &str) -> Result<(), NetworkError> {
-    run_cmd("ip", &["tuntap", "add", tap, "mode", "tap"]).await?;
-    run_cmd("ip", &["link", "set", tap, "master", bridge]).await?;
-    run_cmd("ip", &["link", "set", tap, "up"]).await?;
+/// Idempotent attach: ensure the TAP exists, is mastered to `bridge`,
+/// and is up. New taps are always created with IFF_MULTI_QUEUE so
+/// cloud-hypervisor's `--net num_queues=N>2` open succeeds. An
+/// existing tap is trusted — we never delete-and-recreate while the
+/// VM may have its fd open (that path produced EBADFD storms on the
+/// guest's RX queues and crashed cloud-hypervisor).
+pub(crate) async fn ensure_tap_on_bridge(tap: &str, bridge: &str) -> Result<(), NetworkError> {
+    if !link_exists(tap).await? {
+        run_cmd("ip", &["tuntap", "add", tap, "mode", "tap", "multi_queue"]).await?;
+    }
+    run_cmd("ip", &["link", "set", tap, "master", bridge])
+        .await
+        .map_err(|e| NetworkError::TapInconsistent {
+            tap: tap.to_string(),
+            reason: format!("attach to bridge {bridge}: {e}"),
+        })?;
+    run_cmd("ip", &["link", "set", tap, "up"])
+        .await
+        .map_err(|e| NetworkError::TapInconsistent {
+            tap: tap.to_string(),
+            reason: format!("link up: {e}"),
+        })?;
     Ok(())
 }
 
-/// Idempotent attach: create the TAP if missing, else (re)master it
-/// to the bridge and bring it up.
-pub(crate) async fn ensure_tap_on_bridge(tap: &str, bridge: &str) -> Result<(), NetworkError> {
-    let exists = Command::new("ip")
-        .args(["link", "show", tap])
-        .output()
-        .await?;
-    if exists.status.success() {
-        run_cmd("ip", &["link", "set", tap, "master", bridge])
-            .await
-            .map_err(|e| NetworkError::TapInconsistent {
-                tap: tap.to_string(),
-                reason: format!("re-attach to bridge {bridge}: {e}"),
-            })?;
-        run_cmd("ip", &["link", "set", tap, "up"])
-            .await
-            .map_err(|e| NetworkError::TapInconsistent {
-                tap: tap.to_string(),
-                reason: format!("link up: {e}"),
-            })?;
-        return Ok(());
-    }
-    create_and_attach_tap(tap, bridge).await
-}
-
-pub async fn delete_tap_by_name(name: &str) -> Result<(), NetworkError> {
+/// Best-effort delete; logs and continues if the link is already gone.
+/// The only legitimate caller is the VM-teardown path in
+/// `handlers::delete_vm` (after cloud-hypervisor has stopped). We
+/// never delete a tap whose VM is still running.
+pub async fn delete_tap_by_name(name: &str) {
     if let Err(e) = run_cmd("ip", &["link", "delete", name]).await {
         warn!(tap = %name, error = %e, "delete tap (may already be gone)");
     }
-    Ok(())
-}
-
-/// Enumerate every agent-managed TAP on the host.
-pub async fn list_agent_taps() -> Result<Vec<String>, NetworkError> {
-    let out = Command::new("ip")
-        .args(["-o", "link", "show", "type", "tuntap"])
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Err(NetworkError::BridgeFailed(
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        ));
-    }
-    let mut taps = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let Some(name) = line.split_whitespace().nth(1) else {
-            continue;
-        };
-        let name = name.trim_end_matches(':').trim_end_matches('@');
-        if is_agent_managed_tap(name) {
-            taps.push(name.to_string());
-        }
-    }
-    Ok(taps)
 }
 
 /// Install a source-scoped MASQUERADE rule for `cluster_cidr`
@@ -542,14 +505,5 @@ mod tests {
     fn tap_names_fit_ifnamsiz() {
         let vm = "3f8a1b2c-7d9e-4f1a-b5c3-2e8f6a9d0b1e";
         assert!(primary_tap_name(vm).len() <= 15);
-    }
-
-    #[test]
-    fn is_agent_managed_requires_full_shape() {
-        assert!(is_agent_managed_tap(&primary_tap_name("v1")));
-        assert!(!is_agent_managed_tap("eth0"));
-        assert!(!is_agent_managed_tap("basis0"));
-        assert!(!is_agent_managed_tap("basabc123")); // too short
-        assert!(!is_agent_managed_tap("basnonhex000")); // non-hex suffix
     }
 }

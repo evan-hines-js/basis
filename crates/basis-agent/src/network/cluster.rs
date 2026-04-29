@@ -20,13 +20,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use basis_proto::{ClusterState, ClusterVip};
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{trace, warn};
 
 use std::collections::hash_map::Entry;
 
 use super::{
-    ensure_cluster_masquerade, ensure_tap_on_bridge, primary_tap_name, remove_cluster_masquerade,
-    run_cmd, NetworkError, VXLAN_OVERHEAD,
+    ensure_cluster_masquerade, ensure_tap_on_bridge, link_exists, primary_tap_name,
+    remove_cluster_masquerade, run_cmd, NetworkError, VXLAN_OVERHEAD,
 };
 
 const BRIDGE_PREFIX: &str = "brc";
@@ -273,6 +273,25 @@ impl ClusterManager {
             let (lan_prefixes, lan_addrs) = expand_lan_vips(&cluster.cluster_vips, &self_host_id);
             let tree_prefixes = expand_tree_prefixes(&cluster.internal_cluster_vips);
 
+            let owners: Vec<&str> = cluster
+                .cluster_vips
+                .iter()
+                .map(|v| v.owner_host_id.as_str())
+                .collect();
+            trace!(
+                vni = cluster.vni,
+                cidr = %cluster.cidr,
+                self_host_id = %self_host_id,
+                vrf = ?vrf.as_ref().map(|v| &v.name),
+                lan_vips = cluster.cluster_vips.len(),
+                lan_owners = ?owners,
+                tree_vips = cluster.internal_cluster_vips.len(),
+                lan_prefix_count = lan_prefixes.len(),
+                lan_proxy_arp_count = lan_addrs.len(),
+                tree_prefix_count = tree_prefixes.len(),
+                "per-cluster reconcile decision",
+            );
+
             let bridge = bridge_name(cluster.vni);
             let table_id = vrf.as_ref().map(|v| v.table_id);
 
@@ -322,6 +341,22 @@ impl ClusterManager {
 
             let mut want_combined = lan_prefixes;
             want_combined.extend(tree_prefixes);
+
+            // Transit-only host (ghost ClusterState: no gateway_ip,
+            // so the kernel never injects `<cidr> dev brc<vni>` into
+            // the VRF table). A LAN-VIP VM here replying to a source
+            // in this cluster's CIDR would otherwise hit only
+            // `default via <uplink-gw>` in the VRF and leak the
+            // SYN-ACK out the uplink. Adding `cidr` to want_combined
+            // makes the reconcile loop install
+            // `<cidr> dev brc<vni> table <vrf>` and keep it across
+            // reconciles. Hosts that DO carry a VM keep the kernel's
+            // `proto kernel` connected route untouched — `add_prefix_route`
+            // would replace it, but `list_kernel_prefix_routes` skips
+            // proto-kernel rows so the diff never sees it as missing.
+            if table_id.is_some() && cluster.gateway_ip.is_empty() && !cluster.cidr.is_empty() {
+                want_combined.insert(cluster.cidr.clone());
+            }
 
             if let Some(t) = table_id {
                 let kernel_vrf = list_kernel_prefix_routes(&bridge, Some(t)).await?;
@@ -600,7 +635,10 @@ impl ClusterManager {
             ensure_bridge_address(&bridge, &cluster.gateway_ip, cluster.prefix_len).await?;
         }
 
-        if !cluster.cidr.is_empty() {
+        // MASQUERADE only makes sense on hosts that run VMs of the
+        // cluster — the rule rewrites `<cidr> -> uplink` egress, and
+        // a transit-only host never sources traffic from `<cidr>`.
+        if !cluster.gateway_ip.is_empty() && !cluster.cidr.is_empty() {
             ensure_cluster_masquerade(&cluster.cidr, &self.uplink_bridge).await?;
         }
 
@@ -617,7 +655,11 @@ impl ClusterManager {
         // in their own VRF tables and never appear in main, so a
         // packet from one tree's bridge looking up another tree's
         // VIP still misses everywhere and dies.
-        if vrf.is_some() && !cluster.cidr.is_empty() {
+        //
+        // Skipped on transit-only hosts (`gateway_ip` empty): no VM
+        // of this cluster lives here, so there's no NAT'd egress to
+        // get a reverse-path reply.
+        if vrf.is_some() && !cluster.gateway_ip.is_empty() && !cluster.cidr.is_empty() {
             run_cmd(
                 "ip",
                 &[
@@ -717,14 +759,6 @@ async fn read_uplink_gateway(uplink: &str) -> Result<Option<String>, NetworkErro
         }
     }
     Ok(None)
-}
-
-async fn link_exists(name: &str) -> Result<bool, NetworkError> {
-    let out = Command::new("ip")
-        .args(["link", "show", name])
-        .output()
-        .await?;
-    Ok(out.status.success())
 }
 
 /// Read the master device of `link` (e.g. the VRF a bridge is
@@ -842,6 +876,7 @@ async fn add_prefix_route(
     if let Some(t) = table_str.as_deref() {
         args.extend_from_slice(&["table", t]);
     }
+    trace!(prefix, bridge, table = ?table, "prefix route add");
     run_cmd("ip", &args).await
 }
 
@@ -855,16 +890,19 @@ async fn del_prefix_route(
     if let Some(t) = table_str.as_deref() {
         args.extend_from_slice(&["table", t]);
     }
+    trace!(prefix, bridge, table = ?table, "prefix route del");
     run_cmd("ip", &args).await
 }
 
 /// Make this host answer ARP for `addr` on the underlay. `replace`
 /// keeps it idempotent across reconciles.
 async fn add_proxy_arp(addr: &str, uplink: &str) -> Result<(), NetworkError> {
+    trace!(addr, uplink, "proxy-arp add");
     run_cmd("ip", &["neigh", "replace", "proxy", addr, "dev", uplink]).await
 }
 
 async fn del_proxy_arp(addr: &str, uplink: &str) -> Result<(), NetworkError> {
+    trace!(addr, uplink, "proxy-arp del");
     run_cmd("ip", &["neigh", "del", "proxy", addr, "dev", uplink]).await
 }
 
@@ -882,7 +920,9 @@ async fn send_garp(addr: &str, uplink: &str) {
         .output()
         .await;
     match result {
-        Ok(out) if out.status.success() => {}
+        Ok(out) if out.status.success() => {
+            trace!(addr, uplink, "garp burst sent");
+        }
         Ok(out) => {
             warn!(
                 addr = %addr,

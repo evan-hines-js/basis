@@ -91,8 +91,9 @@
   notify: restart basis-agent
 
 - name: Install systemd unit
-  ansible.builtin.copy:
-    src: "{{ basis_repo_root }}/deploy/systemd/basis-agent.service"
+  # Templated so the unit picks up `basis_agent_rust_log`.
+  ansible.builtin.template:
+    src: basis-agent.service.j2
     dest: /etc/systemd/system/basis-agent.service
     owner: root
     group: root
