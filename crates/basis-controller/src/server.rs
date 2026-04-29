@@ -1154,13 +1154,38 @@ impl basis_server::Basis for BasisApiService {
         let pool = self.resolve_pool(&req.external_ip_pool)?;
 
         // Idempotent by name.
-        if let Some(existing) = self
+        if let Some(mut existing) = self
             .shared
             .db
             .get_cluster_by_name(&req.name)
             .await
             .map_err(db_status)?
         {
+            // The CAPI provider stamps every CreateCluster with the
+            // live trust_domain it derives from `lattice-system/lattice-ca`.
+            // If the stored value disagrees, the row is from an earlier
+            // install with a different CA (controller.db carried across
+            // a `lattice install` re-run) and would silently isolate
+            // this cluster from its siblings on the wrong tree-VRF.
+            // Refresh and broadcast so agents detach the bridge from
+            // the stale VRF and attach to the live one on the next
+            // reconcile pass.
+            if !req.trust_domain.is_empty() && req.trust_domain != existing.trust_domain {
+                warn!(
+                    cluster_id = %existing.id,
+                    name = %req.name,
+                    old = %existing.trust_domain,
+                    new = %req.trust_domain,
+                    "CreateCluster: trust_domain drift, refreshing stored row"
+                );
+                self.shared
+                    .db
+                    .update_cluster_trust_domain(&existing.id, &req.trust_domain)
+                    .await
+                    .map_err(db_status)?;
+                existing.trust_domain = req.trust_domain.clone();
+                self.shared.broadcast_cluster(&existing.id).await;
+            }
             info!(cluster_id = %existing.id, name = %req.name, "CreateCluster idempotent return");
             return Ok(Response::new(create_cluster_response(&existing)));
         }

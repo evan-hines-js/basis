@@ -897,6 +897,26 @@ impl Db {
         )
     }
 
+    /// Overwrite a cluster's `trust_domain`. Idempotent CreateCluster
+    /// calls this when the request's trust_domain disagrees with the
+    /// stored value — the caller is the source of truth for the live
+    /// CA, and a stored row that lags (DB carried over from an
+    /// install with a different CA) silently places the cluster in
+    /// the wrong VRF. Caller broadcasts reconcile so agents move the
+    /// bridge to the new VRF on the next pass.
+    pub async fn update_cluster_trust_domain(
+        &self,
+        cluster_id: &str,
+        trust_domain: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE clusters SET trust_domain = ? WHERE id = ?")
+            .bind(trust_domain)
+            .bind(cluster_id)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
     /// Hard-delete a cluster row. Caller is responsible for ensuring
     /// every (host, cluster) row has already been tombstoned and acked
     /// — DeleteCluster's flow marks each host pending and waits for
@@ -2784,5 +2804,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owner, "");
+    }
+
+    /// `update_cluster_trust_domain` overwrites the stored value so the
+    /// next agent reconcile pass picks up the new VRF assignment.
+    #[tokio::test]
+    async fn update_cluster_trust_domain_overwrites_stored_value() {
+        let db = test_db().await;
+        let net = db.allocate_cluster_network(&make_net_config()).await.unwrap();
+        let mut cluster = make_cluster("c1", "c1", net, "10.100.0.1");
+        cluster.trust_domain = "old-td".to_string();
+        db.insert_cluster(&cluster).await.unwrap();
+
+        db.update_cluster_trust_domain(&cluster.id, "new-td")
+            .await
+            .unwrap();
+
+        let refreshed = db.get_cluster(&cluster.id).await.unwrap();
+        assert_eq!(refreshed.trust_domain, "new-td");
     }
 }

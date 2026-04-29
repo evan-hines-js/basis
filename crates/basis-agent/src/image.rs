@@ -516,9 +516,17 @@ impl ImageManager {
 /// literal kernel name (`ens3` / etc) — cloud-hypervisor's PCI slot
 /// assignment shifts whenever the device list changes (extra disks,
 /// VFIO devices) and a literal name would silently apply to nothing.
+///
+/// The MAC is rendered as a quoted YAML string. Unquoted, ~1.3% of
+/// MACs (those whose six bytes are all decimal-digit-only and each
+/// < 60) are reinterpreted by YAML 1.1's sexagesimal rule as a
+/// single integer — `52:54:00:22:54:05` becomes 41,135,122,445 — and
+/// netplan rejects them as invalid MACs. The bug fires once every
+/// ~80 VMs and was the cause of the "first cluster bootstraps,
+/// second hangs forever" e2e flake.
 fn network_config(primary: &GuestNetwork<'_>) -> String {
     let mut s = format!(
-        "network:\n  version: 2\n  ethernets:\n    primary:\n      match:\n        macaddress: {}\n      mtu: {}\n      addresses:\n        - {}/{}\n      gateway4: {}\n      nameservers:\n        addresses:\n",
+        "network:\n  version: 2\n  ethernets:\n    primary:\n      match:\n        macaddress: \"{}\"\n      mtu: {}\n      addresses:\n        - {}/{}\n      gateway4: {}\n      nameservers:\n        addresses:\n",
         primary.mac, primary.mtu, primary.ip_address, primary.prefix_len, primary.gateway,
     );
     for d in primary.dns_servers {
@@ -651,8 +659,12 @@ mod tests {
 
     #[test]
     fn network_config_binds_by_mac() {
+        // Use an all-digit, all-<60 MAC — the sexagesimal-trap shape
+        // that broke production. Test passes only when the renderer
+        // emits the value quoted so YAML 1.1 doesn't reinterpret it
+        // as base-60 integer 41135122445.
         let primary = GuestNetwork {
-            mac: "52:54:00:aa:bb:cc",
+            mac: "52:54:00:22:54:05",
             ip_address: "10.1.0.20",
             gateway: "10.1.0.1",
             prefix_len: 20,
@@ -661,8 +673,8 @@ mod tests {
         };
         let s = network_config(&primary);
         assert!(
-            s.contains("macaddress: 52:54:00:aa:bb:cc"),
-            "primary NIC must bind by MAC, never by `ensN` — that name shifts with PCI slot ordering: {s}"
+            s.contains("macaddress: \"52:54:00:22:54:05\""),
+            "primary NIC must bind by MAC, quoted to avoid YAML 1.1 sexagesimal: {s}"
         );
         assert!(s.contains("10.1.0.20/20"), "{s}");
         assert!(s.contains("gateway4: 10.1.0.1"), "{s}");
