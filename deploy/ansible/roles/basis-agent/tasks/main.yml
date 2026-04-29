@@ -1,4 +1,17 @@
 ---
+# iputils-arping provides the `arping` binary the agent shells out to
+# after installing a proxy-ARP entry on the uplink. The unsolicited
+# ARP-reply burst (`arping -A`) collapses LAN-side ARP-cache
+# convergence from the kernel's ~60s default TTL down to one packet
+# round-trip on owner-change reconciles. Without it, single-responder
+# proxy-ARP still works but takes a full TTL to fail over. Cache
+# refresh is owned by `basis-prereqs` (which already tolerates the
+# PVE enterprise-repo 401); we just install from whatever's there.
+- name: Ensure iputils-arping is installed
+  ansible.builtin.package:
+    name: iputils-arping
+    state: present
+
 - name: Ensure data directory exists
   ansible.builtin.file:
     path: "{{ basis_data_dir }}"
@@ -68,10 +81,14 @@
     # 0600 because registry credentials (if configured) live here in
     # plaintext. The agent runs as root, no other reader should see this.
     mode: "0600"
-  # Changes to Host spec trigger SIGHUP. The agent only applies mutable
-  # fields (controllerEndpoint); immutable field changes log a warning
-  # and require a full restart — surfaced by the running agent's logs.
-  notify: reload basis-agent
+  # host.yaml changes always trigger a full restart — `reload` (SIGHUP)
+  # only picks up the small set of mutable fields (controllerEndpoint),
+  # and quietly logs a warning for everything else. New fields landing
+  # on existing hosts (e.g. the dual-VG `storage` block added with the
+  # Rook handoff) are immutable and were silently ignored under reload
+  # until the next manual restart. Restart is cheap — VMs run in
+  # independent systemd scopes and survive across agent bounces.
+  notify: restart basis-agent
 
 - name: Install systemd unit
   ansible.builtin.copy:

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use basis_common::gpu::GpuInfo;
 use basis_proto::CreateMachineRequest;
 
-use crate::db::{HostRow, HostUsage};
+use crate::db::{HostRow, HostUsage, GIB};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
@@ -107,11 +107,15 @@ pub struct ScheduleRequest {
     pub cluster_id: String,
     pub cpu: u32,
     pub memory_mib: u32,
-    /// Full host-side disk footprint — rootfs plus every extra data
-    /// disk. The scheduler compares this directly against the host's
-    /// free thin-pool capacity; callers that only supply rootfs
-    /// would silently over-place any VM that asked for extras.
-    pub disk_gib: u32,
+    /// Rootfs size (GiB). Charged against the host's rootfs thin
+    /// pool free capacity, not the data VG.
+    pub rootfs_gib: u32,
+    /// Sum of extra-disk sizes (GiB). Charged against the host's
+    /// data VG free capacity, not the rootfs pool. Mixing the two
+    /// budgets would let a VM with a 1 TiB OSD disk eat into the
+    /// rootfs pool — the exact failure mode the split exists to
+    /// prevent.
+    pub data_gib: u32,
     pub gpus: u32,
     pub min_group_size: u32,
     /// Operator-supplied placement constraints. Empty by default, in
@@ -121,12 +125,13 @@ pub struct ScheduleRequest {
 
 impl From<&CreateMachineRequest> for ScheduleRequest {
     fn from(req: &CreateMachineRequest) -> Self {
-        let extras_total: u32 = req.extra_disks.iter().map(|d| d.size_gib).sum();
+        let data_gib: u32 = req.extra_disks.iter().map(|d| d.size_gib).sum();
         Self {
             cluster_id: req.cluster_id.clone(),
             cpu: req.cpu,
             memory_mib: req.memory_mib,
-            disk_gib: req.disk_gib.saturating_add(extras_total),
+            rootfs_gib: req.disk_gib,
+            data_gib,
             gpus: req.gpus,
             min_group_size: req
                 .gpu_constraints
@@ -143,14 +148,15 @@ impl From<&CreateMachineRequest> for ScheduleRequest {
 }
 
 /// Free capacity on a host after subtracting current usage. `cpu` is
-/// scaled by `cpu_overcommit_ratio`; memory and disk are strict
-/// because oversubscribing either ends in OOM-kills or ENOSPC — much
-/// worse failure modes than CPU time-slicing.
+/// scaled by `cpu_overcommit_ratio`; memory and both disk pools are
+/// strict because oversubscribing either ends in OOM-kills or
+/// ENOSPC — much worse failure modes than CPU time-slicing.
 #[derive(Debug, Clone, Copy)]
 struct Available {
     cpu: u32,
     memory_mib: u32,
-    disk_gib: u32,
+    rootfs_gib: u32,
+    data_gib: u32,
 }
 
 impl Available {
@@ -158,21 +164,26 @@ impl Available {
         // Promote to f64 so large core counts with fractional ratios
         // don't lose precision in the multiply.
         let effective_cpu = (host.total_cpu as f64 * cpu_overcommit_ratio as f64) as i64;
+        let rootfs_total_gib = host.rootfs_total_bytes / GIB;
+        let data_total_gib = host.data_total_bytes / GIB;
         Self {
             cpu: effective_cpu.saturating_sub(usage.used_cpu).max(0) as u32,
             memory_mib: host
                 .total_memory_mib
                 .saturating_sub(usage.used_memory_mib)
                 .max(0) as u32,
-            disk_gib: host
-                .total_disk_gib
-                .saturating_sub(usage.used_disk_gib)
+            rootfs_gib: rootfs_total_gib
+                .saturating_sub(usage.used_rootfs_gib)
                 .max(0) as u32,
+            data_gib: data_total_gib.saturating_sub(usage.used_data_gib).max(0) as u32,
         }
     }
 
     fn fits(&self, req: &ScheduleRequest) -> bool {
-        self.cpu >= req.cpu && self.memory_mib >= req.memory_mib && self.disk_gib >= req.disk_gib
+        self.cpu >= req.cpu
+            && self.memory_mib >= req.memory_mib
+            && self.rootfs_gib >= req.rootfs_gib
+            && self.data_gib >= req.data_gib
     }
 
     fn remaining_after(&self, req: &ScheduleRequest) -> u64 {
@@ -297,8 +308,8 @@ pub fn schedule(
                 SchedulerError::UnsatisfiedRequirements(req.placement.describe_requires())
             } else {
                 SchedulerError::NoCapacity(format!(
-                    "cpu={}, mem={}MiB, disk={}GiB, gpus={}",
-                    req.cpu, req.memory_mib, req.disk_gib, req.gpus
+                    "cpu={}, mem={}MiB, rootfs={}GiB, data={}GiB, gpus={}",
+                    req.cpu, req.memory_mib, req.rootfs_gib, req.data_gib, req.gpus
                 ))
             },
         );
@@ -373,13 +384,34 @@ mod tests {
     /// below exercise ratios > 1.0.
     const STRICT: f32 = 1.0;
 
+    /// Single-pool helper: tests that don't care about the rootfs/data
+    /// split treat `disk` as combined capacity, which the helper bills
+    /// 50/50 to each pool. Tests that exercise per-pool exhaustion use
+    /// [`make_host_pools`] directly.
     fn make_host(id: &str, cpu: i64, mem: i64, disk: i64, gpus: &[GpuInfo]) -> HostRow {
+        let half = (disk / 2) * GIB;
+        make_host_pools(id, cpu, mem, half, half, gpus)
+    }
+
+    fn make_host_pools(
+        id: &str,
+        cpu: i64,
+        mem: i64,
+        rootfs_bytes: i64,
+        data_bytes: i64,
+        gpus: &[GpuInfo],
+    ) -> HostRow {
         HostRow {
             id: id.to_string(),
             hostname: format!("{id}.local"),
             total_cpu: cpu,
             total_memory_mib: mem,
-            total_disk_gib: disk,
+            rootfs_total_bytes: rootfs_bytes,
+            rootfs_free_bytes: rootfs_bytes,
+            rootfs_metadata_total_bytes: 0,
+            rootfs_metadata_free_bytes: 0,
+            data_total_bytes: data_bytes,
+            data_free_bytes: data_bytes,
             gpu_inventory: gpus.to_vec(),
             vtep_address: format!("10.100.0.{id}"),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
@@ -416,7 +448,8 @@ mod tests {
             cluster_id: String::new(),
             cpu: 4,
             memory_mib: 8192,
-            disk_gib: 100,
+            rootfs_gib: 100,
+            data_gib: 0,
             gpus,
             min_group_size: min_group,
             placement: Placement::default(),
@@ -431,14 +464,27 @@ mod tests {
     }
 
     /// Summarize one host's consumed capacity — the shape
-    /// `Db::host_usage_snapshot` hands to `schedule`. `disk` here is
-    /// the total footprint (rootfs + extras); there's no separate
-    /// "extras" knob because the scheduler only ever looks at the sum.
+    /// `Db::host_usage_snapshot` hands to `schedule`. Rootfs and data
+    /// usage are tracked separately so the scheduler's per-pool
+    /// budgets stay honest.
     fn usage(cpu: i64, mem: i64, disk: i64, gpus: &[GpuInfo]) -> HostUsage {
+        // Default helper: assume the combined `disk` was rootfs-only.
+        // Tests that exercise data-pool consumption use `usage_pools`.
+        usage_pools(cpu, mem, disk, 0, gpus)
+    }
+
+    fn usage_pools(
+        cpu: i64,
+        mem: i64,
+        rootfs_gib: i64,
+        data_gib: i64,
+        gpus: &[GpuInfo],
+    ) -> HostUsage {
         HostUsage {
             used_cpu: cpu,
             used_memory_mib: mem,
-            used_disk_gib: disk,
+            used_rootfs_gib: rootfs_gib,
+            used_data_gib: data_gib,
             assigned_pci: gpus.iter().map(|g| g.pci_address.clone()).collect(),
             vms_by_cluster: HashMap::new(),
         }
@@ -481,7 +527,7 @@ mod tests {
         let req = ScheduleRequest {
             cpu: 8,
             memory_mib: 16384,
-            disk_gib: 100,
+            rootfs_gib: 100,
             ..basic_req(0, 0)
         };
         assert!(matches!(
@@ -522,7 +568,7 @@ mod tests {
         let req = ScheduleRequest {
             cpu: 1,
             memory_mib: 1024,
-            disk_gib: 10,
+            rootfs_gib: 10,
             ..basic_req(0, 0)
         };
         assert!(schedule(&[], &empty(), &req, STRICT).is_err());
@@ -549,31 +595,46 @@ mod tests {
         assert_eq!(host_id, "h2");
     }
 
-    /// A VM already on a host charges *total* disk — rootfs plus every
-    /// extra data disk — against free capacity. Without this, a
-    /// ceph-heavy VM with 1 TiB of extras looks like its 100 GiB rootfs
-    /// to the scheduler and the next placement silently oversubscribes
-    /// the thin pool into ENOSPC. The `HostUsage` rollup coming out
-    /// of `Db::host_usage_snapshot` already sums extras for us.
+    /// A request charges its rootfs against the rootfs pool budget
+    /// only. A host with plenty of data-pool space but a saturated
+    /// rootfs pool must be refused — the two pools are independent.
     #[test]
-    fn test_schedule_charges_extra_disks_against_host() {
-        // 500 GiB host, 400 GiB already in use (100 rootfs + 300 extras).
-        // A 150 GiB request must be rejected.
-        let hosts = vec![make_host("h1", 64, 262144, 500, &[])];
+    fn test_schedule_rejects_when_rootfs_pool_full() {
+        // 200 GiB rootfs, 800 GiB data. Existing VMs already used 150
+        // GiB rootfs. A 100-GiB-rootfs request must fail even though
+        // data pool is empty.
+        let hosts = vec![make_host_pools("h1", 64, 262144, 200 * GIB, 800 * GIB, &[])];
         let mut usage_by_host = HashMap::new();
-        usage_by_host.insert("h1".to_string(), usage(4, 8192, 400, &[]));
+        usage_by_host.insert("h1".to_string(), usage_pools(4, 8192, 150, 0, &[]));
         let req = ScheduleRequest {
-            disk_gib: 150,
+            rootfs_gib: 100,
             ..basic_req(0, 0)
         };
         assert!(schedule(&hosts, &usage_by_host, &req, STRICT).is_err());
     }
 
-    /// A request's extra disks count against the host just like the
-    /// rootfs does — `ScheduleRequest::from(CreateMachineRequest)`
-    /// collapses them into a single `disk_gib` total.
+    /// And the symmetric case: a rootfs-fits request whose data
+    /// disks blow past the data VG must be refused. Without this
+    /// split, an OSD VM with a 1 TiB extra disk could eat into the
+    /// rootfs pool — exactly what the two-pool design exists to
+    /// prevent.
     #[test]
-    fn test_schedule_request_sums_extra_disks() {
+    fn test_schedule_rejects_when_data_pool_full() {
+        let hosts = vec![make_host_pools("h1", 64, 262144, 200 * GIB, 800 * GIB, &[])];
+        let mut usage_by_host = HashMap::new();
+        usage_by_host.insert("h1".to_string(), usage_pools(4, 8192, 50, 700, &[]));
+        let req = ScheduleRequest {
+            rootfs_gib: 50,
+            data_gib: 200,
+            ..basic_req(0, 0)
+        };
+        assert!(schedule(&hosts, &usage_by_host, &req, STRICT).is_err());
+    }
+
+    /// A `CreateMachineRequest` lands its rootfs on `rootfs_gib` and
+    /// its extras on `data_gib` — never collapsed.
+    #[test]
+    fn test_schedule_request_splits_rootfs_and_data() {
         let req = CreateMachineRequest {
             cluster_id: "c".into(),
             name: "n".into(),
@@ -591,7 +652,8 @@ mod tests {
             placement: None,
         };
         let sched_req: ScheduleRequest = (&req).into();
-        assert_eq!(sched_req.disk_gib, 600);
+        assert_eq!(sched_req.rootfs_gib, 100);
+        assert_eq!(sched_req.data_gib, 500);
     }
 
     #[test]
@@ -745,7 +807,7 @@ mod tests {
         usage_by_host.insert("h1".to_string(), usage(16, 8192, 50, &[]));
         let req = ScheduleRequest {
             cpu: 16,
-            disk_gib: 50,
+            rootfs_gib: 50,
             ..basic_req(0, 0)
         };
         assert!(schedule(&hosts, &usage_by_host, &req, 1.0).is_err());
@@ -763,15 +825,16 @@ mod tests {
         let req = ScheduleRequest {
             cpu: 2,
             memory_mib: 1024,
-            disk_gib: 10,
+            rootfs_gib: 10,
             ..basic_req(0, 0)
         };
         assert!(schedule(&hosts, &usage_by_host, &req, 8.0).is_err());
 
-        // Same shape but disk over-subscribed: also refused regardless of CPU ratio.
-        let hosts = vec![make_host("h2", 16, 65536, 50, &[])];
+        // Same shape but rootfs pool over-subscribed: also refused
+        // regardless of CPU ratio.
+        let hosts = vec![make_host_pools("h2", 16, 65536, 50 * GIB, 0, &[])];
         let mut usage_by_host = HashMap::new();
-        usage_by_host.insert("h2".to_string(), usage(2, 2048, 50, &[]));
+        usage_by_host.insert("h2".to_string(), usage_pools(2, 2048, 50, 0, &[]));
         assert!(schedule(&hosts, &usage_by_host, &req, 8.0).is_err());
     }
 

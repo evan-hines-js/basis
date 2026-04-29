@@ -120,26 +120,31 @@ fn classify_cluster_vips(
     cluster: &ClusterRow,
     visibility: ApiserverVisibility,
     pool: &Pool,
-) -> (Vec<String>, Vec<String>) {
-    let mut cluster_vips: Vec<String> = Vec::with_capacity(2);
+    owner_host_id: &str,
+) -> (Vec<ClusterVip>, Vec<String>) {
+    let mut cluster_vips: Vec<ClusterVip> = Vec::with_capacity(2);
     let mut internal_cluster_vips: Vec<String> = Vec::with_capacity(2);
     if visibility == ApiserverVisibility::ApiserverPublic {
         if let Ok(vip) = cluster.control_plane_endpoint.parse::<std::net::Ipv4Addr>() {
-            let target = if pool.is_tree() {
-                &mut internal_cluster_vips
+            if pool.is_tree() {
+                internal_cluster_vips.push(format!("{vip}/32"));
             } else {
-                &mut cluster_vips
-            };
-            target.push(format!("{vip}/32"));
+                cluster_vips.push(ClusterVip {
+                    cidr: format!("{vip}/32"),
+                    owner_host_id: owner_host_id.to_string(),
+                });
+            }
         }
     }
     if !cluster.service_block_cidr.is_empty() {
-        let target = if pool.is_tree() {
-            &mut internal_cluster_vips
+        if pool.is_tree() {
+            internal_cluster_vips.push(cluster.service_block_cidr.clone());
         } else {
-            &mut cluster_vips
-        };
-        target.push(cluster.service_block_cidr.clone());
+            cluster_vips.push(ClusterVip {
+                cidr: cluster.service_block_cidr.clone(),
+                owner_host_id: owner_host_id.to_string(),
+            });
+        }
     }
     (cluster_vips, internal_cluster_vips)
 }
@@ -336,8 +341,14 @@ impl SharedCtx {
                         cluster.id, cluster.external_pool,
                     ))
                 })?;
+            // Sticky single-responder LAN-VIP owner. See
+            // `Db::elect_lan_vip_owner` for the election rule and why
+            // sticky-on-member-add is the fix for the worker-placement
+            // black-hole.
+            let carriers = self.db.list_active_carriers(&cluster.id).await?;
+            let owner_host_id = self.db.elect_lan_vip_owner(&cluster.id, &carriers).await?;
             let (cluster_vips, internal_cluster_vips) =
-                classify_cluster_vips(&cluster, visibility, pool);
+                classify_cluster_vips(&cluster, visibility, pool, &owner_host_id);
             cluster_states.push(ClusterState {
                 cluster_id: cluster.id.clone(),
                 vni: cluster.vni as u32,
@@ -389,14 +400,13 @@ impl SharedCtx {
             if !pool.is_tree() {
                 continue;
             }
-            let mut internal_cluster_vips: Vec<String> = Vec::with_capacity(2);
-            // For tree pools, both the apiserver VIP (when
-            // APISERVER_PUBLIC) and the LB Service block fan out so
-            // every host can route the cell-internal address into the
-            // cluster's bridge. APISERVER_PRIVATE puts the apiserver
-            // VIP at the last usable address in the cluster's tree
-            // CIDR — that's reachable via `gateway_ip` on the bridge,
-            // no separate `internal_cluster_vips` entry needed.
+            // Fan-out hosts share the same VIP classification as
+            // carrier hosts; only `cluster_vips` differs (always empty
+            // here — fan-out hosts don't proxy-ARP on the LAN). Reuse
+            // `classify_cluster_vips` with an empty owner so the tree-
+            // pool branch populates `internal_cluster_vips` exactly as
+            // the carrier branch would; the LAN list is forced empty
+            // because non-tree pools never reach this loop body.
             let visibility = ApiserverVisibility::try_from(cluster.apiserver_visibility as i32)
                 .map_err(|_| {
                     DbError::Malformed(format!(
@@ -404,14 +414,7 @@ impl SharedCtx {
                         cluster.id, cluster.apiserver_visibility,
                     ))
                 })?;
-            if visibility == ApiserverVisibility::ApiserverPublic {
-                if let Ok(vip) = cluster.control_plane_endpoint.parse::<std::net::Ipv4Addr>() {
-                    internal_cluster_vips.push(format!("{vip}/32"));
-                }
-            }
-            if !cluster.service_block_cidr.is_empty() {
-                internal_cluster_vips.push(cluster.service_block_cidr.clone());
-            }
+            let (_, internal_cluster_vips) = classify_cluster_vips(&cluster, visibility, pool, "");
             cluster_states.push(ClusterState {
                 cluster_id: cluster.id.clone(),
                 vni: cluster.vni as u32,
@@ -983,7 +986,6 @@ impl BasisApiService {
             .map_err(|e| PlaceError::Internal(db_status(e)))?;
 
         let extra_disk_gibs: Vec<u32> = req.extra_disks.iter().map(|d| d.size_gib).collect();
-        let extra_disk_total_gib: i64 = extra_disk_gibs.iter().map(|&g| g as i64).sum();
         let vm = VmRow {
             id: vm_id.to_string(),
             name: req.name.clone(),
@@ -994,7 +996,6 @@ impl BasisApiService {
             cpu: req.cpu as i64,
             memory_mib: req.memory_mib as i64,
             disk_gib: req.disk_gib as i64,
-            extra_disk_total_gib,
             extra_disk_gibs: serde_json::to_string(&extra_disk_gibs)
                 .expect("serializing Vec<u32> to JSON is infallible"),
             image: req.image.clone(),
@@ -1961,12 +1962,22 @@ impl BasisAgentService {
             }
         };
 
+        let capacity = register
+            .storage_capacity
+            .as_ref()
+            .map(crate::db::StorageCapacityBytes::from_proto)
+            .unwrap_or_default();
         let host = crate::db::HostRow {
             id: host_id.clone(),
             hostname: register.hostname.clone(),
             total_cpu: register.total_cpu as i64,
             total_memory_mib: register.total_memory_mib as i64,
-            total_disk_gib: register.total_disk_gib as i64,
+            rootfs_total_bytes: capacity.rootfs_total_bytes,
+            rootfs_free_bytes: capacity.rootfs_free_bytes,
+            rootfs_metadata_total_bytes: capacity.rootfs_metadata_total_bytes,
+            rootfs_metadata_free_bytes: capacity.rootfs_metadata_free_bytes,
+            data_total_bytes: capacity.data_total_bytes,
+            data_free_bytes: capacity.data_free_bytes,
             gpu_inventory,
             vtep_address: register.vtep_address.clone(),
             last_heartbeat: now_rfc3339(),
@@ -1991,13 +2002,20 @@ async fn handle_agent_message(
     msg: AgentMessage,
 ) -> anyhow::Result<()> {
     match msg.payload {
-        Some(agent_message::Payload::Heartbeat(_)) => {
+        Some(agent_message::Payload::Heartbeat(hb)) => {
             // Identity is the authenticated stream's host_id, never
             // anything in the message body — see HeartbeatRequest's
-            // proto comment.
+            // proto comment. The body carries a fresh per-pool
+            // capacity snapshot which becomes the scheduler's live
+            // budget input.
+            let capacity = hb
+                .storage_capacity
+                .as_ref()
+                .map(crate::db::StorageCapacityBytes::from_proto)
+                .unwrap_or_default();
             shared
                 .db
-                .update_host_heartbeat(host_id, &now_rfc3339())
+                .record_heartbeat(host_id, &now_rfc3339(), &capacity)
                 .await?;
         }
         Some(agent_message::Payload::VmState(report)) => {
@@ -2243,10 +2261,20 @@ mod tests {
     fn classify_lan_public_puts_everything_in_cluster_vips() {
         let cluster = cluster_with("cell-public", true, "192.168.0.16/28");
         let p = pool("cell-public", PoolScope::Lan);
-        let (lan, tree) = classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPublic, &p);
+        let (lan, tree) =
+            classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPublic, &p, "host-a");
         assert_eq!(
             lan,
-            vec!["10.100.0.10/32".to_string(), "192.168.0.16/28".to_string()]
+            vec![
+                ClusterVip {
+                    cidr: "10.100.0.10/32".to_string(),
+                    owner_host_id: "host-a".to_string(),
+                },
+                ClusterVip {
+                    cidr: "192.168.0.16/28".to_string(),
+                    owner_host_id: "host-a".to_string(),
+                }
+            ]
         );
         assert!(tree.is_empty());
     }
@@ -2258,8 +2286,12 @@ mod tests {
     fn classify_tree_private_routes_service_block_to_internal() {
         let cluster = cluster_with("cell-internal", false, "10.250.0.16/28");
         let p = pool("cell-internal", PoolScope::Tree);
-        let (lan, tree) =
-            classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPrivate, &p);
+        let (lan, tree) = classify_cluster_vips(
+            &cluster,
+            ApiserverVisibility::ApiserverPrivate,
+            &p,
+            "host-a",
+        );
         assert!(lan.is_empty());
         assert_eq!(tree, vec!["10.250.0.16/28".to_string()]);
     }
@@ -2272,8 +2304,12 @@ mod tests {
     fn classify_empty_service_block_emits_nothing() {
         let cluster = cluster_with("cell-public", false, "");
         let p = pool("cell-public", PoolScope::Lan);
-        let (lan, tree) =
-            classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPrivate, &p);
+        let (lan, tree) = classify_cluster_vips(
+            &cluster,
+            ApiserverVisibility::ApiserverPrivate,
+            &p,
+            "host-a",
+        );
         assert!(lan.is_empty());
         assert!(tree.is_empty());
     }
@@ -2286,7 +2322,8 @@ mod tests {
     fn classify_tree_public_routes_apiserver_vip_to_internal() {
         let cluster = cluster_with("cell-internal", true, "10.250.0.16/28");
         let p = pool("cell-internal", PoolScope::Tree);
-        let (lan, tree) = classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPublic, &p);
+        let (lan, tree) =
+            classify_cluster_vips(&cluster, ApiserverVisibility::ApiserverPublic, &p, "host-a");
         assert!(
             lan.is_empty(),
             "tree pool VIPs must never appear in `cluster_vips` (the LAN-routable list)",
@@ -2312,7 +2349,6 @@ mod tests {
             cpu: 4,
             memory_mib: 4096,
             disk_gib: 50,
-            extra_disk_total_gib: 0,
             extra_disk_gibs: "[]".to_string(),
             image: "ubuntu:22.04".to_string(),
             error_message: String::new(),

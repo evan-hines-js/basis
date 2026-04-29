@@ -65,6 +65,14 @@ impl NetworkManager {
         self.uplink.bridge_name()
     }
 
+    /// Direct handle to the cluster manager for control-plane plumbing
+    /// that lives outside the reconcile loop (e.g. seeding host_id at
+    /// registration). Reconcile work still goes through
+    /// [`Self::reconcile_clusters`].
+    pub fn cluster_mgr(&self) -> &ClusterManager {
+        &self.clusters
+    }
+
     /// Cluster-overlay inner MTU (uplink minus VXLAN overhead).
     /// Plumbed to cloud-init so the guest's primary NIC matches the
     /// bridge, avoiding silent drops on >MTU egress.

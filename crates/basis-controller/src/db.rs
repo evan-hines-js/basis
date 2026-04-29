@@ -126,13 +126,24 @@ impl Db {
     }
 
     async fn migrate(&self) -> Result<(), DbError> {
+        // Hosts carry per-pool storage capacity in bytes. Two pools by
+        // design: a thin pool for VM rootfs and a plain VG for raw data
+        // disks. `*_total_bytes` is fixed at provision, refreshed on
+        // every register; `*_free_bytes` is heartbeat-fresh and drives
+        // the scheduler's per-pool budgets. `metadata_*_bytes` apply
+        // only to the rootfs thin pool — the data VG reports zero.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS hosts (
                 id TEXT PRIMARY KEY,
                 hostname TEXT NOT NULL UNIQUE,
                 total_cpu INTEGER NOT NULL,
                 total_memory_mib INTEGER NOT NULL,
-                total_disk_gib INTEGER NOT NULL,
+                rootfs_total_bytes INTEGER NOT NULL DEFAULT 0,
+                rootfs_free_bytes INTEGER NOT NULL DEFAULT 0,
+                rootfs_metadata_total_bytes INTEGER NOT NULL DEFAULT 0,
+                rootfs_metadata_free_bytes INTEGER NOT NULL DEFAULT 0,
+                data_total_bytes INTEGER NOT NULL DEFAULT 0,
+                data_free_bytes INTEGER NOT NULL DEFAULT 0,
                 gpu_inventory TEXT NOT NULL DEFAULT '[]',
                 vtep_address TEXT NOT NULL DEFAULT '',
                 last_heartbeat TEXT NOT NULL,
@@ -225,6 +236,11 @@ impl Db {
         .execute(&self.writer)
         .await?;
 
+        // `disk_gib` is the rootfs LV size (rootfs thin pool). Data
+        // disks are tracked by the JSON `extra_disk_gibs` column —
+        // single source of truth, no denormalised per-row sum. The
+        // scheduler's capacity gate sums them per-host on the fly via
+        // `json_each(extra_disk_gibs)`.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS vms (
                 id TEXT PRIMARY KEY,
@@ -236,12 +252,32 @@ impl Db {
                 cpu INTEGER NOT NULL,
                 memory_mib INTEGER NOT NULL,
                 disk_gib INTEGER NOT NULL,
-                extra_disk_total_gib INTEGER NOT NULL DEFAULT 0,
                 extra_disk_gibs TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL,
                 error_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.writer)
+        .await?;
+
+        // Sticky LAN-VIP owner per cluster. The agent on `host_id` is
+        // the single LAN proxy-ARP responder for this cluster's
+        // `cluster_vips`; non-owner carriers install routes + BGP-
+        // advertise but skip proxy-ARP. Sticky: a new carrier joining
+        // does NOT displace the existing owner — re-election only
+        // fires when the recorded owner is no longer in
+        // `host_clusters` with state=ACTIVE. Without sticky, ownership
+        // would shift on UUID-sort ordering of carriers and the
+        // resulting owner-change reconcile black-holed LAN traffic to
+        // the apiserver VIP whenever a worker landed on a host whose
+        // host_id sorted lower than the existing carrier.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cluster_lan_vip_owner (
+                cluster_id TEXT PRIMARY KEY REFERENCES clusters(id) ON DELETE CASCADE,
+                host_id TEXT NOT NULL,
+                elected_at TEXT NOT NULL
             )",
         )
         .execute(&self.writer)
@@ -867,11 +903,63 @@ impl Db {
     /// acks before invoking this. The FK on host_clusters fires
     /// noisily if you skip that step, which is the desired behaviour.
     pub async fn delete_cluster(&self, id: &str) -> Result<(), DbError> {
+        // `cluster_lan_vip_owner` cascades via ON DELETE CASCADE.
         sqlx::query("DELETE FROM clusters WHERE id = ?")
             .bind(id)
             .execute(&self.writer)
             .await?;
         Ok(())
+    }
+
+    /// Resolve the sticky LAN-VIP owner for `cluster_id` against the
+    /// current carrier set: keep the recorded owner if still active,
+    /// else pick the lowest-id survivor and persist. Returns the
+    /// elected owner (empty string if `carriers` is empty — a fresh
+    /// cluster with no placement yet, in which case agents skip
+    /// proxy-ARP for every entry).
+    ///
+    /// Idempotent across concurrent `build_reconcile_command` runs:
+    /// every host computes the same election from the same input, so
+    /// the `INSERT OR REPLACE` is a no-op write when the owner hasn't
+    /// changed.
+    ///
+    /// Sticky on member-add (the bug fix): a worker placement adds a
+    /// carrier, but `prev` is still in `carriers`, so the recorded
+    /// owner stays. Re-election fires only when `prev` left
+    /// `host_clusters` — which is the correct trigger for ownership
+    /// transfer (drain the old owner first, then GARP from the new).
+    pub async fn elect_lan_vip_owner(
+        &self,
+        cluster_id: &str,
+        carriers: &[String],
+    ) -> Result<String, DbError> {
+        let prev: Option<String> =
+            sqlx::query_scalar("SELECT host_id FROM cluster_lan_vip_owner WHERE cluster_id = ?")
+                .bind(cluster_id)
+                .fetch_optional(&self.reader)
+                .await?;
+
+        if let Some(prev) = prev {
+            if carriers.iter().any(|h| h == &prev) {
+                return Ok(prev);
+            }
+        }
+
+        let new_owner = match carriers.first() {
+            Some(h) => h.clone(),
+            None => return Ok(String::new()),
+        };
+        let now = basis_common::time::now_rfc3339();
+        sqlx::query(
+            "INSERT OR REPLACE INTO cluster_lan_vip_owner
+             (cluster_id, host_id, elected_at) VALUES (?, ?, ?)",
+        )
+        .bind(cluster_id)
+        .bind(&new_owner)
+        .bind(&now)
+        .execute(&self.writer)
+        .await?;
+        Ok(new_owner)
     }
 
     pub async fn list_clusters(&self) -> Result<Vec<ClusterRow>, DbError> {
@@ -908,18 +996,60 @@ impl Db {
         Ok(rows.into_iter().map(|(h,)| h).collect())
     }
 
+    /// Host IDs with an ACTIVE host_clusters row for this cluster AND
+    /// a healthy host record, in deterministic order (lowest host_id
+    /// first). Drives controller-side LAN-VIP owner election: the
+    /// first entry is the host that owns proxy-ARP for the cluster's
+    /// `cluster_vips` on every other host's reconcile pass.
+    ///
+    /// Joining on `hosts.healthy = 1` makes ownership reactive to the
+    /// existing host health-check signal. Without the join, a hard-
+    /// crashed host whose `host_clusters` rows haven't been cleaned up
+    /// stays "elected" — the dead host doesn't proxy-ARP, no host
+    /// does, and LAN ingress to the cluster's VIPs black-holes until
+    /// the membership rows finally clear. Gating on healthy means the
+    /// next reconcile after the heartbeat watchdog flips `healthy=0`
+    /// re-elects to a live carrier.
+    ///
+    /// Stable identity → no ownership flap on reconciles that don't
+    /// change the carrier set; deterministic across controllers
+    /// (no random tiebreak) so a controller failover doesn't move
+    /// ownership either. PENDING_TEARDOWN carriers are excluded — they
+    /// shouldn't take ownership of anything they're about to release.
+    pub async fn list_active_carriers(&self, cluster_id: &str) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT hc.host_id FROM host_clusters hc
+             JOIN hosts h ON h.id = hc.host_id
+             WHERE hc.cluster_id = ? AND hc.state = 0 AND h.healthy = 1
+             ORDER BY hc.host_id ASC",
+        )
+        .bind(cluster_id)
+        .fetch_all(&self.reader)
+        .await?)
+    }
+
     // --- Hosts ---
 
     pub async fn upsert_host(&self, host: &HostRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO hosts (id, hostname, total_cpu, total_memory_mib, total_disk_gib,
-                gpu_inventory, vtep_address, last_heartbeat, healthy, rank, labels)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO hosts (
+                id, hostname, total_cpu, total_memory_mib,
+                rootfs_total_bytes, rootfs_free_bytes,
+                rootfs_metadata_total_bytes, rootfs_metadata_free_bytes,
+                data_total_bytes, data_free_bytes,
+                gpu_inventory, vtep_address, last_heartbeat, healthy, rank, labels
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 hostname = excluded.hostname,
                 total_cpu = excluded.total_cpu,
                 total_memory_mib = excluded.total_memory_mib,
-                total_disk_gib = excluded.total_disk_gib,
+                rootfs_total_bytes = excluded.rootfs_total_bytes,
+                rootfs_free_bytes = excluded.rootfs_free_bytes,
+                rootfs_metadata_total_bytes = excluded.rootfs_metadata_total_bytes,
+                rootfs_metadata_free_bytes = excluded.rootfs_metadata_free_bytes,
+                data_total_bytes = excluded.data_total_bytes,
+                data_free_bytes = excluded.data_free_bytes,
                 gpu_inventory = excluded.gpu_inventory,
                 vtep_address = excluded.vtep_address,
                 last_heartbeat = excluded.last_heartbeat,
@@ -931,7 +1061,12 @@ impl Db {
         .bind(&host.hostname)
         .bind(host.total_cpu)
         .bind(host.total_memory_mib)
-        .bind(host.total_disk_gib)
+        .bind(host.rootfs_total_bytes)
+        .bind(host.rootfs_free_bytes)
+        .bind(host.rootfs_metadata_total_bytes)
+        .bind(host.rootfs_metadata_free_bytes)
+        .bind(host.data_total_bytes)
+        .bind(host.data_free_bytes)
         .bind(
             serde_json::to_string(&host.gpu_inventory)
                 .expect("serializing Vec<GpuInfo> to JSON is infallible"),
@@ -946,6 +1081,45 @@ impl Db {
         )
         .execute(&self.writer)
         .await?;
+        Ok(())
+    }
+
+    /// Apply a fresh storage capacity snapshot from a heartbeat. One
+    /// call site so the column list lives in exactly one place. Also
+    /// flips `healthy=1` and stamps `last_heartbeat` — heartbeats
+    /// always carry capacity now, so collapsing the two updates avoids
+    /// a separate UPDATE round-trip per tick.
+    pub async fn record_heartbeat(
+        &self,
+        host_id: &str,
+        now: &str,
+        capacity: &StorageCapacityBytes,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE hosts SET
+                last_heartbeat = ?,
+                healthy = 1,
+                rootfs_total_bytes = ?,
+                rootfs_free_bytes = ?,
+                rootfs_metadata_total_bytes = ?,
+                rootfs_metadata_free_bytes = ?,
+                data_total_bytes = ?,
+                data_free_bytes = ?
+             WHERE id = ?",
+        )
+        .bind(now)
+        .bind(capacity.rootfs_total_bytes)
+        .bind(capacity.rootfs_free_bytes)
+        .bind(capacity.rootfs_metadata_total_bytes)
+        .bind(capacity.rootfs_metadata_free_bytes)
+        .bind(capacity.data_total_bytes)
+        .bind(capacity.data_free_bytes)
+        .bind(host_id)
+        .execute(&self.writer)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("host '{host_id}'")));
+        }
         Ok(())
     }
 
@@ -978,19 +1152,6 @@ impl Db {
         Ok(sqlx::query_as::<_, HostRow>("SELECT * FROM hosts")
             .fetch_all(&self.reader)
             .await?)
-    }
-
-    pub async fn update_host_heartbeat(&self, host_id: &str, now: &str) -> Result<(), DbError> {
-        let result = sqlx::query("UPDATE hosts SET last_heartbeat = ?, healthy = 1 WHERE id = ?")
-            .bind(now)
-            .bind(host_id)
-            .execute(&self.writer)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("host '{host_id}'")));
-        }
-        Ok(())
     }
 
     pub async fn mark_host_unhealthy(&self, host_id: &str) -> Result<(), DbError> {
@@ -1026,13 +1187,23 @@ impl Db {
     pub async fn insert_vm(&self, vm: &VmRow, gpus: &[GpuAssignment]) -> Result<(), DbError> {
         let mut tx = self.writer.begin().await?;
 
+        // Sum the new VM's data-disk footprint up front so the gate
+        // doesn't have to json_each the bound JSON literal — the
+        // host-side data total still uses json_each over `vms` to
+        // capture every existing VM's extras.
+        let data_gib_request: i64 = vm.extra_disks_sum_gib().map_err(|e| {
+            DbError::Malformed(format!("vm '{}': extra_disk_gibs unparseable: {e}", vm.id))
+        })?;
+        let rootfs_bytes_request: i64 = vm.disk_gib.saturating_mul(GIB);
+        let data_bytes_request: i64 = data_gib_request.saturating_mul(GIB);
+
         let affected = sqlx::query(
             "INSERT INTO vms (
                 id, name, cluster_id, host_id, ip_address, state,
-                cpu, memory_mib, disk_gib, extra_disk_total_gib,
+                cpu, memory_mib, disk_gib,
                 extra_disk_gibs, image, error_message,
                 created_at, updated_at)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              WHERE EXISTS (
                  SELECT 1 FROM hosts h
                  WHERE h.id = ? AND h.healthy = 1
@@ -1042,9 +1213,13 @@ impl Db {
                    AND h.total_memory_mib
                        - COALESCE((SELECT SUM(memory_mib) FROM vms
                                    WHERE host_id = h.id), 0) >= ?
-                   AND h.total_disk_gib
-                       - COALESCE((SELECT SUM(disk_gib + extra_disk_total_gib) FROM vms
-                                   WHERE host_id = h.id), 0) >= ?
+                   AND h.rootfs_total_bytes
+                       - COALESCE((SELECT SUM(disk_gib) FROM vms
+                                   WHERE host_id = h.id), 0) * ? >= ?
+                   AND h.data_total_bytes
+                       - COALESCE((SELECT SUM(je.value) FROM vms v,
+                                          json_each(v.extra_disk_gibs) je
+                                   WHERE v.host_id = h.id), 0) * ? >= ?
              )",
         )
         .bind(&vm.id)
@@ -1056,7 +1231,6 @@ impl Db {
         .bind(vm.cpu)
         .bind(vm.memory_mib)
         .bind(vm.disk_gib)
-        .bind(vm.extra_disk_total_gib)
         .bind(&vm.extra_disk_gibs)
         .bind(&vm.image)
         .bind(&vm.error_message)
@@ -1066,7 +1240,10 @@ impl Db {
         .bind(self.cpu_overcommit_ratio as f64)
         .bind(vm.cpu)
         .bind(vm.memory_mib)
-        .bind(vm.total_disk_gib())
+        .bind(GIB)
+        .bind(rootfs_bytes_request)
+        .bind(GIB)
+        .bind(data_bytes_request)
         .execute(&mut *tx)
         .await
         .map_err(|e| match e {
@@ -1191,25 +1368,34 @@ impl Db {
     pub async fn host_usage_snapshot(&self) -> Result<HashMap<String, HostUsage>, DbError> {
         let mut out: HashMap<String, HostUsage> = HashMap::new();
 
-        // Consumed cpu / mem / disk per host. COALESCE covers hosts with
-        // zero VMs by leaving them absent from this result; the caller
-        // fills in `HostUsage::default()` when a host isn't in the map.
-        let rows = sqlx::query_as::<_, (String, i64, i64, i64)>(
-            "SELECT host_id,
-                    COALESCE(SUM(cpu), 0),
-                    COALESCE(SUM(memory_mib), 0),
-                    COALESCE(SUM(disk_gib + extra_disk_total_gib), 0)
-             FROM vms GROUP BY host_id",
+        // Consumed cpu / mem / rootfs / data per host. The data column
+        // sums each VM's `extra_disk_gibs` JSON via `json_each` —
+        // single source of truth for per-disk sizes lives there.
+        // `LEFT JOIN` so a VM with no extras still contributes its
+        // rootfs to the rollup. COALESCE covers hosts with zero VMs
+        // by leaving them absent; the caller fills in
+        // `HostUsage::default()` when a host isn't in the map.
+        let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+            "SELECT v.host_id,
+                    COALESCE(SUM(v.cpu), 0),
+                    COALESCE(SUM(v.memory_mib), 0),
+                    COALESCE(SUM(v.disk_gib), 0),
+                    COALESCE((SELECT SUM(je.value)
+                              FROM vms v2, json_each(v2.extra_disk_gibs) je
+                              WHERE v2.host_id = v.host_id), 0)
+             FROM vms v
+             GROUP BY v.host_id",
         )
         .fetch_all(&self.reader)
         .await?;
-        for (host_id, cpu, mem, disk) in rows {
+        for (host_id, cpu, mem, rootfs_gib, data_gib) in rows {
             out.insert(
                 host_id,
                 HostUsage {
                     used_cpu: cpu,
                     used_memory_mib: mem,
-                    used_disk_gib: disk,
+                    used_rootfs_gib: rootfs_gib,
+                    used_data_gib: data_gib,
                     assigned_pci: HashSet::new(),
                     vms_by_cluster: HashMap::new(),
                 },
@@ -1522,13 +1708,56 @@ impl ClusterNetwork {
     }
 }
 
+/// Bytes everywhere — the GiB conversion happens at scheduler /
+/// metrics consumption sites, never in storage. `metadata_*` apply
+/// only to the rootfs thin pool; the data VG reports zero.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StorageCapacityBytes {
+    pub rootfs_total_bytes: i64,
+    pub rootfs_free_bytes: i64,
+    pub rootfs_metadata_total_bytes: i64,
+    pub rootfs_metadata_free_bytes: i64,
+    pub data_total_bytes: i64,
+    pub data_free_bytes: i64,
+}
+
+impl StorageCapacityBytes {
+    /// Build from the agent-side proto. Single boundary conversion;
+    /// callers don't need to know the field shape on either side.
+    pub fn from_proto(c: &basis_proto::StorageCapacity) -> Self {
+        let rootfs = c.rootfs.as_ref();
+        let data = c.data.as_ref();
+        Self {
+            rootfs_total_bytes: rootfs.map(|p| p.total_bytes as i64).unwrap_or(0),
+            rootfs_free_bytes: rootfs.map(|p| p.free_bytes as i64).unwrap_or(0),
+            rootfs_metadata_total_bytes: rootfs.map(|p| p.metadata_total_bytes as i64).unwrap_or(0),
+            rootfs_metadata_free_bytes: rootfs.map(|p| p.metadata_free_bytes as i64).unwrap_or(0),
+            data_total_bytes: data.map(|p| p.total_bytes as i64).unwrap_or(0),
+            data_free_bytes: data.map(|p| p.free_bytes as i64).unwrap_or(0),
+        }
+    }
+}
+
+/// One gibibyte in bytes. Used wherever the agent reports bytes but
+/// the scheduler / VM accounting works in GiB.
+pub const GIB: i64 = 1 << 30;
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct HostRow {
     pub id: String,
     pub hostname: String,
     pub total_cpu: i64,
     pub total_memory_mib: i64,
-    pub total_disk_gib: i64,
+    /// Rootfs thin pool capacity (bytes). `_total_*` is set on
+    /// register; `_free_*` is heartbeat-fresh. `metadata_*` is the
+    /// thin pool's separate metadata extent.
+    pub rootfs_total_bytes: i64,
+    pub rootfs_free_bytes: i64,
+    pub rootfs_metadata_total_bytes: i64,
+    pub rootfs_metadata_free_bytes: i64,
+    /// Data VG capacity (bytes). Plain VG, no thin metadata.
+    pub data_total_bytes: i64,
+    pub data_free_bytes: i64,
     #[sqlx(json)]
     pub gpu_inventory: Vec<GpuInfo>,
     /// IP address the agent uses as the VXLAN src for outgoing tunneled
@@ -1564,17 +1793,13 @@ pub struct VmRow {
     pub state: i64,
     pub cpu: i64,
     pub memory_mib: i64,
+    /// Rootfs LV size in GiB. The data-disk footprint is the sum of
+    /// [`Self::extra_disk_gibs`].
     pub disk_gib: i64,
-    /// Sum of `extra_disk_gibs`. Denormalized from the JSON blob so the
-    /// capacity-gate SQL in `insert_vm` can `SUM(disk_gib +
-    /// extra_disk_total_gib)` without a `json_each` call per row.
-    /// `insert_vm` is the only writer; the two stay in sync by
-    /// construction.
-    pub extra_disk_total_gib: i64,
-    /// Per-extra-disk sizes, JSON-encoded `Vec<u32>` of gibibytes. The
-    /// authoritative per-disk breakdown the agent consumes on reconcile
-    /// to decide how many LVs to carve; `extra_disk_total_gib` is its
-    /// sum.
+    /// Per-extra-disk sizes, JSON-encoded `Vec<u32>` of gibibytes.
+    /// Authoritative source of per-disk breakdown; the host-usage
+    /// rollup sums via `json_each` so there's no denormalised total
+    /// to drift from this.
     pub extra_disk_gibs: String,
     pub image: String,
     pub error_message: String,
@@ -1583,12 +1808,14 @@ pub struct VmRow {
 }
 
 impl VmRow {
-    pub fn total_disk_gib(&self) -> i64 {
-        self.disk_gib + self.extra_disk_total_gib
-    }
-
     pub fn extra_disks(&self) -> serde_json::Result<Vec<u32>> {
         serde_json::from_str(&self.extra_disk_gibs)
+    }
+
+    /// Sum of [`Self::extra_disk_gibs`], in GiB. Computed on demand;
+    /// no DB column duplicates this.
+    pub fn extra_disks_sum_gib(&self) -> serde_json::Result<i64> {
+        Ok(self.extra_disks()?.into_iter().map(|g| g as i64).sum())
     }
 }
 
@@ -1637,11 +1864,17 @@ impl GpuAssignment {
 /// Snapshot of one host's in-use capacity, derived from `vms` + `vm_gpus`.
 /// This is all the scheduler needs — it never sees raw `VmRow`s, and
 /// never parses a GPU JSON blob (because there isn't one).
+///
+/// Disk usage is split per-pool: rootfs LVs contribute to
+/// `used_rootfs_gib`, data disks contribute to `used_data_gib`. The
+/// scheduler charges each request against the matching pool — a
+/// rootfs-only VM can't use up data-pool capacity and vice versa.
 #[derive(Debug, Clone, Default)]
 pub struct HostUsage {
     pub used_cpu: i64,
     pub used_memory_mib: i64,
-    pub used_disk_gib: i64,
+    pub used_rootfs_gib: i64,
+    pub used_data_gib: i64,
     pub assigned_pci: HashSet<String>,
     /// Number of VMs from each cluster currently on this host. Drives
     /// soft anti-affinity in the scheduler so a cluster's VMs spread
@@ -1878,7 +2111,12 @@ mod tests {
             hostname: hostname.to_string(),
             total_cpu: 16,
             total_memory_mib: 65536,
-            total_disk_gib: 1000,
+            rootfs_total_bytes: 200 * GIB,
+            rootfs_free_bytes: 200 * GIB,
+            rootfs_metadata_total_bytes: 0,
+            rootfs_metadata_free_bytes: 0,
+            data_total_bytes: 800 * GIB,
+            data_free_bytes: 800 * GIB,
             gpu_inventory: Vec::new(),
             vtep_address: format!("10.100.0.{}", id.bytes().last().unwrap_or(b'1')),
             last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
@@ -1918,7 +2156,6 @@ mod tests {
             cpu: 4,
             memory_mib: 8192,
             disk_gib: 100,
-            extra_disk_total_gib: 0,
             extra_disk_gibs: "[]".to_string(),
             image: "test:latest".to_string(),
             error_message: String::new(),
@@ -2395,19 +2632,157 @@ mod tests {
         v1.cpu = 4;
         v1.memory_mib = 8192;
         v1.disk_gib = 100;
-        v1.extra_disk_total_gib = 50;
+        v1.extra_disk_gibs = "[30, 20]".to_string();
         db.insert_vm(&v1, &[]).await.unwrap();
 
         let snapshot = db.host_usage_snapshot().await.unwrap();
         let u = snapshot.get("h1").expect("host in snapshot");
         assert_eq!(u.used_cpu, 4);
         assert_eq!(u.used_memory_mib, 8192);
-        assert_eq!(u.used_disk_gib, 150, "disk usage = rootfs + extras");
+        assert_eq!(u.used_rootfs_gib, 100, "rootfs usage = vms.disk_gib only");
+        assert_eq!(
+            u.used_data_gib, 50,
+            "data usage = sum of extras (json_each over extra_disk_gibs)"
+        );
         assert!(u.assigned_pci.is_empty());
         assert_eq!(
             u.vms_by_cluster.get("c1").copied(),
             Some(1),
             "per-cluster VM count populated from vms.cluster_id"
         );
+    }
+
+    /// Bring up a fresh DB with two healthy hosts and one cluster ready
+    /// for `ensure_host_cluster_active`. Common preamble for the LAN-VIP
+    /// election tests below.
+    async fn lan_vip_owner_setup() -> (Db, ClusterRow) {
+        let db = test_db().await;
+        let net = make_net_config();
+        let mut h1 = make_host("h1", "node-1");
+        h1.vtep_address = "10.100.0.1".to_string();
+        db.upsert_host(&h1).await.unwrap();
+        let mut h2 = make_host("h2", "node-2");
+        h2.vtep_address = "10.100.0.2".to_string();
+        db.upsert_host(&h2).await.unwrap();
+        let n = db.allocate_cluster_network(&net).await.unwrap();
+        let cluster = make_cluster("c1", "c1", n, "10.100.0.1");
+        db.insert_cluster(&cluster).await.unwrap();
+        (db, cluster)
+    }
+
+    /// First election picks the lowest-id carrier and persists. The
+    /// second carrier joining does NOT displace — sticky behaviour
+    /// is the whole point of the election rule.
+    #[tokio::test]
+    async fn elect_lan_vip_owner_is_sticky_on_member_add() {
+        let (db, cluster) = lan_vip_owner_setup().await;
+
+        db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
+        let carriers = db.list_active_carriers(&cluster.id).await.unwrap();
+        let owner1 = db
+            .elect_lan_vip_owner(&cluster.id, &carriers)
+            .await
+            .unwrap();
+        assert_eq!(owner1, "h1");
+
+        // Second carrier joins. Ownership must NOT flip — h1 is still
+        // active and the recorded owner.
+        db.ensure_host_cluster_active(&cluster, "h2").await.unwrap();
+        let carriers = db.list_active_carriers(&cluster.id).await.unwrap();
+        let owner2 = db
+            .elect_lan_vip_owner(&cluster.id, &carriers)
+            .await
+            .unwrap();
+        assert_eq!(owner2, "h1", "sticky: member-add must not displace owner");
+    }
+
+    /// When the recorded owner leaves the carrier set, election picks a
+    /// surviving carrier and persists. This is the only path that
+    /// changes ownership.
+    #[tokio::test]
+    async fn elect_lan_vip_owner_re_elects_when_owner_leaves() {
+        let (db, cluster) = lan_vip_owner_setup().await;
+
+        db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
+        db.ensure_host_cluster_active(&cluster, "h2").await.unwrap();
+        let carriers = db.list_active_carriers(&cluster.id).await.unwrap();
+        assert_eq!(
+            db.elect_lan_vip_owner(&cluster.id, &carriers)
+                .await
+                .unwrap(),
+            "h1"
+        );
+
+        // h1 transitions to PENDING_TEARDOWN — drops out of the active
+        // carrier set. Re-election must pick the survivor.
+        db.mark_host_cluster_pending_teardown(&cluster.id, "h1")
+            .await
+            .unwrap();
+        let carriers = db.list_active_carriers(&cluster.id).await.unwrap();
+        assert_eq!(
+            db.elect_lan_vip_owner(&cluster.id, &carriers)
+                .await
+                .unwrap(),
+            "h2",
+            "owner left → re-elect to surviving carrier"
+        );
+    }
+
+    /// `list_active_carriers` joins on `hosts.healthy = 1`. A carrier
+    /// whose host went unhealthy must NOT win or retain ownership —
+    /// otherwise nobody answers ARP for the cluster's LAN VIPs and
+    /// LAN ingress black-holes until membership rows clear.
+    #[tokio::test]
+    async fn elect_lan_vip_owner_skips_unhealthy_carrier() {
+        let (db, cluster) = lan_vip_owner_setup().await;
+
+        db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
+        db.ensure_host_cluster_active(&cluster, "h2").await.unwrap();
+
+        // Owner h1 is elected first.
+        let carriers = db.list_active_carriers(&cluster.id).await.unwrap();
+        assert_eq!(
+            db.elect_lan_vip_owner(&cluster.id, &carriers)
+                .await
+                .unwrap(),
+            "h1"
+        );
+
+        // h1 goes unhealthy (heartbeat watchdog flips the bit). The
+        // join in `list_active_carriers` excludes h1; election re-runs
+        // because the recorded owner is no longer in the carrier set.
+        sqlx::query("UPDATE hosts SET healthy = 0 WHERE id = ?")
+            .bind("h1")
+            .execute(&db.writer)
+            .await
+            .unwrap();
+        let carriers = db.list_active_carriers(&cluster.id).await.unwrap();
+        assert_eq!(
+            carriers,
+            vec!["h2".to_string()],
+            "unhealthy carrier excluded from list"
+        );
+        assert_eq!(
+            db.elect_lan_vip_owner(&cluster.id, &carriers)
+                .await
+                .unwrap(),
+            "h2",
+            "election re-runs to surviving healthy carrier"
+        );
+    }
+
+    /// No carriers at all → empty owner string. Agents skip proxy-ARP
+    /// for every entry; routes still install. This is the cold-start
+    /// shape between cluster create and first placement.
+    #[tokio::test]
+    async fn elect_lan_vip_owner_no_carriers_returns_empty() {
+        let (db, cluster) = lan_vip_owner_setup().await;
+        let carriers = db.list_active_carriers(&cluster.id).await.unwrap();
+        assert!(carriers.is_empty());
+        let owner = db
+            .elect_lan_vip_owner(&cluster.id, &carriers)
+            .await
+            .unwrap();
+        assert_eq!(owner, "");
     }
 }

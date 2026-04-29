@@ -12,6 +12,15 @@ basis_lvm_devices:
   - /dev/sdd
   - /dev/sde
 
+# basis-data VG: e2e backed by a 120G sparse loopback on the OS root
+# (sda). The four SSDs above are the rootfs thin pool; sdf/sdg are
+# untouched and reserved for other PVE workloads. Sparse loopback
+# tracks actual bluestore writes (near-zero in e2e). Production hosts
+# would list a dedicated NVMe / partition here instead.
+basis_lvm_data_devices:
+  - file: /var/lib/basis/basis-data.img
+    size: 120G
+
 # Network config (cluster_supernet, pools, default_external_service_ips)
 # lives in group_vars/all.yml — it's a cell-wide concern, not per-host.
 # Only override here for fields that genuinely vary across hosts in

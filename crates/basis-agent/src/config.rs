@@ -11,6 +11,9 @@
 //!   network:
 //!     bridge: basis0        # Linux bridge that masters `physicalNic`
 //!     physicalNic: eno1     # physical NIC carrying VXLAN underlay traffic
+//!   storage:
+//!     rootfs: { vg: basis, thinPool: pool }   # thin pool for VM rootfs
+//!     data:   { vg: basis-data }              # plain VG for raw data disks
 //!   tls: { ... }
 //! ```
 //!
@@ -37,6 +40,12 @@ pub struct HostSpec {
     pub controller_endpoint: String,
     pub data_dir: PathBuf,
     pub network: NetworkSpec,
+    /// LVM volume groups backing this host's VM disks. Two distinct
+    /// pools by design: a thin pool for VM rootfs (golden-image CoW
+    /// snapshots are exactly what thin was built for) and a plain VG
+    /// for raw data disks (linear LVs under bluestore — no thin layer
+    /// double-booking allocation, no shared blast radius with rootfs).
+    pub storage: StorageSpec,
     pub tls: TlsConfig,
 
     /// Credentials for private OCI registries the agent pulls VM images
@@ -87,6 +96,40 @@ pub struct RegistryCredentials {
     pub host: String,
     pub username: String,
     pub password: String,
+}
+
+/// LVM layout this agent expects on the host.
+///
+/// Two pools, each provisioned by the basis-prereqs ansible role on
+/// distinct partitions / NVMes:
+///   * `rootfs` — thin pool. VM rootfs LVs are CoW snapshots of a
+///     golden image LV. Sub-second create. Tolerates overcommit (rare
+///     but possible across an image's free space).
+///   * `data`   — plain VG. Each requested data disk is a linear LV
+///     of the requested size, fully allocated. No CoW under bluestore;
+///     guest TRIM reaches the underlying NVMe through dm-linear with
+///     no metadata indirection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageSpec {
+    pub rootfs: RootfsSpec,
+    pub data: DataSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootfsSpec {
+    /// Volume group containing the rootfs thin pool.
+    pub vg: String,
+    /// Thin pool LV name within `vg`.
+    pub thin_pool: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataSpec {
+    /// Volume group hosting linear LVs for VM data disks.
+    pub vg: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -143,6 +186,12 @@ spec:
   network:
     bridge: basis0
     physicalNic: eno1
+  storage:
+    rootfs:
+      vg: basis
+      thinPool: pool
+    data:
+      vg: basis-data
   tls:
     cert: /etc/basis/tls/agent.crt
     key: /etc/basis/tls/agent.key
@@ -153,6 +202,9 @@ spec:
         assert_eq!(host.metadata.name, "node-1");
         assert_eq!(host.spec.network.bridge, "basis0");
         assert_eq!(host.spec.network.physical_nic, "eno1");
+        assert_eq!(host.spec.storage.rootfs.vg, "basis");
+        assert_eq!(host.spec.storage.rootfs.thin_pool, "pool");
+        assert_eq!(host.spec.storage.data.vg, "basis-data");
     }
 
     #[test]

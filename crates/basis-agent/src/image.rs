@@ -33,7 +33,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::lvm;
+use crate::lvm::{self, Storage};
 
 /// TCP-level connect deadline to the registry. Default is the OS
 /// setting (~75s of SYN retries on Linux) which is far too long for a
@@ -258,11 +258,15 @@ impl ImageManager {
 
     /// Ensure the kernel, initrd, and golden rootfs LV for `image_ref`
     /// are ready locally. Pulls missing layers, decompresses the qcow2,
-    /// and converts it once into a raw thin LV at `/dev/basis/image-<hash>`
-    /// that per-VM snapshots branch from. Concurrent callers for the
-    /// same `image_ref` serialize on a per-ref lock so only one
-    /// pull+convert runs.
-    pub async fn ensure_cached(&self, image_ref: &str) -> Result<CachedImage, ImageError> {
+    /// and converts it once into a raw thin LV in the rootfs VG that
+    /// per-VM snapshots branch from. Concurrent callers for the same
+    /// `image_ref` serialize on a per-ref lock so only one pull+convert
+    /// runs.
+    pub async fn ensure_cached(
+        &self,
+        image_ref: &str,
+        storage: &Storage,
+    ) -> Result<CachedImage, ImageError> {
         let prefix = image_ref_to_prefix(image_ref);
         let rootfs = self.images_dir.join(format!("{prefix}.qcow2"));
         let kernel = self.images_dir.join(format!("{prefix}.vmlinuz"));
@@ -274,7 +278,7 @@ impl ImageManager {
         if rootfs.exists()
             && kernel.exists()
             && initrd.exists()
-            && lvm::image_lv_path(&prefix).exists()
+            && storage.image_lv_path(&prefix).exists()
         {
             // qemu-img info is local file I/O + JSON parse, sub-100ms
             // on a populated qcow2 — cheap enough to call on every
@@ -309,7 +313,9 @@ impl ImageManager {
         // Convert qcow2 → raw into a golden thin LV. Idempotent: if the
         // LV is already populated (marked RO), this is a no-op.
         let virtual_size_gib = qcow2_virtual_size_gib(&rootfs).await?;
-        lvm::ensure_image_lv(&prefix, &rootfs, virtual_size_gib).await?;
+        storage
+            .ensure_image_lv(&prefix, &rootfs, virtual_size_gib)
+            .await?;
 
         Ok(CachedImage {
             image_hash: prefix,

@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
 use crate::image::{GuestNetwork, ImageManager};
-use crate::lvm;
+use crate::lvm::Storage;
 use crate::metrics::Metrics;
 use crate::network::NetworkManager;
 use crate::vm;
@@ -40,10 +40,11 @@ pub async fn create_vm(
     vm_mgr: &Arc<VmManager>,
     net_mgr: &NetworkManager,
     agent_db: &AgentDb,
+    storage: &Storage,
     metrics: &Metrics,
 ) -> anyhow::Result<()> {
     vm_mgr.mark_pending(&cmd.vm_id).await;
-    let result = create_vm_inner(cmd, image_mgr, vm_mgr, net_mgr, agent_db, metrics).await;
+    let result = create_vm_inner(cmd, image_mgr, vm_mgr, net_mgr, agent_db, storage, metrics).await;
     vm_mgr.clear_pending(&cmd.vm_id).await;
 
     match result {
@@ -57,7 +58,7 @@ pub async fn create_vm(
                 error = %e,
                 "create_vm failed; rolling back partial state"
             );
-            let _ = delete_vm(&cmd.vm_id, vm_mgr, net_mgr, agent_db).await;
+            let _ = delete_vm(&cmd.vm_id, vm_mgr, net_mgr, agent_db, storage).await;
             Err(e)
         }
     }
@@ -69,13 +70,14 @@ async fn create_vm_inner(
     vm_mgr: &Arc<VmManager>,
     net_mgr: &NetworkManager,
     agent_db: &AgentDb,
+    storage: &Storage,
     metrics: &Metrics,
 ) -> anyhow::Result<()> {
     let vm_dir = vm_mgr.vms_dir.join(&cmd.vm_id);
     std::fs::create_dir_all(&vm_dir)?;
 
     let started = Instant::now();
-    let base = image_mgr.ensure_cached(&cmd.image).await?;
+    let base = image_mgr.ensure_cached(&cmd.image, storage).await?;
     metrics
         .image_ensure_cached_seconds
         .observe(started.elapsed().as_secs_f64());
@@ -121,7 +123,9 @@ async fn create_vm_inner(
         .await?;
 
     let started = Instant::now();
-    let rootfs_path = lvm::create_vm_lv(&cmd.vm_id, &base.image_hash, cmd.disk_gib as u64).await?;
+    let rootfs_path = storage
+        .create_vm_lv(&cmd.vm_id, &base.image_hash, cmd.disk_gib as u64)
+        .await?;
     metrics
         .lv_snapshot_seconds
         .observe(started.elapsed().as_secs_f64());
@@ -129,7 +133,9 @@ async fn create_vm_inner(
     let started = Instant::now();
     let mut data_disk_paths = Vec::with_capacity(cmd.extra_disks.len());
     for (index, disk) in cmd.extra_disks.iter().enumerate() {
-        let path = lvm::create_data_disk_lv(&cmd.vm_id, index as u32, disk.size_gib as u64).await?;
+        let path = storage
+            .create_data_disk_lv(&cmd.vm_id, index as u32, disk.size_gib as u64)
+            .await?;
         data_disk_paths.push(path);
     }
     metrics
@@ -207,6 +213,7 @@ pub async fn delete_vm(
     vm_mgr: &Arc<VmManager>,
     net_mgr: &NetworkManager,
     agent_db: &AgentDb,
+    storage: &Storage,
 ) -> anyhow::Result<()> {
     // Read the record first so we still have the GPU PCI list after
     // the row is gone.
@@ -239,11 +246,11 @@ pub async fn delete_vm(
     }
     // lvremove comes last: cloud-hypervisor holds its LVs exclusively
     // until its process exits.
-    lvm::remove_vm_lv(vm_id).await.map_err(|e| {
+    storage.remove_vm_lv(vm_id).await.map_err(|e| {
         warn!(vm_id, error = %e, "VM delete failed at lvremove; caller will retry");
         anyhow::Error::from(e)
     })?;
-    lvm::remove_vm_data_disks(vm_id).await.map_err(|e| {
+    storage.remove_vm_data_disks(vm_id).await.map_err(|e| {
         warn!(vm_id, error = %e, "VM delete failed removing data disks; caller will retry");
         anyhow::Error::from(e)
     })?;

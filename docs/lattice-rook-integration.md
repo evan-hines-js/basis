@@ -79,49 +79,93 @@ sizes in its local DB and reattaches at the same index. Rook addresses
 disks by `by-id` / WWN internally, so this is belt-and-suspenders — but
 code that hard-codes `/dev/vdc` is safe.
 
+### Two-pool host layout
+
+Basis hosts run two LVM volume groups, each fit-to-purpose:
+
+| VG | Backend | Purpose |
+| --- | --- | --- |
+| `basis` (default name) | thin pool `basis/pool` | VM rootfs LVs (`vm-<vm_id>`), CoW snapshots of golden images |
+| `basis-data` (default name) | plain VG, linear LVs | every requested data disk (`vmdata-<vm_id>-<N>`) |
+
+The split is the right shape for OSDs. `bluestore` on `dm-thin`
+double-books allocation; `bluestore` on `dm-linear` is a one-table
+pass-through. Pool exhaustion in `basis-data` is bounded — no shared
+blast radius with rootfs.
+
+Pool names are operator-configurable in `host.yaml`:
+
+```yaml
+storage:
+  rootfs:
+    vg: basis
+    thinPool: pool
+  data:
+    vg: basis-data
+```
+
+The basis-prereqs ansible role provisions both VGs at host install on
+distinct partitions (or NVMes). Recommended split for a single-disk
+host: rootfs pool ≈ `30 GiB × max-VMs-per-host + 30%` headroom; data
+VG = the rest.
+
 ### Per-data-disk tuning (already set by Basis)
 
 Each extra disk is attached with:
 
 ```
-path=/dev/basis/vmdata-<vm_id>-<N>,image_type=raw,direct=on,num_queues=<vcpus>,queue_size=256
+path=/dev/basis-data/vmdata-<vm_id>-<N>,image_type=raw,direct=on,discard=unmap,num_queues=<vcpus>,queue_size=256
 ```
 
-- `direct=on` — O_DIRECT; ceph bluestore fsync durability isn't defeated by the host page cache.
-- `num_queues=<vcpus>` — virtio-blk parallelism.
+- `direct=on` — O_DIRECT on the host; ceph bluestore fsync durability isn't defeated by the host page cache.
+- `discard=unmap` — guest `blkdiscard` / `fstrim` reaches the underlying NVMe through dm-linear (no metadata indirection). Ceph OSD compaction reclaims physical blocks immediately.
+- `num_queues=<vcpus>` — virtio-blk parallelism scales with guest vCPU count.
 
-Guest TRIM propagates through cloud-hypervisor's default `sparse=on` (#7666) and then `issue_discards=1` in `/etc/lvm/lvm.conf` so ceph OSD compaction returns extents to `basis/pool`. No extra per-disk flag is needed for this.
+Rootfs LVs use the same `direct=on` + `image_type=raw` plus
+`num_queues`/`queue_size`, but rely on the thin pool's `sparse=on`
+default for discard rather than `discard=unmap` (snapshots of golden
+images don't need an explicit unmap directive).
 
 ### Scheduler behaviour
 
-Basis charges **total disk footprint** (rootfs + sum of
-`extraDiskGibs`) against each host's free thin-pool capacity. A VM
-requesting `diskGib: 80` + `extraDiskGibs: [500]` needs 580 GiB free;
-placements that don't fit surface to CAPI as `ResourceExhausted` on the
-`BasisMachine`.
+Basis tracks **two independent budgets per host**: rootfs pool free
+bytes and data VG free bytes. `extraDiskGibs` charges only against the
+data VG; `diskGib` (rootfs) charges only against the thin pool. A VM
+with `diskGib: 80` + `extraDiskGibs: [500]` needs 80 GiB free in the
+host's rootfs thin pool *and* 500 GiB free in the host's data VG.
+Failure to fit either pool surfaces to CAPI as `ResourceExhausted` on
+the `BasisMachine`, with `cpu=…, mem=…MiB, rootfs=…GiB, data=…GiB`
+in the error message so operators can tell which pool ran out.
+
+Capacity is **heartbeat-fresh**, not registration-static: every agent
+heartbeat (default 30s) carries a `StorageCapacity` snapshot, and the
+scheduler reads from `hosts.{rootfs,data}_total_bytes` /
+`{rootfs,data}_free_bytes` updated on each tick.
 
 ### Lifecycle
 
-- **Create**: agent creates the rootfs LV, then loops `create_data_disk_lv` per extra.
-- **Delete**: agent removes the rootfs LV and every `vmdata-<vm_id>-*` LV belonging to this VM.
-- **Restart after host reboot**: agent reads `extra_disk_gibs` from local DB, re-resolves `vmdata-<vm_id>-N` paths, reattaches. Missing LV → fails with `DiskMissing`; CAPI sees FAILED and remediates. Strict by design: a silent reattach with a wrong disk would corrupt ceph's OSD metadata.
-- **Orphan sweep**: periodic; reclaims any `vm-<id>` or `vmdata-<id>-*` LV whose `vm_id` is no longer in the agent DB.
+- **Create**: agent creates the rootfs LV in the rootfs VG, then loops `create_data_disk_lv` per extra into the data VG.
+- **Delete**: agent removes the rootfs LV from the rootfs VG and every `vmdata-<vm_id>-*` LV from the data VG.
+- **Restart after host reboot**: agent reads `extra_disk_gibs` from local DB, re-resolves `vmdata-<vm_id>-N` paths in the data VG, reattaches. Missing LV → fails with `DiskMissing`; CAPI sees FAILED and remediates. Strict by design: a silent reattach with a wrong disk would corrupt ceph's OSD metadata.
+- **Orphan sweep**: periodic; walks both VGs. Reclaims any `vm-<id>` (rootfs VG) or `vmdata-<id>-*` (data VG) LV whose `vm_id` is no longer in the agent DB.
 
 ### What Basis does NOT do
 
 - Format, partition, mount, discover, claim, or manage the disks.
 - Expose a StorageClass.
-- Plan thin-pool capacity.
+- Plan thin-pool / data-VG capacity (operators size the partitions).
 
-All of that is Lattice's job.
+All of that is Lattice's (or the operator's) job.
 
 ### Reference material in the Basis repo
 
-- Proto: `basis/crates/basis-proto/proto/basis.proto` — `ExtraDisk`, `CreateMachineRequest.extra_disks`, `CreateVMCommand.extra_disks`, `Machine.extra_disks`.
+- Proto: `basis/crates/basis-proto/proto/basis.proto` — `ExtraDisk`, `CreateMachineRequest.extra_disks`, `CreateVMCommand.extra_disks`, `Machine.extra_disks`, `StorageCapacity`, `PoolBytes`.
 - CRD: `basis/crates/basis-capi-provider/src/crds.rs` — `BasisMachineSpec.extra_disk_gibs`.
-- Agent LVM: `basis/crates/basis-agent/src/lvm.rs` — `create_data_disk_lv`, `remove_vm_data_disks`, `list_managed_vm_ids`, `DATA_LV_PREFIX`.
-- Agent VM: `basis/crates/basis-agent/src/vm.rs` — `BootArtifacts.extra_disks`, `lv_disk_spec`.
-- Scheduler: `basis/crates/basis-controller/src/scheduler.rs` — `ScheduleRequest::from(&CreateMachineRequest)` sums extras; `VmRow::total_disk_gib()` in `basis-controller/src/db.rs`.
+- Agent storage: `basis/crates/basis-agent/src/lvm.rs` — `Storage` (per-host owner of both VGs), `Storage::create_data_disk_lv`, `Storage::remove_vm_data_disks`, `Storage::list_managed_vm_ids`, `LvmPermits` (per-VG mutation gate), `StorageCapacity`, `PoolBytes`.
+- Agent host config: `basis/crates/basis-agent/src/config.rs` — `StorageSpec`, `RootfsSpec`, `DataSpec`.
+- Agent VM: `basis/crates/basis-agent/src/vm.rs` — `BootArtifacts.extra_disks`, `DiskSpec` enum (Rootfs / Data / CloudInit, one Display path).
+- Scheduler: `basis/crates/basis-controller/src/scheduler.rs` — `ScheduleRequest { rootfs_gib, data_gib }`, `Available { rootfs_gib, data_gib }`, dual-budget `fits()`.
+- DB: `basis/crates/basis-controller/src/db.rs` — `HostRow.{rootfs,data}_{total,free}_bytes`, `HostUsage.{used_rootfs_gib, used_data_gib}`, `Db::record_heartbeat` (capacity update + heartbeat in one round-trip).
 
 ## Design: Rook is always-on, not a CRD
 

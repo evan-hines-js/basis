@@ -10,7 +10,7 @@ use basis_agent::gpu;
 use basis_agent::handlers;
 use basis_agent::host_info::HostResources;
 use basis_agent::image::ImageManager;
-use basis_agent::lvm;
+use basis_agent::lvm::{self, Storage, StorageCapacity};
 use basis_agent::metrics::{self, Metrics};
 use basis_agent::network::{probe_uplink, ClusterManager, NetworkManager, UplinkBridge};
 use basis_agent::reconcile;
@@ -36,8 +36,11 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-const POOL_CAPACITY_INTERVAL: Duration = Duration::from_secs(120);
-const POOL_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cadence of the agent's storage capacity refresh. The latest snapshot
+/// is shared with the heartbeat loop so the controller's per-pool
+/// scheduling budgets stay live, not registration-stale.
+const STORAGE_CAPACITY_INTERVAL: Duration = Duration::from_secs(120);
+const STORAGE_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const ORPHAN_SWEEP_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 const ORPHAN_SWEEP_BUSY_INTERVAL: Duration = Duration::from_secs(5);
@@ -57,6 +60,12 @@ struct AgentRuntime {
     image_mgr: Arc<ImageManager>,
     vm_mgr: Arc<VmManager>,
     net_mgr: Arc<NetworkManager>,
+    storage: Arc<Storage>,
+    /// Latest [`StorageCapacity`] from the agent's local lvm queries.
+    /// Refreshed on every [`STORAGE_CAPACITY_INTERVAL`] tick by
+    /// [`spawn_storage_capacity_loop`]; read by the heartbeat sender
+    /// so the controller's scheduling budgets are heartbeat-fresh.
+    storage_capacity: Arc<tokio::sync::RwLock<StorageCapacity>>,
     metrics: Arc<Metrics>,
     host_resources: HostResources,
     gpus: Vec<GpuInfo>,
@@ -126,7 +135,10 @@ async fn main() -> anyhow::Result<()> {
     // controller isn't involved in. Spawning these inside `run_session`
     // would leak one extra copy each time the controller stream
     // reconnects.
-    spawn_pool_capacity_loop();
+    {
+        let rt = runtime.read().await;
+        spawn_storage_capacity_loop(rt.storage.clone(), rt.storage_capacity.clone());
+    }
     spawn_orphan_sweep_loop(runtime.clone());
 
     loop {
@@ -182,13 +194,16 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     );
     let net_mgr = NetworkManager::new(uplink, clusters);
 
+    let storage = Arc::new(Storage::new(spec.storage.clone()));
+
     // Preflight everything in parallel. `try_join!` short-circuits on
     // the first failure.
-    let (pool_capacity, iso_tool, (), ()) = tokio::try_join!(
+    let (initial_capacity, iso_tool, (), ()) = tokio::try_join!(
         async {
-            lvm::validate_pool()
+            storage
+                .validate()
                 .await
-                .context("validating LVM thin pool (run basis-prereqs ansible role)")
+                .context("validating LVM layout (run basis-prereqs ansible role)")
         },
         async {
             basis_agent::image::validate_tools()
@@ -233,7 +248,8 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     let net_mgr = Arc::new(net_mgr);
 
     let report =
-        reconcile::reconcile_on_startup(&spec, &agent_db, &vm_mgr, &net_mgr, &image_mgr).await?;
+        reconcile::reconcile_on_startup(&spec, &agent_db, &vm_mgr, &net_mgr, &image_mgr, &storage)
+            .await?;
     info!(
         recovered = report.recovered,
         restarted = report.restarted,
@@ -243,7 +259,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         "reconciliation complete"
     );
 
-    let host_resources = HostResources::discover(pool_capacity.data_total_bytes);
+    let host_resources = HostResources::discover();
     let gpus = gpu::discover_gpus()
         .await
         .context("discovering GPUs (set RUST_LOG=basis=debug for driver details)")?;
@@ -251,7 +267,8 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         hostname = %hostname,
         cpu = host_resources.total_cpu,
         memory_mib = host_resources.total_memory_mib,
-        disk_gib = host_resources.total_disk_gib,
+        rootfs_total_gib = initial_capacity.rootfs.total / (1 << 30),
+        data_total_gib = initial_capacity.data.total / (1 << 30),
         gpus = gpus.len(),
         vtep = %probe.vtep_address,
         "discovered host resources"
@@ -267,6 +284,8 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         image_mgr,
         vm_mgr,
         net_mgr,
+        storage,
+        storage_capacity: Arc::new(tokio::sync::RwLock::new(initial_capacity)),
         metrics,
         host_resources,
         gpus,
@@ -385,7 +404,8 @@ async fn run_session(
     // reconciler both break on `ChannelClosed`). Agent-lifetime loops
     // (pool capacity, orphan sweep) are spawned once from `run` —
     // spawning them here would leak one per reconnect.
-    spawn_heartbeat_loop(msg_tx.clone());
+    let capacity = runtime.read().await.storage_capacity.clone();
+    spawn_heartbeat_loop(msg_tx.clone(), capacity);
     spawn_periodic_reconciler(msg_tx.clone(), runtime.clone());
 
     process_inbound(&mut inbound, runtime, msg_tx, reconnect).await
@@ -430,13 +450,15 @@ async fn send_register(
         }
     };
 
+    let storage_capacity = storage_capacity_to_proto(&*rt.storage_capacity.read().await);
+
     sender
         .send(AgentMessage {
             payload: Some(agent_message::Payload::Register(RegisterHostRequest {
                 hostname: rt.hostname.clone(),
                 total_cpu: rt.host_resources.total_cpu,
                 total_memory_mib: rt.host_resources.total_memory_mib,
-                total_disk_gib: rt.host_resources.total_disk_gib,
+                storage_capacity: Some(storage_capacity),
                 gpus: gpu_devices,
                 vtep_address: rt.vtep_address.clone(),
                 rank: rt.spec.rank,
@@ -446,6 +468,25 @@ async fn send_register(
         })
         .await?;
     Ok(())
+}
+
+/// Convert the agent's internal [`StorageCapacity`] to its proto form.
+/// One construction site so the field mapping doesn't drift between
+/// register, heartbeat, and any future capacity carriers.
+fn storage_capacity_to_proto(c: &StorageCapacity) -> basis_proto::StorageCapacity {
+    basis_proto::StorageCapacity {
+        rootfs: Some(pool_bytes_to_proto(&c.rootfs)),
+        data: Some(pool_bytes_to_proto(&c.data)),
+    }
+}
+
+fn pool_bytes_to_proto(p: &lvm::PoolBytes) -> basis_proto::PoolBytes {
+    basis_proto::PoolBytes {
+        total_bytes: p.total,
+        free_bytes: p.free,
+        metadata_total_bytes: p.metadata_total,
+        metadata_free_bytes: p.metadata_free,
+    }
 }
 
 async fn handshake(
@@ -475,6 +516,11 @@ async fn handshake(
     {
         let rt = runtime.read().await;
         rt.agent_db.set_host_id(&host_id).await?;
+        // Hand the host_id to the network manager BEFORE the first
+        // reconcile so LAN-VIP proxy-ARP gating sees a non-empty self
+        // identity. Empty would skip all proxy-ARP and the cell would
+        // black-hole LAN ingress until next reconcile.
+        rt.net_mgr.cluster_mgr().set_host_id(host_id.clone()).await;
         if let Some(initial) = initial {
             apply_reconcile(&rt, &initial, sender).await?;
         }
@@ -563,7 +609,7 @@ async fn apply_reconcile(
 
     let mut acked_vm_ids: Vec<String> = Vec::with_capacity(cmd.vm_tombstones.len());
     for vm_id in &cmd.vm_tombstones {
-        match handlers::delete_vm(vm_id, &rt.vm_mgr, &rt.net_mgr, &rt.agent_db).await {
+        match handlers::delete_vm(vm_id, &rt.vm_mgr, &rt.net_mgr, &rt.agent_db, &rt.storage).await {
             Ok(()) => acked_vm_ids.push(vm_id.clone()),
             Err(e) => warn!(
                 vm_id = %vm_id, error = %e,
@@ -590,11 +636,14 @@ async fn apply_reconcile(
     if let Some(speaker) = rt.bgp_speaker.as_ref() {
         let mut prefixes: Vec<ipnet::Ipv4Net> = Vec::new();
         for cluster in &cmd.clusters {
+            // Every carrier advertises every VIP via BGP regardless of
+            // proxy-ARP ownership — BGP is the inter-host route plane,
+            // proxy-ARP ownership is only the L2 LAN responder.
             for vip in &cluster.cluster_vips {
-                match vip.parse::<ipnet::Ipv4Net>() {
+                match vip.cidr.parse::<ipnet::Ipv4Net>() {
                     Ok(p) => prefixes.push(p),
                     Err(_) => warn!(
-                        vip = %vip, vni = cluster.vni,
+                        vip = %vip.cidr, vni = cluster.vni,
                         "BGP advertise: cluster_vip unparseable, skipping"
                     ),
                 }
@@ -607,13 +656,19 @@ async fn apply_reconcile(
     Ok(())
 }
 
-fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>) {
+fn spawn_heartbeat_loop(
+    sender: mpsc::Sender<AgentMessage>,
+    capacity: Arc<tokio::sync::RwLock<StorageCapacity>>,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
+            let snapshot = storage_capacity_to_proto(&*capacity.read().await);
             let msg = AgentMessage {
-                payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {})),
+                payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
+                    storage_capacity: Some(snapshot),
+                })),
             };
             if sender.send(msg).await.is_err() {
                 break;
@@ -622,23 +677,31 @@ fn spawn_heartbeat_loop(sender: mpsc::Sender<AgentMessage>) {
     });
 }
 
-fn spawn_pool_capacity_loop() {
+fn spawn_storage_capacity_loop(
+    storage: Arc<Storage>,
+    shared: Arc<tokio::sync::RwLock<StorageCapacity>>,
+) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(POOL_CAPACITY_INTERVAL);
+        let mut interval = tokio::time::interval(STORAGE_CAPACITY_INTERVAL);
         loop {
             interval.tick().await;
-            match tokio::time::timeout(POOL_CAPACITY_TIMEOUT, lvm::pool_capacity()).await {
-                Ok(Ok(c)) => info!(
-                    pool_data_free_gib = c.data_free_bytes / (1 << 30),
-                    pool_data_total_gib = c.data_total_bytes / (1 << 30),
-                    pool_metadata_free_mib = c.metadata_free_bytes / (1 << 20),
-                    pool_metadata_total_mib = c.metadata_total_bytes / (1 << 20),
-                    "thin pool capacity"
-                ),
-                Ok(Err(e)) => warn!(error = %e, "reading thin pool capacity"),
+            match tokio::time::timeout(STORAGE_CAPACITY_TIMEOUT, storage.capacity()).await {
+                Ok(Ok(c)) => {
+                    info!(
+                        rootfs_data_free_gib = c.rootfs.free / (1 << 30),
+                        rootfs_data_total_gib = c.rootfs.total / (1 << 30),
+                        rootfs_metadata_free_mib = c.rootfs.metadata_free / (1 << 20),
+                        rootfs_metadata_total_mib = c.rootfs.metadata_total / (1 << 20),
+                        data_free_gib = c.data.free / (1 << 30),
+                        data_total_gib = c.data.total / (1 << 30),
+                        "storage capacity"
+                    );
+                    *shared.write().await = c;
+                }
+                Ok(Err(e)) => warn!(error = %e, "reading storage capacity"),
                 Err(_) => warn!(
-                    timeout_secs = POOL_CAPACITY_TIMEOUT.as_secs(),
-                    "thin pool capacity query timed out — LVM likely busy"
+                    timeout_secs = STORAGE_CAPACITY_TIMEOUT.as_secs(),
+                    "storage capacity query timed out — LVM likely busy"
                 ),
             }
         }
@@ -651,7 +714,13 @@ fn spawn_orphan_sweep_loop(runtime: Arc<tokio::sync::RwLock<AgentRuntime>>) {
         loop {
             let sleep = {
                 let rt = runtime.read().await;
-                match reconcile::periodic_sweep(&rt.agent_db, &rt.vm_mgr, rt.net_mgr.as_ref()).await
+                match reconcile::periodic_sweep(
+                    &rt.agent_db,
+                    &rt.vm_mgr,
+                    rt.net_mgr.as_ref(),
+                    rt.storage.as_ref(),
+                )
+                .await
                 {
                     Ok(0) => ORPHAN_SWEEP_IDLE_INTERVAL,
                     Ok(n) => {
@@ -760,6 +829,7 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
             &rt.vm_mgr,
             rt.net_mgr.as_ref(),
             &rt.agent_db,
+            rt.storage.as_ref(),
             rt.metrics.as_ref(),
         )
         .await;
@@ -770,7 +840,7 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
                 let transient = e.chain().any(|c| {
                     matches!(
                         c.downcast_ref::<lvm::LvmError>(),
-                        Some(lvm::LvmError::Busy(_))
+                        Some(lvm::LvmError::Busy { .. })
                     )
                 });
                 if transient {
@@ -804,6 +874,7 @@ struct TaskContext {
     image_mgr: Arc<ImageManager>,
     vm_mgr: Arc<VmManager>,
     net_mgr: Arc<NetworkManager>,
+    storage: Arc<Storage>,
     metrics: Arc<Metrics>,
 }
 
@@ -814,6 +885,7 @@ impl AgentRuntime {
             image_mgr: self.image_mgr.clone(),
             vm_mgr: self.vm_mgr.clone(),
             net_mgr: self.net_mgr.clone(),
+            storage: self.storage.clone(),
             metrics: self.metrics.clone(),
         }
     }

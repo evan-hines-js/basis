@@ -1,25 +1,19 @@
-//! Host resource discovery: CPU count, total memory, VM-disk capacity.
+//! Host resource discovery: CPU count and total memory.
 //!
-//! Captured once at agent startup and reported on registration. The
-//! controller's `available_*` accounting is derived from running VMs, not
-//! re-polled here.
+//! Captured once at agent startup and reported on registration.
+//! Storage capacity is reported separately via [`crate::lvm::Storage`]
+//! and is dynamic (heartbeat-fresh), not static.
 
 pub struct HostResources {
     pub total_cpu: u32,
     pub total_memory_mib: u64,
-    pub total_disk_gib: u64,
 }
 
 impl HostResources {
-    /// `thin_pool_data_total_bytes` comes from `lvm::validate_pool` at
-    /// startup. VMs don't live on a filesystem anymore — df on data_dir
-    /// would report the OS disk's free space, which is irrelevant to
-    /// VM-disk capacity. Pool data total is the authoritative number.
-    pub fn discover(thin_pool_data_total_bytes: u64) -> Self {
+    pub fn discover() -> Self {
         Self {
             total_cpu: num_cpus(),
             total_memory_mib: total_memory_mib(),
-            total_disk_gib: thin_pool_data_total_bytes / (1 << 30),
         }
     }
 }

@@ -20,13 +20,15 @@ pub const API_VERSION: &str = "v1alpha1";
 ///
 /// Trust-domain assignment is NOT a user-facing field: every
 /// `BasisCluster` inherits its trust_domain from the provider
-/// instance that creates it (the management cluster's `kube-system`
-/// UID, or an explicit `BASIS_TRUST_DOMAIN` env override on the
-/// provider Deployment). Two clusters under the same management
-/// cluster share a tree and can talk; clusters under different
-/// management clusters land in different per-tree VRFs and are
-/// isolated at the kernel routing level. Operators never type
-/// "trust domain."
+/// instance that creates it. The provider derives it on startup as
+/// the SHA-256 of the shared `lattice-system/lattice-ca` Secret —
+/// every cluster Lattice distributes its CA to gets the same value,
+/// so a parent cluster and every child it spawns share one identifier
+/// without any installer plumbing. Same pattern lattice-istio uses
+/// for its mesh trust domain. Two clusters under the same Lattice
+/// root share a tree and can talk; clusters under different roots
+/// land in different per-tree VRFs and are isolated at the kernel
+/// routing level. Operators never type "trust domain."
 ///
 /// `controlPlaneEndpoint`, `vni`, and `cidr` are populated by the
 /// reconciler after basis allocates them — per CAPI convention, the

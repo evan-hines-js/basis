@@ -112,7 +112,13 @@ pub struct Metrics {
     pub vm_cpu_quota: IntGaugeVec,
     /// Sum of root + extra-disk allocations in GiB. Constant per VM;
     /// useful as the "size" column in the per-VM table panel.
-    pub vm_disk_gib: IntGaugeVec,
+    /// Per-VM rootfs allocation, in GiB. Charges against the host's
+    /// rootfs thin pool budget — see `basis_host_rootfs_bytes_*`.
+    pub vm_rootfs_gib: IntGaugeVec,
+    /// Per-VM data-disk allocation (sum of `extra_disk_gibs`), in
+    /// GiB. Charges against the host's data VG budget — see
+    /// `basis_host_data_bytes_*`.
+    pub vm_data_gib: IntGaugeVec,
 }
 
 impl Metrics {
@@ -143,8 +149,8 @@ impl Metrics {
         let lv_snapshot_seconds = Histogram::with_opts(
             HistogramOpts::new(
                 "basis_agent_lv_snapshot_seconds",
-                "Elapsed seconds for lvm::create_vm_lv — thin-pool snapshot \
-                 of the golden image LV. Contends on the thin-pool \
+                "Elapsed seconds for Storage::create_vm_lv — rootfs thin-pool \
+                 snapshot of the golden image LV. Contends on the thin-pool \
                  metadata lock under concurrent creates",
             )
             .buckets(buckets.clone()),
@@ -284,14 +290,23 @@ impl Metrics {
         )?;
         registry.register(Box::new(vm_cpu_quota.clone()))?;
 
-        let vm_disk_gib = IntGaugeVec::new(
+        let vm_rootfs_gib = IntGaugeVec::new(
             Opts::new(
-                "basis_agent_vm_disk_gib",
-                "Sum of root + extra-disk allocations for the VM, in GiB",
+                "basis_agent_vm_rootfs_gib",
+                "Per-VM rootfs allocation, GiB. Charges against the rootfs thin pool",
             ),
             &["vm_id"],
         )?;
-        registry.register(Box::new(vm_disk_gib.clone()))?;
+        registry.register(Box::new(vm_rootfs_gib.clone()))?;
+
+        let vm_data_gib = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_vm_data_gib",
+                "Per-VM data-disk allocation (sum of extras), GiB. Charges against the data VG",
+            ),
+            &["vm_id"],
+        )?;
+        registry.register(Box::new(vm_data_gib.clone()))?;
 
         Ok(Arc::new(Self {
             registry,
@@ -310,7 +325,8 @@ impl Metrics {
             vm_memory_bytes,
             vm_memory_limit_bytes,
             vm_cpu_quota,
-            vm_disk_gib,
+            vm_rootfs_gib,
+            vm_data_gib,
         }))
     }
 
@@ -411,7 +427,8 @@ async fn refresh_vm_gauges(
     metrics.vm_memory_bytes.reset();
     metrics.vm_memory_limit_bytes.reset();
     metrics.vm_cpu_quota.reset();
-    metrics.vm_disk_gib.reset();
+    metrics.vm_rootfs_gib.reset();
+    metrics.vm_data_gib.reset();
 
     for vm in &vms {
         let vm_id = vm.vm_id.as_str();
@@ -422,7 +439,7 @@ async fn refresh_vm_gauges(
             .set(1);
         metrics.vm_cpu_quota.with_label_values(&[vm_id]).set(vm.cpu);
 
-        let extra_total = vm
+        let data_gib = vm
             .extra_disks()
             .map(|disks| disks.iter().map(|g| *g as i64).sum::<i64>())
             .unwrap_or_else(|e| {
@@ -432,11 +449,14 @@ async fn refresh_vm_gauges(
                 );
                 0
             });
-        let total_disk_gib = vm.disk_gib + extra_total;
         metrics
-            .vm_disk_gib
+            .vm_rootfs_gib
             .with_label_values(&[vm_id])
-            .set(total_disk_gib);
+            .set(vm.disk_gib);
+        metrics
+            .vm_data_gib
+            .with_label_values(&[vm_id])
+            .set(data_gib);
         metrics
             .vm_memory_limit_bytes
             .with_label_values(&[vm_id])

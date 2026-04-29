@@ -66,6 +66,31 @@ basis_lvm_chunk_size: 256K
 # where previously-freed data must not leak across VMs.
 basis_lvm_zero_allocation: false
 
+# Block devices (or file-backed loopbacks) that compose the basis-data
+# VG — the plain VG that holds VM extra-disk LVs (Rook OSD backing,
+# etc.). Kept distinct from the rootfs thin pool because bluestore on
+# dm-thin double-books allocation, fragments I/O, breaks TRIM
+# passthrough, and shares a blast radius with VM rootfs. See
+# crates/basis-agent/src/lvm.rs and docs/storage-pools.md.
+#
+# Each entry is either:
+#   * a string path to a real block device (production):
+#       /dev/nvme1n1
+#   * a {file, size} dict — basis-prereqs truncates the file, binds it
+#     via losetup, and installs a systemd unit that re-binds on reboot:
+#       { file: /var/lib/basis/basis-data.img, size: 200G }
+#
+# Production inventories list dedicated NVMes / partitions. E2E /
+# CI inventories on shared hardware list a file-backed loopback so the
+# dual-pool architecture is honored without dedicating physical disks.
+# Mixing forms in one list is allowed but unusual.
+#
+# Empty list fails the role at apply time. The agent refuses to start
+# without basis-data and that's intentional — there is no silent
+# fallback to the rootfs pool.
+basis_lvm_data_devices: []  # REQUIRED, see comment above
+basis_lvm_data_vg: basis-data
+
 # Controller bind + well-known server SAN. `basis_controller_san` must
 # match the SAN we put on the controller's server cert AND the value the
 # agent clients set as their TLS domain name.

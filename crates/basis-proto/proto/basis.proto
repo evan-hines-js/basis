@@ -384,13 +384,15 @@ message ClusterState {
   // holds its own routes.
   string trust_domain = 9;
   // LAN-routable cluster VIPs (apiserver VIP when `APISERVER_PUBLIC`
-  // + LB Service block from a `Lan`-scoped pool) as `<addr>/<prefix>`
-  // strings. The agent advertises these via BGP (with self as
-  // next-hop), proxy-ARPs them onto the uplink, and installs a bridge
-  // route. Every host carrying the cluster advertises the same VIP
-  // set — kube-vip leader election within the cluster settles which
-  // CP VM owns the apiserver VIP at any moment.
-  repeated string cluster_vips = 7;
+  // + LB Service block from a `Lan`-scoped pool). Every host
+  // carrying the cluster receives the full set; the controller-
+  // elected `owner_host_id` on each entry tells the agent which
+  // single host should answer ARP for the VIP on the uplink.
+  // Non-owners install the bridge route and BGP-advertise the
+  // prefix but skip proxy-ARP — eliminating the multi-host ARP
+  // race that otherwise corrupted LAN ingress during worker
+  // placement churn. Owner re-election + GARP handles failover.
+  repeated ClusterVip cluster_vips = 7;
   // Tree-scoped cluster VIPs (apiserver VIP and/or LB Service block
   // from a `Tree`-scoped pool). Agent installs the bridge route only
   // — no proxy-ARP on the uplink, no BGP advertisement. The LAN
@@ -400,8 +402,27 @@ message ClusterState {
   // `trust_domain`, via `ClusterState` entries with empty
   // `gateway_ip`/`cidr`). Cross-trust-domain traffic stops at the
   // source's host kernel from a missing route — the dataplane is
-  // the trust boundary.
+  // the trust boundary. No owner field — these aren't on the LAN.
   repeated string internal_cluster_vips = 8;
+}
+
+// One LAN-routable cluster VIP plus the host that owns its L2
+// announcement. The controller picks `owner_host_id` deterministically
+// from the cluster's current carrier set; non-owner carriers still
+// install the in-VRF bridge route and BGP-advertise the prefix, but
+// only the owner proxy-ARPs the VIP onto the uplink. On owner change
+// (new placement, host failure), the previous owner withdraws its
+// proxy-ARP entry and the new owner installs + GARPs — sub-second
+// failover with no ARP-cache thrash on LAN clients.
+message ClusterVip {
+  // CIDR string, e.g. "10.0.0.209/32" (apiserver VIP) or
+  // "10.0.0.208/28" (LB Service block).
+  string cidr = 1;
+  // host_id of the agent that should answer ARP for this VIP. Empty
+  // string means "no owner elected yet" — agents skip proxy-ARP for
+  // such entries; routes + BGP still install. Empty is rare (covers
+  // the brief window between cluster create and first placement).
+  string owner_host_id = 2;
 }
 
 // --- Agent registration ---
@@ -410,7 +431,10 @@ message RegisterHostRequest {
   string hostname = 1;
   uint32 total_cpu = 2;
   uint64 total_memory_mib = 3;
-  uint64 total_disk_gib = 4;
+  // Per-pool capacity snapshot at register time. Refreshed on every
+  // heartbeat — see `HeartbeatRequest.storage_capacity`. The scheduler
+  // reads from the heartbeat-fresh value, not from this snapshot.
+  StorageCapacity storage_capacity = 4;
   repeated GPUDevice gpus = 5;
   // IP address the agent will use as the source for outgoing VXLAN
   // frames. Almost always the uplink interface's address. Reported
@@ -458,12 +482,33 @@ message InventoryCluster {
   string cidr = 2;
 }
 
-// Liveness ping. The controller learns *which* host this came from
-// from the authenticated bidi stream's identity, not from any field
-// in this message — a malicious agent could otherwise keep another
-// host marked healthy. Empty body kept (rather than dropping the RPC)
-// so we can extend it later without a streaming-protocol break.
-message HeartbeatRequest {}
+// Liveness ping plus a fresh per-pool storage capacity snapshot.
+// The controller learns *which* host this came from from the
+// authenticated bidi stream's identity, not from any field in this
+// message — a malicious agent could otherwise keep another host
+// marked healthy.
+message HeartbeatRequest {
+  StorageCapacity storage_capacity = 1;
+}
+
+// Per-pool capacity numbers, in bytes. Two pools by design: a thin
+// pool for VM rootfs and a plain VG for raw data disks (Rook OSDs).
+// Reported on register and on every heartbeat so the scheduler's
+// per-pool budgets stay live, not registration-stale.
+message StorageCapacity {
+  PoolBytes rootfs = 1;
+  PoolBytes data = 2;
+}
+
+// Capacity numbers for one pool. `metadata_*` apply only to the
+// rootfs thin pool (lvm2 thin metadata extents); the data VG has no
+// metadata extent and reports zero.
+message PoolBytes {
+  uint64 total_bytes = 1;
+  uint64 free_bytes = 2;
+  uint64 metadata_total_bytes = 3;
+  uint64 metadata_free_bytes = 4;
+}
 
 message ReportVMStateRequest {
   string vm_id = 1;

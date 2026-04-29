@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use basis_proto::ClusterState;
+use basis_proto::{ClusterState, ClusterVip};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -153,6 +153,13 @@ pub struct ClusterManager {
     /// Name of the uplink bridge used as the `-o` interface in the
     /// per-cluster MASQUERADE rules installed by [`Self::ensure_cluster_inner`].
     uplink_bridge: String,
+    /// This agent's host_id, set once at registration. Used to gate
+    /// LAN-VIP proxy-ARP installation: only the controller-elected
+    /// owner of each `cluster_vip` answers ARP for it on the uplink,
+    /// preventing the multi-host ARP race seen on member-churn
+    /// reconciles. Empty string before registration ack lands; the
+    /// agent never reconciles clusters before then so no race.
+    host_id: Mutex<String>,
     /// VNIs currently materialised on this host plus the per-cluster
     /// state we've programmed (CIDR for MASQUERADE, VIP routes for
     /// LAN ingress). `reconcile` diffs keys against the desired set
@@ -166,8 +173,16 @@ impl ClusterManager {
             vtep_address,
             uplink_mtu,
             uplink_bridge,
+            host_id: Mutex::new(String::new()),
             live: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record the host_id assigned by the controller's RegisterHostResponse.
+    /// Must be set before the first `reconcile_clusters` call; otherwise
+    /// proxy-ARP gating skips every VIP and LAN ingress drops.
+    pub async fn set_host_id(&self, host_id: String) {
+        *self.host_id.lock().await = host_id;
     }
 
     pub fn inner_mtu(&self) -> u32 {
@@ -254,17 +269,22 @@ impl ClusterManager {
             //     onto the uplink (so LAN clients can reach the VIP).
             //   * `internal_cluster_vips` — Tree-scoped: bridge route only,
             //     no proxy-ARP (the LAN must not reach the VIP).
-            let (lan_prefixes, lan_addrs) = expand_prefixes(&cluster.cluster_vips);
-            let (tree_prefixes, _) = expand_prefixes(&cluster.internal_cluster_vips);
+            let self_host_id = self.host_id.lock().await.clone();
+            let (lan_prefixes, lan_addrs) = expand_lan_vips(&cluster.cluster_vips, &self_host_id);
+            let tree_prefixes = expand_tree_prefixes(&cluster.internal_cluster_vips);
 
             let bridge = bridge_name(cluster.vni);
             let table_id = vrf.as_ref().map(|v| v.table_id);
 
             // Two-table reconcile when the cluster is in a VRF:
-            //   * MAIN gets the LAN-scoped prefixes ONLY. The tree's
-            //     internal VIPs must never appear in main — that
-            //     would let LAN traffic dst-routed to vmbr0 reach
-            //     them and break tree isolation.
+            //   * MAIN gets the LAN-scoped prefixes (so LAN ingress
+            //     can resolve them) plus a copy of the cluster CIDR
+            //     (so reply traffic from VM-initiated NAT'd egress
+            //     ingressing on the uplink can resolve the un-NAT'd
+            //     destination). The tree's internal VIPs must never
+            //     appear in main — that would let LAN traffic
+            //     dst-routed to vmbr0 reach them and break tree
+            //     isolation.
             //   * VRF gets BOTH lan + tree prefixes. LAN prefixes
             //     are mirrored so VMs in this tree (whose bridge
             //     looks up in the VRF table) can also reach their
@@ -273,20 +293,31 @@ impl ClusterManager {
             // there's no separate VRF table; everything just lives
             // in main as a single set.
             let want_main: BTreeSet<String> = if table_id.is_some() {
-                lan_prefixes.clone()
+                let mut set = lan_prefixes.clone();
+                if !cluster.cidr.is_empty() {
+                    set.insert(cluster.cidr.clone());
+                }
+                set
             } else {
                 let mut set = lan_prefixes.clone();
                 set.extend(tree_prefixes.iter().cloned());
                 set
             };
+            // Add-before-delete on every diff loop: `add_prefix_route`
+            // uses `ip route replace` (kernel-idempotent), so adding
+            // first never errors on duplicates and never disturbs
+            // existing routes. With del-first, traffic to a "new"
+            // prefix would black-hole for the duration of the install
+            // burst — sticky-owner makes this rare on member-add but
+            // the order is the right shape regardless.
             let kernel_main = list_kernel_prefix_routes(&bridge, None).await?;
+            for new in want_main.difference(&kernel_main) {
+                add_prefix_route(new, &bridge, None).await?;
+            }
             for stale in kernel_main.difference(&want_main) {
                 if let Err(e) = del_prefix_route(stale, &bridge, None).await {
                     warn!(prefix = %stale, vni = cluster.vni, error = %e, "main prefix route del");
                 }
-            }
-            for new in want_main.difference(&kernel_main) {
-                add_prefix_route(new, &bridge, None).await?;
             }
 
             let mut want_combined = lan_prefixes;
@@ -294,14 +325,14 @@ impl ClusterManager {
 
             if let Some(t) = table_id {
                 let kernel_vrf = list_kernel_prefix_routes(&bridge, Some(t)).await?;
+                for new in want_combined.difference(&kernel_vrf) {
+                    add_prefix_route(new, &bridge, Some(t)).await?;
+                }
                 for stale in kernel_vrf.difference(&want_combined) {
                     if let Err(e) = del_prefix_route(stale, &bridge, Some(t)).await {
                         warn!(prefix = %stale, vni = cluster.vni, table = t, error = %e,
                             "vrf prefix route del");
                     }
-                }
-                for new in want_combined.difference(&kernel_vrf) {
-                    add_prefix_route(new, &bridge, Some(t)).await?;
                 }
             }
 
@@ -325,14 +356,22 @@ impl ClusterManager {
             .values()
             .flat_map(|c| c.proxy_arp_addrs.iter().cloned())
             .collect();
+        // Add-before-delete: install + GARP first so LAN clients
+        // resolve to this owner before any stale entries are removed.
+        // `add_proxy_arp` uses `ip neigh replace` (idempotent).
         let current_proxy_arp = list_kernel_proxy_arp(&self.uplink_bridge).await?;
+        for new in desired_proxy_arp.difference(&current_proxy_arp) {
+            add_proxy_arp(new, &self.uplink_bridge).await?;
+            // Unsolicited ARP replies collapse LAN ARP-cache
+            // convergence from the kernel default ~60s TTL down to one
+            // packet round-trip on owner change. Best-effort: log and
+            // continue if arping isn't installed.
+            send_garp(new, &self.uplink_bridge).await;
+        }
         for stale in current_proxy_arp.difference(&desired_proxy_arp) {
             if let Err(e) = del_proxy_arp(stale, &self.uplink_bridge).await {
                 warn!(addr = %stale, error = %e, "proxy-arp del");
             }
-        }
-        for new in desired_proxy_arp.difference(&current_proxy_arp) {
-            add_proxy_arp(new, &self.uplink_bridge).await?;
         }
 
         Ok(())
@@ -488,6 +527,35 @@ impl ClusterManager {
             let v = vrf_for(&cluster.trust_domain);
             ensure_vrf(&v).await?;
             enslave_to_vrf(&bridge, &v.name).await?;
+            // Seed the VRF's table with a default via the uplink
+            // gateway. Without this, route lookups in the VRF for any
+            // address outside the cluster's own prefixes (Internet,
+            // LAN, anything not in cluster_vips) miss and the kernel
+            // drops the packet. The gateway is whatever main is
+            // already using for the host's egress, so no extra config
+            // is required from the operator.
+            if let Some(gw) = read_uplink_gateway(&self.uplink_bridge).await? {
+                run_cmd(
+                    "ip",
+                    &[
+                        "route",
+                        "replace",
+                        "default",
+                        "via",
+                        &gw,
+                        "dev",
+                        &self.uplink_bridge,
+                        "table",
+                        &v.table_id.to_string(),
+                    ],
+                )
+                .await?;
+            } else {
+                warn!(
+                    vrf = %v.name, uplink = %self.uplink_bridge,
+                    "no main-table default route via uplink; tree VRF will have no egress path",
+                );
+            }
             Some(v)
         };
 
@@ -553,7 +621,13 @@ impl ClusterManager {
             run_cmd(
                 "ip",
                 &[
-                    "route", "replace", &cluster.cidr, "dev", &bridge, "table", "main",
+                    "route",
+                    "replace",
+                    &cluster.cidr,
+                    "dev",
+                    &bridge,
+                    "table",
+                    "main",
                 ],
             )
             .await?;
@@ -573,21 +647,9 @@ impl ClusterManager {
             .collect();
         let current = list_fdb_bum_dsts(vxlan).await?;
 
-        for stale in current.difference(&desired) {
-            let _ = run_cmd(
-                "bridge",
-                &[
-                    "fdb",
-                    "del",
-                    "00:00:00:00:00:00",
-                    "dev",
-                    vxlan,
-                    "dst",
-                    stale,
-                ],
-            )
-            .await;
-        }
+        // Add-before-delete so BUM flooding never misses a newly-added
+        // peer in the install window. `bridge fdb append` is
+        // idempotent against existing entries.
         for new in desired.difference(&current) {
             run_cmd(
                 "bridge",
@@ -603,8 +665,58 @@ impl ClusterManager {
             )
             .await?;
         }
+        for stale in current.difference(&desired) {
+            let _ = run_cmd(
+                "bridge",
+                &[
+                    "fdb",
+                    "del",
+                    "00:00:00:00:00:00",
+                    "dev",
+                    vxlan,
+                    "dst",
+                    stale,
+                ],
+            )
+            .await;
+        }
         Ok(())
     }
+}
+
+/// Read the gateway of the main table's default route via `uplink`.
+/// Used to seed each tree-VRF's table with its own default so VMs in
+/// the tree can egress to the LAN/Internet — without it, packets from
+/// the VM hit a route-lookup miss in the VRF table and drop. The
+/// gateway is whatever the host already uses for its own egress, so
+/// no extra config is needed.
+async fn read_uplink_gateway(uplink: &str) -> Result<Option<String>, NetworkError> {
+    let out = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let mut via: Option<&str> = None;
+        let mut dev: Option<&str> = None;
+        for i in 0..parts.len() {
+            if parts[i] == "via" && i + 1 < parts.len() {
+                via = Some(parts[i + 1]);
+            }
+            if parts[i] == "dev" && i + 1 < parts.len() {
+                dev = Some(parts[i + 1]);
+            }
+        }
+        if let (Some(v), Some(d)) = (via, dev) {
+            if d == uplink {
+                return Ok(Some(v.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 async fn link_exists(name: &str) -> Result<bool, NetworkError> {
@@ -652,32 +764,62 @@ async fn ensure_bridge_address(bridge: &str, ip: &str, prefix: u32) -> Result<()
     .await
 }
 
-/// Expand a list of CIDR strings (controller-supplied
-/// `cluster_vips`) into:
-///   * the prefix set we'll install routes for (one entry per CIDR)
-///   * the host-address set we'll install proxy-ARP entries for
-///     (each prefix expanded via `ipnet::Ipv4Net::hosts()`, which
-///     yields the single addr for /32 and skips network/broadcast for
-///     non-/32). Unparseable entries are dropped with a warn so a
-///     malformed controller advertisement doesn't take down the
-///     reconciler.
-fn expand_prefixes(prefixes: &[String]) -> (BTreeSet<String>, BTreeSet<String>) {
+/// Expand the LAN-routable `cluster_vips` set (controller-supplied,
+/// each entry carrying its elected `owner_host_id`) into:
+///   * the prefix set this host installs routes for — every entry, so
+///     non-owner carriers can still ingress LAN traffic for the VIP
+///     into the cluster bridge once it arrives via VXLAN from the
+///     owner.
+///   * the host-address set this host proxy-ARPs onto the uplink —
+///     ONLY entries whose `owner_host_id` matches `self_host_id`.
+///     Single-responder L2 announcement: exactly one host on the
+///     LAN answers ARP for any given VIP, eliminating the multi-host
+///     ARP race that corrupted ingress on member-churn reconciles.
+///     `ipnet::Ipv4Net::hosts()` yields the single addr for /32 and
+///     skips network/broadcast for non-/32. Unparseable entries are
+///     dropped with a warn.
+fn expand_lan_vips(
+    vips: &[ClusterVip],
+    self_host_id: &str,
+) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut prefix_set = BTreeSet::new();
     let mut addr_set = BTreeSet::new();
-    for s in prefixes {
-        match s.parse::<ipnet::Ipv4Net>() {
+    for vip in vips {
+        match vip.cidr.parse::<ipnet::Ipv4Net>() {
             Ok(net) => {
-                prefix_set.insert(s.clone());
-                for addr in net.hosts() {
-                    addr_set.insert(addr.to_string());
+                prefix_set.insert(vip.cidr.clone());
+                if vip.owner_host_id == self_host_id && !self_host_id.is_empty() {
+                    for addr in net.hosts() {
+                        addr_set.insert(addr.to_string());
+                    }
                 }
             }
             Err(e) => {
-                warn!(prefix = %s, error = %e, "skipping unparseable cluster prefix");
+                warn!(prefix = %vip.cidr, error = %e, "skipping unparseable cluster_vip");
             }
         }
     }
     (prefix_set, addr_set)
+}
+
+/// Expand tree-scoped VIP CIDRs into the prefix set the agent installs
+/// inside the per-tree VRF. Tree VIPs are LAN-invisible by design — no
+/// proxy-ARP, no owner concept, just routes inside the VRF table so
+/// the cluster's own VMs reach the VIPs via their bridge. Mirror of
+/// [`expand_lan_vips`] without the addr_set.
+fn expand_tree_prefixes(prefixes: &[String]) -> BTreeSet<String> {
+    let mut prefix_set = BTreeSet::new();
+    for s in prefixes {
+        match s.parse::<ipnet::Ipv4Net>() {
+            Ok(_) => {
+                prefix_set.insert(s.clone());
+            }
+            Err(e) => {
+                warn!(prefix = %s, error = %e, "skipping unparseable tree prefix");
+            }
+        }
+    }
+    prefix_set
 }
 
 /// Install a more-specific `<prefix> dev <bridge>` route so the
@@ -726,6 +868,40 @@ async fn del_proxy_arp(addr: &str, uplink: &str) -> Result<(), NetworkError> {
     run_cmd("ip", &["neigh", "del", "proxy", addr, "dev", uplink]).await
 }
 
+/// Best-effort gratuitous-ARP burst announcing `addr` on `uplink`.
+/// Sends 3 unsolicited ARP replies (`-A`) bound to the host's MAC, so
+/// LAN clients with a stale cache entry from the previous owner
+/// re-resolve immediately instead of waiting for their cache TTL.
+/// `-c 3` matches RFC 5227 / common practice; `-w 1` caps total
+/// runtime so a wedged interface doesn't block the reconcile loop.
+/// Non-fatal: missing `iputils-arping` or any error is logged at
+/// `warn` and we move on.
+async fn send_garp(addr: &str, uplink: &str) {
+    let result = Command::new("arping")
+        .args(["-c", "3", "-w", "1", "-A", "-I", uplink, addr])
+        .output()
+        .await;
+    match result {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            warn!(
+                addr = %addr,
+                uplink = %uplink,
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "arping returned non-zero; LAN cache will converge on next client ARP",
+            );
+        }
+        Err(e) => {
+            warn!(
+                addr = %addr,
+                uplink = %uplink,
+                error = %e,
+                "arping not runnable (install iputils-arping?); LAN cache will converge on next client ARP",
+            );
+        }
+    }
+}
+
 /// Enumerate every `brc<vni>` bridge currently on the host. Used at
 /// reconcile start to rediscover bridges left by a prior agent
 /// process so their stale routes/ARP/MASQUERADE get cleaned up.
@@ -753,7 +929,7 @@ async fn list_kernel_cluster_vnis() -> Result<Vec<u32>, NetworkError> {
 /// an agent install — it's auto-acquired from the bridge's IPv4
 /// address. Bare-address destinations are normalised to `<addr>/32`
 /// so the set comparison matches the `<addr>/<prefix>` form produced
-/// by `expand_prefixes`.
+/// by `expand_lan_vips` / `expand_tree_prefixes`.
 ///
 /// `table` must match the table `add_prefix_route` writes to —
 /// otherwise the diff would re-install routes that already exist in
@@ -879,25 +1055,41 @@ mod tests {
         assert_ne!(bridge_name(1), vxlan_name(1));
     }
 
-    /// `/32` is the apiserver-VIP shape: one prefix, one host
-    /// address. Proxy-ARP for the address makes the LAN reach it.
+    fn vip(cidr: &str, owner: &str) -> ClusterVip {
+        ClusterVip {
+            cidr: cidr.to_string(),
+            owner_host_id: owner.to_string(),
+        }
+    }
+
+    /// Owner gets the prefix route AND the proxy-ARP entry: this host
+    /// answers ARP for the apiserver VIP on the LAN.
     #[test]
-    fn expand_prefixes_slash_32_yields_one_addr() {
-        let (prefixes, addrs) = expand_prefixes(&["10.0.0.5/32".to_string()]);
+    fn expand_lan_vips_owner_installs_proxy_arp() {
+        let (prefixes, addrs) = expand_lan_vips(&[vip("10.0.0.5/32", "host-self")], "host-self");
         assert_eq!(prefixes.len(), 1);
         assert!(prefixes.contains("10.0.0.5/32"));
         assert_eq!(addrs.len(), 1);
         assert!(addrs.contains("10.0.0.5"));
     }
 
-    /// `/28` is the typical LB Service block shape. `Ipv4Net::hosts()`
-    /// excludes network and broadcast, so the proxy-ARP set has 14
-    /// entries — the LAN-reachable usable addresses.
+    /// Non-owner: route still installs (so VXLAN-arrived ingress can
+    /// reach the bridge) but proxy-ARP is skipped — only the owner
+    /// answers ARP, eliminating the LAN race.
     #[test]
-    fn expand_prefixes_slash_28_yields_fourteen_addrs() {
-        let (prefixes, addrs) = expand_prefixes(&["10.0.0.16/28".to_string()]);
+    fn expand_lan_vips_non_owner_skips_proxy_arp() {
+        let (prefixes, addrs) = expand_lan_vips(&[vip("10.0.0.5/32", "host-other")], "host-self");
         assert_eq!(prefixes.len(), 1);
-        assert!(prefixes.contains("10.0.0.16/28"));
+        assert!(prefixes.contains("10.0.0.5/32"));
+        assert!(addrs.is_empty());
+    }
+
+    /// `/28` is the typical LB Service block shape. Owner expands to
+    /// 14 proxy-ARP entries (`Ipv4Net::hosts()` excludes net/bcast).
+    #[test]
+    fn expand_lan_vips_owner_slash_28_yields_fourteen_addrs() {
+        let (prefixes, addrs) = expand_lan_vips(&[vip("10.0.0.16/28", "host-self")], "host-self");
+        assert_eq!(prefixes.len(), 1);
         assert_eq!(addrs.len(), 14);
         assert!(addrs.contains("10.0.0.17"));
         assert!(addrs.contains("10.0.0.30"));
@@ -905,27 +1097,50 @@ mod tests {
         assert!(!addrs.contains("10.0.0.31"));
     }
 
-    /// Unparseable entries are dropped (logged at warn). Mixed inputs
-    /// keep the good ones — a malformed advertisement can't take down
-    /// the entire reconcile pass.
+    /// Empty self_host_id (pre-registration) skips proxy-ARP for every
+    /// VIP: routes still install, but no host answers ARP until
+    /// registration completes and ownership is recorded. Defends
+    /// against a reconcile racing the registration ack.
     #[test]
-    fn expand_prefixes_drops_unparseable_keeps_rest() {
-        let (prefixes, addrs) = expand_prefixes(&[
-            "10.0.0.1/32".to_string(),
-            "not-a-cidr".to_string(),
-            "10.0.0.32/28".to_string(),
-        ]);
+    fn expand_lan_vips_empty_self_skips_all_proxy_arp() {
+        let (prefixes, addrs) =
+            expand_lan_vips(&[vip("10.0.0.5/32", ""), vip("10.0.0.6/32", "host-x")], "");
         assert_eq!(prefixes.len(), 2);
-        assert!(prefixes.contains("10.0.0.1/32"));
-        assert!(prefixes.contains("10.0.0.32/28"));
-        assert_eq!(addrs.len(), 1 + 14);
+        assert!(addrs.is_empty());
     }
 
-    /// Empty input is the cold-start case (`ensure_bootstrap` ships an
-    /// empty ClusterState before the first controller reconcile lands).
+    /// Unparseable entries dropped, owner gating preserved across the
+    /// surviving entries.
     #[test]
-    fn expand_prefixes_empty_input_is_empty_output() {
-        let (prefixes, addrs) = expand_prefixes(&[]);
+    fn expand_lan_vips_drops_unparseable_keeps_rest() {
+        let (prefixes, addrs) = expand_lan_vips(
+            &[
+                vip("10.0.0.1/32", "host-self"),
+                vip("not-a-cidr", "host-self"),
+                vip("10.0.0.32/28", "host-other"),
+            ],
+            "host-self",
+        );
+        assert_eq!(prefixes.len(), 2);
+        assert_eq!(addrs.len(), 1); // owner only on the /32
+    }
+
+    /// Tree-scoped expand has no owner concept — every entry produces
+    /// a prefix, no addr_set. Drops unparseables.
+    #[test]
+    fn expand_tree_prefixes_drops_unparseable() {
+        let prefixes = expand_tree_prefixes(&[
+            "10.250.0.0/24".to_string(),
+            "junk".to_string(),
+            "10.250.1.0/24".to_string(),
+        ]);
+        assert_eq!(prefixes.len(), 2);
+    }
+
+    /// Empty input is the cold-start case.
+    #[test]
+    fn expand_lan_vips_empty_input_is_empty_output() {
+        let (prefixes, addrs) = expand_lan_vips(&[], "host-self");
         assert!(prefixes.is_empty());
         assert!(addrs.is_empty());
     }

@@ -9,6 +9,17 @@
 basis_lvm_devices:
   - /dev/sdf
 
+# basis-data VG: this PVE host has no spare physical disk, so back
+# the data VG with a 120G sparse loopback file on the OS root.
+# basis-prereqs truncates the file, binds it via losetup, and
+# persists the binding through basis-data-loopback.service. Sparse
+# means actual disk usage tracks bluestore writes (near-zero in e2e
+# since Rook/Ceph doesn't drive real workload during the test).
+# Production hosts list dedicated NVMes here instead.
+basis_lvm_data_devices:
+  - file: /var/lib/basis/basis-data.img
+    size: 120G
+
 # Single SATA drive shared with PVE — only good enough for workers.
 # CP with `prefers: tier=fast` falls back here if no fast host is up;
 # workers with `requires: tier=slow` land here exclusively.

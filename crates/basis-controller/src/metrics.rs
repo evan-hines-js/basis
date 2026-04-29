@@ -51,9 +51,18 @@ pub struct Metrics {
     /// exposed symmetrically with CPU so dashboards don't have to
     /// special-case one resource.
     pub host_memory_mib_assigned: IntGaugeVec,
-    pub host_disk_gib_total: IntGaugeVec,
-    /// Sum of VM disk allocations on the host. Never overcommitted.
-    pub host_disk_gib_assigned: IntGaugeVec,
+    /// Total bytes of the rootfs thin pool on each host. The pool
+    /// backs VM rootfs LVs (golden-image CoW snapshots).
+    pub host_rootfs_bytes_total: IntGaugeVec,
+    /// Sum of VM rootfs allocations (bytes) on each host. Never
+    /// overcommitted at the scheduler — exhaustion blocks placement.
+    pub host_rootfs_bytes_assigned: IntGaugeVec,
+    /// Total bytes of the data VG on each host. The VG backs raw
+    /// data disks (Rook OSDs and other guest-managed block devices).
+    pub host_data_bytes_total: IntGaugeVec,
+    /// Sum of VM data-disk allocations (bytes) on each host. Never
+    /// overcommitted.
+    pub host_data_bytes_assigned: IntGaugeVec,
     pub host_gpus_total: IntGaugeVec,
     pub host_gpus_assigned: IntGaugeVec,
     pub host_last_heartbeat_age_seconds: GaugeVec,
@@ -144,20 +153,41 @@ impl Metrics {
         )?;
         registry.register(Box::new(host_memory_mib_assigned.clone()))?;
 
-        let host_disk_gib_total = IntGaugeVec::new(
-            Opts::new("basis_host_disk_gib_total", "Total disk (GiB) on each host"),
-            &["host"],
-        )?;
-        registry.register(Box::new(host_disk_gib_total.clone()))?;
-
-        let host_disk_gib_assigned = IntGaugeVec::new(
+        let host_rootfs_bytes_total = IntGaugeVec::new(
             Opts::new(
-                "basis_host_disk_gib_assigned",
-                "Sum of VM disk allocations (GiB) on each host",
+                "basis_host_rootfs_bytes_total",
+                "Total bytes of the rootfs thin pool on each host",
             ),
             &["host"],
         )?;
-        registry.register(Box::new(host_disk_gib_assigned.clone()))?;
+        registry.register(Box::new(host_rootfs_bytes_total.clone()))?;
+
+        let host_rootfs_bytes_assigned = IntGaugeVec::new(
+            Opts::new(
+                "basis_host_rootfs_bytes_assigned",
+                "Sum of VM rootfs allocations (bytes) on each host",
+            ),
+            &["host"],
+        )?;
+        registry.register(Box::new(host_rootfs_bytes_assigned.clone()))?;
+
+        let host_data_bytes_total = IntGaugeVec::new(
+            Opts::new(
+                "basis_host_data_bytes_total",
+                "Total bytes of the data VG on each host (raw data-disk pool)",
+            ),
+            &["host"],
+        )?;
+        registry.register(Box::new(host_data_bytes_total.clone()))?;
+
+        let host_data_bytes_assigned = IntGaugeVec::new(
+            Opts::new(
+                "basis_host_data_bytes_assigned",
+                "Sum of VM data-disk allocations (bytes) on each host",
+            ),
+            &["host"],
+        )?;
+        registry.register(Box::new(host_data_bytes_assigned.clone()))?;
 
         let host_gpus_total = IntGaugeVec::new(
             Opts::new(
@@ -265,8 +295,10 @@ impl Metrics {
             host_cpu_assigned,
             host_memory_mib_total,
             host_memory_mib_assigned,
-            host_disk_gib_total,
-            host_disk_gib_assigned,
+            host_rootfs_bytes_total,
+            host_rootfs_bytes_assigned,
+            host_data_bytes_total,
+            host_data_bytes_assigned,
             host_gpus_total,
             host_gpus_assigned,
             host_last_heartbeat_age_seconds,
@@ -339,8 +371,10 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
     metrics.host_cpu_assigned.reset();
     metrics.host_memory_mib_total.reset();
     metrics.host_memory_mib_assigned.reset();
-    metrics.host_disk_gib_total.reset();
-    metrics.host_disk_gib_assigned.reset();
+    metrics.host_rootfs_bytes_total.reset();
+    metrics.host_rootfs_bytes_assigned.reset();
+    metrics.host_data_bytes_total.reset();
+    metrics.host_data_bytes_assigned.reset();
     metrics.host_gpus_total.reset();
     metrics.host_gpus_assigned.reset();
     metrics.host_last_heartbeat_age_seconds.reset();
@@ -376,13 +410,21 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
             .with_label_values(&[h])
             .set(usage.used_memory_mib);
         metrics
-            .host_disk_gib_total
+            .host_rootfs_bytes_total
             .with_label_values(&[h])
-            .set(host.total_disk_gib);
+            .set(host.rootfs_total_bytes);
         metrics
-            .host_disk_gib_assigned
+            .host_rootfs_bytes_assigned
             .with_label_values(&[h])
-            .set(usage.used_disk_gib);
+            .set(usage.used_rootfs_gib.saturating_mul(crate::db::GIB));
+        metrics
+            .host_data_bytes_total
+            .with_label_values(&[h])
+            .set(host.data_total_bytes);
+        metrics
+            .host_data_bytes_assigned
+            .with_label_values(&[h])
+            .set(usage.used_data_gib.saturating_mul(crate::db::GIB));
 
         metrics
             .host_gpus_total
@@ -526,7 +568,12 @@ mod tests {
             hostname: hostname.to_string(),
             total_cpu,
             total_memory_mib: 65536,
-            total_disk_gib: 1000,
+            rootfs_total_bytes: 1000 * crate::db::GIB,
+            rootfs_free_bytes: 1000 * crate::db::GIB,
+            rootfs_metadata_total_bytes: 0,
+            rootfs_metadata_free_bytes: 0,
+            data_total_bytes: 1000 * crate::db::GIB,
+            data_free_bytes: 1000 * crate::db::GIB,
             gpu_inventory: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
             last_heartbeat: basis_common::time::now_rfc3339(),
@@ -547,7 +594,6 @@ mod tests {
             cpu: 4,
             memory_mib: 8192,
             disk_gib: 100,
-            extra_disk_total_gib: 0,
             extra_disk_gibs: "[]".to_string(),
             image: "ubuntu:22.04".to_string(),
             error_message: String::new(),

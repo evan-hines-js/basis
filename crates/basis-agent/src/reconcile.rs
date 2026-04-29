@@ -9,7 +9,7 @@ use basis_proto::{CreateVmCommand, ExtraDisk};
 use crate::config::HostSpec;
 use crate::db::{AgentDb, LocalVmRow};
 use crate::gpu;
-use crate::lvm;
+use crate::lvm::Storage;
 use crate::metrics;
 use crate::network::{primary_tap_name, NetworkManager};
 use crate::vm::{BootArtifacts, VmManager};
@@ -80,6 +80,7 @@ struct UnitCollector<'a> {
     agent_db: &'a AgentDb,
     vm_mgr: &'a Arc<VmManager>,
     net_mgr: &'a NetworkManager,
+    storage: &'a Storage,
 }
 
 impl<'a> GarbageCollectable for UnitCollector<'a> {
@@ -90,24 +91,39 @@ impl<'a> GarbageCollectable for UnitCollector<'a> {
         Ok(self.running_vm_ids.to_vec())
     }
     async fn reclaim(&self, vm_id: &str) -> anyhow::Result<()> {
-        crate::handlers::delete_vm(vm_id, self.vm_mgr, self.net_mgr, self.agent_db).await
+        crate::handlers::delete_vm(
+            vm_id,
+            self.vm_mgr,
+            self.net_mgr,
+            self.agent_db,
+            self.storage,
+        )
+        .await
     }
 }
 
-/// Thin-pool LVs whose `vm_id` is not in the agent DB. Unifies rootfs
-/// LVs and data disk LVs into a single vm_id-keyed set.
-struct LvCollector;
+/// LVs (rootfs in the rootfs VG, data in the data VG) whose `vm_id`
+/// is not in the agent DB. Unifies both VGs into a single vm_id-keyed
+/// set so the orphan sweep makes one decision per VM.
+struct LvCollector<'a> {
+    storage: &'a Storage,
+}
 
-impl GarbageCollectable for LvCollector {
+impl<'a> GarbageCollectable for LvCollector<'a> {
     fn kind(&self) -> &'static str {
         "lv"
     }
     async fn list(&self) -> anyhow::Result<Vec<String>> {
-        Ok(lvm::list_managed_vm_ids().await?.into_iter().collect())
+        Ok(self
+            .storage
+            .list_managed_vm_ids()
+            .await?
+            .into_iter()
+            .collect())
     }
     async fn reclaim(&self, vm_id: &str) -> anyhow::Result<()> {
-        lvm::remove_vm_lv(vm_id).await?;
-        lvm::remove_vm_data_disks(vm_id).await?;
+        self.storage.remove_vm_lv(vm_id).await?;
+        self.storage.remove_vm_data_disks(vm_id).await?;
         Ok(())
     }
 }
@@ -160,6 +176,7 @@ pub async fn reconcile_on_startup(
     vm_mgr: &Arc<VmManager>,
     net_mgr: &NetworkManager,
     image_mgr: &crate::image::ImageManager,
+    storage: &Storage,
 ) -> anyhow::Result<ReconcileReport> {
     let mut report = ReconcileReport {
         recovered: 0,
@@ -186,7 +203,7 @@ pub async fn reconcile_on_startup(
         .map(|vm_record| async move {
             (
                 vm_record.vm_id.clone(),
-                restart_vm(config, vm_record, vm_mgr, net_mgr, image_mgr).await,
+                restart_vm(config, vm_record, vm_mgr, net_mgr, image_mgr, storage).await,
             )
         })
         .buffer_unordered(RESTART_CONCURRENCY)
@@ -230,7 +247,15 @@ pub async fn reconcile_on_startup(
         }
     }
 
-    report.orphans = sweep_orphans(&running_vm_ids, &known_ids, agent_db, vm_mgr, net_mgr).await;
+    report.orphans = sweep_orphans(
+        &running_vm_ids,
+        &known_ids,
+        agent_db,
+        vm_mgr,
+        net_mgr,
+        storage,
+    )
+    .await;
 
     Ok(report)
 }
@@ -244,6 +269,7 @@ pub async fn sweep_orphans(
     agent_db: &AgentDb,
     vm_mgr: &Arc<VmManager>,
     net_mgr: &NetworkManager,
+    storage: &Storage,
 ) -> u32 {
     // Unit reclamation runs first because its reclaim path
     // (`handlers::delete_vm`) drops the associated LV and TAPs.
@@ -252,10 +278,11 @@ pub async fn sweep_orphans(
         agent_db,
         vm_mgr,
         net_mgr,
+        storage,
     };
     let unit_reclaimed = collect(&units, known_ids, usize::MAX).await;
 
-    let lvs = LvCollector;
+    let lvs = LvCollector { storage };
     let lv_reclaimed = collect(&lvs, known_ids, ORPHAN_LV_BATCH).await;
 
     // Expected TAP names = primary for every known vm_id. Anything
@@ -276,12 +303,21 @@ pub async fn periodic_sweep(
     agent_db: &AgentDb,
     vm_mgr: &Arc<VmManager>,
     net_mgr: &NetworkManager,
+    storage: &Storage,
 ) -> anyhow::Result<u32> {
     let running_vm_ids = vm_mgr.reconcile_running().await?;
     let known_vms = agent_db.list_vms().await?;
     let mut known_ids: HashSet<String> = known_vms.iter().map(|v| v.vm_id.clone()).collect();
     known_ids.extend(vm_mgr.live_vm_ids().await);
-    Ok(sweep_orphans(&running_vm_ids, &known_ids, agent_db, vm_mgr, net_mgr).await)
+    Ok(sweep_orphans(
+        &running_vm_ids,
+        &known_ids,
+        agent_db,
+        vm_mgr,
+        net_mgr,
+        storage,
+    )
+    .await)
 }
 
 enum RestartError {
@@ -305,9 +341,10 @@ async fn restart_vm(
     vm_mgr: &Arc<VmManager>,
     net_mgr: &NetworkManager,
     image_mgr: &crate::image::ImageManager,
+    storage: &Storage,
 ) -> Result<(), RestartError> {
     let vm_dir = config.vms_dir().join(&vm_record.vm_id);
-    let rootfs_path = lvm::vm_lv_path(&vm_record.vm_id);
+    let rootfs_path = storage.vm_lv_path(&vm_record.vm_id);
     let cloud_init_path = vm_dir.join("cidata.iso");
 
     if !rootfs_path.exists() || !cloud_init_path.exists() {
@@ -317,15 +354,15 @@ async fn restart_vm(
         });
     }
 
-    let extra_disk_gibs = vm_record
-        .extra_disks()
-        .map_err(|e| RestartError::Other(anyhow::anyhow!(
+    let extra_disk_gibs = vm_record.extra_disks().map_err(|e| {
+        RestartError::Other(anyhow::anyhow!(
             "VM {} has malformed local_vms.extra_disk_gibs: {e}",
             vm_record.vm_id,
-        )))?;
+        ))
+    })?;
     let mut data_disk_paths = Vec::with_capacity(extra_disk_gibs.len());
     for index in 0..extra_disk_gibs.len() {
-        let path = lvm::data_disk_lv_path(&vm_record.vm_id, index as u32);
+        let path = storage.data_disk_lv_path(&vm_record.vm_id, index as u32);
         if !path.exists() {
             return Err(RestartError::DiskMissing {
                 lv_path: path,
@@ -336,7 +373,7 @@ async fn restart_vm(
     }
 
     let cached = image_mgr
-        .ensure_cached(&vm_record.image)
+        .ensure_cached(&vm_record.image, storage)
         .await
         .map_err(|e| RestartError::Other(e.into()))?;
 
@@ -364,12 +401,12 @@ async fn restart_vm(
         .await
         .map_err(|e| RestartError::Other(e.into()))?;
 
-    let gpu_addrs = vm_record
-        .gpus()
-        .map_err(|e| RestartError::Other(anyhow::anyhow!(
+    let gpu_addrs = vm_record.gpus().map_err(|e| {
+        RestartError::Other(anyhow::anyhow!(
             "VM {} has malformed local_vms.gpu_pci_addresses: {e}",
             vm_record.vm_id,
-        )))?;
+        ))
+    })?;
     let mut vfio_devices = Vec::new();
     for addr in &gpu_addrs {
         match gpu::bind_vfio(addr).await {

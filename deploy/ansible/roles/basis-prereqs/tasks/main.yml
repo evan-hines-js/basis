@@ -202,6 +202,108 @@
   changed_when: true
 # ------------------------------------------------------------------------
 
+# basis-data VG: plain VG (linear LVs) for VM extra disks. Provisioned
+# from `basis_lvm_data_devices` which accepts real block devices
+# (production) or {file, size} dicts (e2e on shared infra — backed by
+# a file + losetup + a systemd unit that re-binds on reboot). Same
+# var, same role; only the value differs between environments.
+
+- name: basis-data — fail loud when basis_lvm_data_devices is empty
+  ansible.builtin.assert:
+    that: basis_lvm_data_devices | length > 0
+    fail_msg: >-
+      basis_lvm_data_devices is empty. Set it to a list of block devices
+      (production) or {file, size} entries (e2e). The agent refuses to
+      start without a basis-data VG; no silent fallback to the rootfs
+      pool exists. See docs/storage-pools.md.
+
+- name: basis-data — derive file-backed entries
+  ansible.builtin.set_fact:
+    basis_data_file_entries: >-
+      {{ basis_lvm_data_devices | selectattr('file', 'defined') | list }}
+
+- name: basis-data — ensure backing files exist for file-backed entries
+  ansible.builtin.command:
+    cmd: "truncate -s {{ item.size }} {{ item.file }}"
+    creates: "{{ item.file }}"
+  loop: "{{ basis_data_file_entries }}"
+  loop_control:
+    label: "{{ item.file }}"
+
+# Single systemd unit that binds every configured file at boot. Unit is
+# only installed when at least one file-backed entry exists; pure-
+# block-device inventories never see it. Re-rendered when the file
+# list changes; daemon-reload + restart so subsequent ansible runs
+# pick up additions / removals.
+- name: basis-data — install loopback systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/basis-data-loopback.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Bind basis-data loopback devices
+      DefaultDependencies=no
+      After=local-fs.target
+      Before=lvm2-monitor.service
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      {% for entry in basis_data_file_entries %}
+      ExecStart=/bin/sh -c '/sbin/losetup -j {{ entry.file }} -O NAME --noheadings | grep -q . || /sbin/losetup --find {{ entry.file }}'
+      ExecStop=/bin/sh -c 'dev=$(/sbin/losetup -j {{ entry.file }} -O NAME --noheadings | head -1); [ -n "$dev" ] && /sbin/losetup --detach "$dev" || true'
+      {% endfor %}
+      [Install]
+      WantedBy=local-fs.target
+  when: basis_data_file_entries | length > 0
+  register: loopback_unit
+
+- name: basis-data — daemon-reload after unit change
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: loopback_unit.changed | default(false)
+
+- name: basis-data — enable + start loopback unit
+  ansible.builtin.systemd:
+    name: basis-data-loopback.service
+    enabled: true
+    state: started
+  when: basis_data_file_entries | length > 0
+
+# After the unit has run, every configured file has a loop binding.
+# Resolve every entry (file-backed or block-device) to the actual
+# device path that pvcreate/vgcreate will consume.
+- name: basis-data — resolve every entry to a block-device path
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {% for entry in basis_lvm_data_devices %}
+    {% if entry is mapping %}
+    losetup -j {{ entry.file }} -O NAME --noheadings | head -1 | awk '{$1=$1};1'
+    {% else %}
+    echo {{ entry }}
+    {% endif %}
+    {% endfor %}
+  register: basis_data_pvs
+  changed_when: false
+
+- name: basis-data — fail if any entry resolved to empty (loop not bound)
+  ansible.builtin.assert:
+    that:
+      - basis_data_pvs.stdout_lines | length == basis_lvm_data_devices | length
+      - basis_data_pvs.stdout_lines | reject('match', '^\\s*$') | list | length
+        == basis_lvm_data_devices | length
+    fail_msg: >-
+      One or more basis_lvm_data_devices entries did not resolve to a
+      block device. For file-backed entries, this means the loopback
+      systemd unit did not bind the file. Check
+      `journalctl -u basis-data-loopback.service`.
+
+- name: basis-data — create volume group {{ basis_lvm_data_vg }}
+  community.general.lvg:
+    vg: "{{ basis_lvm_data_vg }}"
+    pvs: "{{ basis_data_pvs.stdout_lines | join(',') }}"
+    state: present
+# ------------------------------------------------------------------------
+
 - name: Check installed cloud-hypervisor version
   ansible.builtin.command: "{{ basis_bin_dir }}/cloud-hypervisor --version"
   register: ch_version_check

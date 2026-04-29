@@ -1,26 +1,13 @@
-//! Startup preconditions.
-//!
-//! The provider's reconcilers watch three CRDs (`BasisCluster`,
-//! `BasisMachine`, `BasisMachineTemplate`). If the pod starts before
-//! those CRDs are registered on the apiserver — a real race when the
-//! Deployment and CRD manifests are applied concurrently — kube-rs's
-//! watcher hits its default exponential backoff and sits silently for
-//! up to ~5 minutes per watched kind before retrying. We block startup
-//! here until every CRD we manage is listable, so that backoff path
-//! can never happen in the first place.
-//!
-//! We probe by calling `list` on the CRs directly, not on
-//! `apiextensions.k8s.io/customresourcedefinitions`. That way the check
-//! uses the exact same RBAC the controllers need anyway — no extra
-//! cluster role binding required.
+//! Startup preconditions: block until the CRDs the provider watches are
+//! registered, and resolve the trust-domain identifier from cluster state.
 
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, ListParams};
 use kube::Client;
-use kube::ResourceExt;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -29,9 +16,26 @@ use crate::crds::{BasisCluster, BasisMachine, BasisMachineTemplate};
 const CRD_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const CRD_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Block until every CRD the provider watches is listable, or give up
-/// after `CRD_WAIT_TIMEOUT` so the pod crash-loops fast (letting k8s
-/// show a clear restart signal) rather than staying up idle.
+// Cross-repo contract with lattice-common: these three identifiers must match
+// `lattice_common::{CA_SECRET, CA_CERT_KEY}` and
+// `lattice_core::LATTICE_SYSTEM_NAMESPACE`. Duplicated here (rather than
+// shared via a path dep) because basis is a separate repo with its own Docker
+// build root — a cross-repo dep would break `docker build .` for any user who
+// doesn't have lattice mounted alongside. The values haven't changed in the
+// life of the project; if they do, lattice's snapshot test for these
+// constants flags it.
+const LATTICE_SYSTEM_NAMESPACE: &str = "lattice-system";
+const CA_SECRET: &str = "lattice-ca";
+const CA_CERT_KEY: &str = "ca.crt";
+
+const CA_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const CA_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Block until every CRD the provider watches is listable, or give up after
+/// `CRD_WAIT_TIMEOUT` so the pod crash-loops fast (letting k8s show a clear
+/// restart signal) rather than staying up idle. The watcher in kube-rs would
+/// otherwise back off silently for up to ~5 minutes per watched kind on the
+/// race where the Deployment lands before its CRDs.
 pub async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
     let deadline = Instant::now() + CRD_WAIT_TIMEOUT;
     wait_for_crd::<BasisCluster>(client, "BasisCluster", deadline).await?;
@@ -41,47 +45,65 @@ pub async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
 }
 
 /// Resolve the trust-domain identifier this provider stamps onto every
-/// `BasisCluster` it creates. Two-tier lookup:
+/// `BasisCluster` it creates: SHA-256 hex of the `lattice-ca` Secret's
+/// `ca.crt` PEM bytes.
 ///
-///   1. `BASIS_TRUST_DOMAIN` env var — if set non-empty, use it
-///      verbatim. This is how a child cluster inherits its parent's
-///      tree (the parent's provider sets the env on the child's
-///      provider Deployment at install time) and how an operator
-///      overrides the default if they want to merge two roots.
-///   2. The `kube-system` Namespace UID — the root fallback. The
-///      namespace is created at apiserver bootstrap and its UID is
-///      immutable for the cluster's lifetime, so this is stable
-///      across provider restarts and CAPI restarts.
+/// Same pattern lattice-istio uses for its mesh trust domain. Two clusters
+/// sharing the same `lattice-ca` derive the same identifier — which is what
+/// "in the same Lattice tree" means — so a parent cluster and every child it
+/// spawns land in the same per-tree VRF on every basis host. No env-var
+/// plumbing, no parent-kubeconfig threading: the provider self-discovers
+/// from the same shared resource Lattice already distributes.
 ///
-/// Every `BasisCluster` spawned by the same root therefore shares a
-/// tree (and a per-tree VRF on every basis host); clusters spawned by
-/// different roots land in different trees and are isolated at the
-/// kernel routing level. Operator-invisible at the cluster level —
-/// the contract is "two clusters under the same Lattice root can
-/// talk; under different roots they can't."
-///
-/// Fail loud if both lookups fail: running without a trust-domain
-/// identity would silently merge every basis cluster the provider
-/// touches into the empty-trust-domain tree and break isolation.
+/// Blocks until the Secret appears (with timeout). Lattice's parent-cell
+/// install creates it; the bootstrap path applies basis-capi-provider
+/// concurrently, so a brief absence at startup is normal.
 pub async fn read_trust_domain(client: &Client) -> anyhow::Result<String> {
-    if let Ok(explicit) = std::env::var("BASIS_TRUST_DOMAIN") {
-        if !explicit.is_empty() {
-            info!(trust_domain = %explicit, "trust domain set via BASIS_TRUST_DOMAIN");
-            return Ok(explicit);
+    let cert_pem = wait_for_lattice_ca(client).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(cert_pem.as_bytes());
+    let digest = hasher.finalize();
+    let trust_domain: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    info!(trust_domain = %trust_domain, "trust domain derived from lattice-ca");
+    Ok(trust_domain)
+}
+
+async fn wait_for_lattice_ca(client: &Client) -> anyhow::Result<String> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), LATTICE_SYSTEM_NAMESPACE);
+    let deadline = Instant::now() + CA_WAIT_TIMEOUT;
+    loop {
+        match api.get_opt(CA_SECRET).await {
+            Ok(Some(secret)) => {
+                if let Some(bytes) = secret.data.as_ref().and_then(|d| d.get(CA_CERT_KEY)) {
+                    if let Ok(pem) = std::str::from_utf8(&bytes.0) {
+                        if !pem.is_empty() {
+                            return Ok(pem.to_string());
+                        }
+                    }
+                    anyhow::bail!(
+                        "{CA_SECRET} Secret is present but {CA_CERT_KEY} is empty \
+                         or not valid UTF-8 — Lattice CA install is corrupt"
+                    );
+                }
+                anyhow::bail!(
+                    "{CA_SECRET} Secret has no {CA_CERT_KEY} key — Lattice CA \
+                     install did not finish writing the cert"
+                );
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out after {CA_WAIT_TIMEOUT:?} waiting for \
+                         {LATTICE_SYSTEM_NAMESPACE}/{CA_SECRET} Secret; Lattice's parent-cell \
+                         install must run before basis-capi-provider can stamp BasisClusters"
+                    );
+                }
+                warn!(secret = %CA_SECRET, namespace = %LATTICE_SYSTEM_NAMESPACE, "lattice-ca not present yet, retrying");
+                sleep(CA_POLL_INTERVAL).await;
+            }
+            Err(e) => return Err(e.into()),
         }
     }
-    let api: Api<Namespace> = Api::all(client.clone());
-    let ns = api
-        .get("kube-system")
-        .await
-        .map_err(|e| anyhow::anyhow!("read kube-system namespace for trust domain: {e}"))?;
-    let uid = ns.uid().ok_or_else(|| {
-        anyhow::anyhow!(
-            "kube-system namespace has no UID — apiserver state is corrupt or non-conformant"
-        )
-    })?;
-    info!(trust_domain = %uid, "trust domain resolved from kube-system namespace UID (root fallback)");
-    Ok(uid)
 }
 
 async fn wait_for_crd<K>(client: &Client, kind: &str, deadline: Instant) -> anyhow::Result<()>
@@ -110,5 +132,24 @@ where
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trust_domain_is_deterministic_64_hex() {
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJALRiMLAh0TTDMA==\n-----END CERTIFICATE-----\n";
+        let mut hasher = Sha256::new();
+        hasher.update(pem.as_bytes());
+        let td: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        assert_eq!(td.len(), 64);
+        assert!(td.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

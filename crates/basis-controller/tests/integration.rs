@@ -211,7 +211,20 @@ async fn register_agent(
             hostname: hostname.to_string(),
             total_cpu: 16,
             total_memory_mib: 65536,
-            total_disk_gib: 1000,
+            storage_capacity: Some(basis_proto::StorageCapacity {
+                rootfs: Some(basis_proto::PoolBytes {
+                    total_bytes: 200 * (1 << 30),
+                    free_bytes: 200 * (1 << 30),
+                    metadata_total_bytes: 0,
+                    metadata_free_bytes: 0,
+                }),
+                data: Some(basis_proto::PoolBytes {
+                    total_bytes: 800 * (1 << 30),
+                    free_bytes: 800 * (1 << 30),
+                    metadata_total_bytes: 0,
+                    metadata_free_bytes: 0,
+                }),
+            }),
             gpus: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
             rank: 0,
@@ -627,7 +640,12 @@ async fn test_create_machine_no_agent() {
         hostname: "ghost".to_string(),
         total_cpu: 16,
         total_memory_mib: 65536,
-        total_disk_gib: 1000,
+        rootfs_total_bytes: 200 * basis_controller::db::GIB,
+        rootfs_free_bytes: 200 * basis_controller::db::GIB,
+        rootfs_metadata_total_bytes: 0,
+        rootfs_metadata_free_bytes: 0,
+        data_total_bytes: 800 * basis_controller::db::GIB,
+        data_free_bytes: 800 * basis_controller::db::GIB,
         gpu_inventory: Vec::new(),
         vtep_address: "10.100.0.99".to_string(),
         last_heartbeat: "2025-01-01T00:00:00Z".to_string(),
@@ -777,7 +795,20 @@ async fn test_agent_cn_must_match_registered_hostname() {
             hostname: "some-other-host".to_string(),
             total_cpu: 16,
             total_memory_mib: 65536,
-            total_disk_gib: 1000,
+            storage_capacity: Some(basis_proto::StorageCapacity {
+                rootfs: Some(basis_proto::PoolBytes {
+                    total_bytes: 200 * (1 << 30),
+                    free_bytes: 200 * (1 << 30),
+                    metadata_total_bytes: 0,
+                    metadata_free_bytes: 0,
+                }),
+                data: Some(basis_proto::PoolBytes {
+                    total_bytes: 800 * (1 << 30),
+                    free_bytes: 800 * (1 << 30),
+                    metadata_total_bytes: 0,
+                    metadata_free_bytes: 0,
+                }),
+            }),
             gpus: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
             rank: 0,
@@ -810,7 +841,9 @@ async fn test_heartbeat_flips_unhealthy_back_to_healthy() {
 
     agent_tx
         .send(AgentMessage {
-            payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {})),
+            payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
+                storage_capacity: None,
+            })),
         })
         .await
         .unwrap();
@@ -874,7 +907,9 @@ async fn test_agent_stream_cannot_report_for_other_host() {
     db.mark_host_unhealthy(&host_a_id).await.unwrap();
     agent_b_tx
         .send(AgentMessage {
-            payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {})),
+            payload: Some(agent_message::Payload::Heartbeat(HeartbeatRequest {
+                storage_capacity: None,
+            })),
         })
         .await
         .unwrap();

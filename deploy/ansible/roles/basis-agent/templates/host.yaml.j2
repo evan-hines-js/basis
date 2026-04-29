@@ -12,6 +12,12 @@ spec:
   network:
     bridge: {{ basis_bridge }}
     physicalNic: {{ basis_physical_nic }}
+  storage:
+    rootfs:
+      vg: {{ basis_lvm_vg }}
+      thinPool: {{ basis_lvm_thinpool }}
+    data:
+      vg: {{ basis_lvm_data_vg }}
   tls:
     cert: {{ basis_tls_dir }}/agent.crt
     key: {{ basis_tls_dir }}/agent.key
