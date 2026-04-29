@@ -2218,7 +2218,7 @@ mod tests {
         assert_eq!(u32::from(n.bridge_start), u32::from(n.cidr.network()) + 1);
         assert_eq!(
             u32::from(n.bridge_end) - u32::from(n.bridge_start),
-            (net.bridge_reserve - 1) as u32
+            net.bridge_reserve - 1
         );
         assert_eq!(u32::from(n.vm_start), u32::from(n.bridge_end) + 1);
         assert_eq!(u32::from(n.vm_end), u32::from(n.cidr.broadcast()) - 1);
@@ -2811,7 +2811,10 @@ mod tests {
     #[tokio::test]
     async fn update_cluster_trust_domain_overwrites_stored_value() {
         let db = test_db().await;
-        let net = db.allocate_cluster_network(&make_net_config()).await.unwrap();
+        let net = db
+            .allocate_cluster_network(&make_net_config())
+            .await
+            .unwrap();
         let mut cluster = make_cluster("c1", "c1", net, "10.100.0.1");
         cluster.trust_domain = "old-td".to_string();
         db.insert_cluster(&cluster).await.unwrap();

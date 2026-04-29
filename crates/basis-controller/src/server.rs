@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -172,8 +173,73 @@ struct PendingVmOp {
 }
 
 /// Connected agent with a command channel.
+///
+/// `epoch` is the per-process unique generation stamped at the moment
+/// this stream was registered. Each new `stream_messages` call mints a
+/// fresh epoch via [`next_agent_epoch`], so a stale stream's cleanup
+/// can compare-and-remove against the live entry: if a faster reconnect
+/// has already replaced this connection's slot, the old cleanup must
+/// not clobber the new one's `command_tx`, `pending_ops`, or metric.
 struct ConnectedAgent {
     command_tx: mpsc::Sender<ControllerCommand>,
+    epoch: u64,
+}
+
+/// Mint a process-unique generation id for a new agent stream.
+fn next_agent_epoch() -> u64 {
+    static AGENT_EPOCH: AtomicU64 = AtomicU64::new(1);
+    AGENT_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Release the per-agent state owned by an `epoch`-tagged stream
+/// whose connection just ended.
+///
+/// The compare-and-remove on `epoch` is the synchronisation point with
+/// `stream_messages`'s `agents.insert`: a faster reconnect mints a new
+/// epoch and replaces the slot, after which the *old* stream's cleanup
+/// (still observing its own epoch) no-ops here. That keeps the live
+/// connection's `command_tx`, in-flight `pending_ops` waiters, and
+/// `agent_connected` metric untouched. When the slot still belongs to
+/// the caller, drain the host's pending waiters (their dispatch path
+/// is gone) and zero the metric in one place.
+///
+/// Free function (rather than a method) so it can be tested with
+/// purpose-built `DashMap`s and a fresh `Metrics` registry, without
+/// constructing a full `SharedCtx`.
+fn release_agent_stream(
+    agents: &DashMap<String, ConnectedAgent>,
+    pending_ops: &DashMap<String, PendingVmOp>,
+    metrics: &Metrics,
+    host_id: &str,
+    hostname: &str,
+    epoch: u64,
+) {
+    if agents.remove_if(host_id, |_, a| a.epoch == epoch).is_none() {
+        debug!(
+            host_id,
+            epoch, "stream cleanup skipped: superseded by newer connection"
+        );
+        return;
+    }
+    let stale: Vec<String> = pending_ops
+        .iter()
+        .filter(|e| e.value().host_id == host_id)
+        .map(|e| e.key().clone())
+        .collect();
+    for vm_id in &stale {
+        pending_ops.remove(vm_id);
+    }
+    if !stale.is_empty() {
+        warn!(
+            host_id,
+            cancelled = stale.len(),
+            "cancelled in-flight VM op waiters for disconnected agent"
+        );
+    }
+    metrics
+        .agent_connected
+        .with_label_values(&[hostname])
+        .set(0);
 }
 
 pub struct BasisServer {
@@ -264,16 +330,15 @@ impl BasisServer {
             bgp: self.bgp.clone(),
             safety: self.safety.clone(),
             agents: self.agents.clone(),
+            pending_ops: self.pending_ops.clone(),
             placement_lock: Mutex::new(()),
         });
         let basis_svc = basis_server::BasisServer::new(BasisApiService {
             shared: shared.clone(),
-            pending_ops: self.pending_ops.clone(),
         });
         let agent_svc = basis_agent_server::BasisAgentServer::new(BasisAgentService {
             shared,
             reconcile_interval: self.reconcile_interval,
-            pending_ops: self.pending_ops.clone(),
         });
         (basis_svc, agent_svc)
     }
@@ -288,6 +353,12 @@ struct SharedCtx {
     bgp: Arc<BgpConfig>,
     safety: Arc<SafetyConfig>,
     agents: Arc<DashMap<String, ConnectedAgent>>,
+    /// Tracks `CreateMachine` waiters keyed by `vm_id`. Inserted by
+    /// the API service before dispatching the agent command and
+    /// resolved by the agent stream when the VM transitions to a
+    /// terminal state. Lives on `SharedCtx` so both services share
+    /// one map without each holding its own clone.
+    pending_ops: Arc<DashMap<String, PendingVmOp>>,
     /// Serializes placement: held across `pick_host` → `insert_vm` so
     /// each scoring pass sees the prior placement's commit. Without
     /// this, N concurrent creates against an empty cluster all read
@@ -747,7 +818,6 @@ impl SharedCtx {
 
 struct BasisApiService {
     shared: Arc<SharedCtx>,
-    pending_ops: Arc<DashMap<String, PendingVmOp>>,
 }
 
 impl BasisApiService {
@@ -826,7 +896,7 @@ impl BasisApiService {
         host_id: &str,
     ) -> oneshot::Receiver<Result<(), VmFailure>> {
         let (tx, rx) = oneshot::channel();
-        self.pending_ops.insert(
+        self.shared.pending_ops.insert(
             vm_id.to_string(),
             PendingVmOp {
                 tx,
@@ -1319,12 +1389,20 @@ impl basis_server::Basis for BasisApiService {
         let req = request.into_inner();
         info!(cluster_id = %req.cluster_id, "DeleteCluster received");
 
-        let _ = self
-            .shared
-            .db
-            .get_cluster(&req.cluster_id)
-            .await
-            .map_err(db_status)?;
+        // Idempotent: once the final tombstone ack drains the cluster
+        // row, a retried finalizer cleanup must succeed so the K8s
+        // object can be released. NotFound here is the steady state.
+        match self.shared.db.get_cluster(&req.cluster_id).await {
+            Ok(_) => {}
+            Err(DbError::NotFound(_)) => {
+                info!(
+                    cluster_id = %req.cluster_id,
+                    "DeleteCluster idempotent: cluster row already drained"
+                );
+                return Ok(Response::new(DeleteClusterResponse {}));
+            }
+            Err(e) => return Err(db_status(e)),
+        }
 
         // Mark every VM of this cluster pending teardown. Each one
         // becomes a `vm_tombstone` on the next reconcile to its host.
@@ -1595,7 +1673,7 @@ impl basis_server::Basis for BasisApiService {
 
         info!(vm_id = %vm_id, host_id = %host_id, vni = cluster.vni, "CreateMachine: dispatching CreateVm to agent");
         if agent.command_tx.send(cmd).await.is_err() {
-            self.pending_ops.remove(&vm_id);
+            self.shared.pending_ops.remove(&vm_id);
             self.shared
                 .cleanup_failed_vm(&vm_id, &cluster.id, &host_id)
                 .await;
@@ -1651,7 +1729,7 @@ impl basis_server::Basis for BasisApiService {
                 Err(Status::internal("agent disconnected during VM creation"))
             }
             Err(_) => {
-                self.pending_ops.remove(&vm_id);
+                self.shared.pending_ops.remove(&vm_id);
                 let timeout_msg = format!(
                     "VM creation timed out ({}s)",
                     CREATE_MACHINE_TIMEOUT.as_secs()
@@ -1693,9 +1771,20 @@ impl basis_server::Basis for BasisApiService {
         require_capi_caller(&request)?;
         let req = request.into_inner();
         info!(vm_id = %req.id, "DeleteMachine received");
-        let vm = self.shared.db.get_vm(&req.id).await.map_err(db_status)?;
-        // Idempotent: a VM already pending teardown just nudges the
-        // host again so the tombstone re-fires on the next reconcile.
+        // Idempotent across the full lifecycle:
+        //   * row missing       → already tombstone-acked, return Ok so
+        //                         a retried finalizer cleanup lifts.
+        //   * PENDING_TEARDOWN  → nudge the host so the tombstone
+        //                         re-fires on the next reconcile.
+        //   * any other state   → start the teardown pipeline.
+        let vm = match self.shared.db.get_vm(&req.id).await {
+            Ok(v) => v,
+            Err(DbError::NotFound(_)) => {
+                info!(vm_id = %req.id, "DeleteMachine idempotent: VM row already drained");
+                return Ok(Response::new(DeleteMachineResponse {}));
+            }
+            Err(e) => return Err(db_status(e)),
+        };
         if vm.state != VM_STATE_PENDING_TEARDOWN {
             self.initiate_vm_teardown(&vm).await?;
         } else {
@@ -1752,7 +1841,6 @@ impl basis_server::Basis for BasisApiService {
 struct BasisAgentService {
     shared: Arc<SharedCtx>,
     reconcile_interval: std::time::Duration,
-    pending_ops: Arc<DashMap<String, PendingVmOp>>,
 }
 
 #[tonic::async_trait]
@@ -1850,10 +1938,12 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
             .await
             .map_err(|_| Status::internal("failed to send registration ack"))?;
 
+        let epoch = next_agent_epoch();
         self.shared.agents.insert(
             host_id.clone(),
             ConnectedAgent {
                 command_tx: command_tx.clone(),
+                epoch,
             },
         );
         self.shared
@@ -1901,16 +1991,13 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
 
         // Inbound handler.
         let shared = self.shared.clone();
-        let pending_ops = self.pending_ops.clone();
         let agent_host_id = host_id.clone();
         let agent_hostname = register.hostname.clone();
         tokio::spawn(async move {
             while let Some(result) = inbound.next().await {
                 match result {
                     Ok(msg) => {
-                        if let Err(e) =
-                            handle_agent_message(&shared, &pending_ops, &agent_host_id, msg).await
-                        {
+                        if let Err(e) = handle_agent_message(&shared, &agent_host_id, msg).await {
                             warn!(error = %e, host_id = %agent_host_id, "error handling agent message");
                         }
                     }
@@ -1921,28 +2008,15 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
                 }
             }
             info!(host_id = %agent_host_id, "agent disconnected");
-            shared.agents.remove(&agent_host_id);
             reconcile_handle.abort();
-            let stale: Vec<String> = pending_ops
-                .iter()
-                .filter(|e| e.value().host_id == agent_host_id)
-                .map(|e| e.key().clone())
-                .collect();
-            for vm_id in &stale {
-                pending_ops.remove(vm_id);
-            }
-            if !stale.is_empty() {
-                warn!(
-                    host_id = %agent_host_id,
-                    cancelled = stale.len(),
-                    "cancelled in-flight VM op waiters for disconnected agent"
-                );
-            }
-            shared
-                .metrics
-                .agent_connected
-                .with_label_values(&[&agent_hostname])
-                .set(0);
+            release_agent_stream(
+                &shared.agents,
+                &shared.pending_ops,
+                &shared.metrics,
+                &agent_host_id,
+                &agent_hostname,
+                epoch,
+            );
         });
 
         let output = ReceiverStream::new(command_rx).map(Ok);
@@ -2022,7 +2096,6 @@ impl BasisAgentService {
 
 async fn handle_agent_message(
     shared: &SharedCtx,
-    pending_ops: &DashMap<String, PendingVmOp>,
     host_id: &str,
     msg: AgentMessage,
 ) -> anyhow::Result<()> {
@@ -2102,7 +2175,7 @@ async fn handle_agent_message(
             // tombstone-driven and resolves via TombstoneAck.
             let resolves = matches!(state, MachineState::Running | MachineState::Failed);
             if resolves {
-                if let Some(pending) = pending_ops.get(&report.vm_id) {
+                if let Some(pending) = shared.pending_ops.get(&report.vm_id) {
                     if pending.host_id != host_id {
                         warn!(
                             stream_host_id = %host_id,
@@ -2113,7 +2186,7 @@ async fn handle_agent_message(
                         return Ok(());
                     }
                 }
-                if let Some((_, pending)) = pending_ops.remove(&report.vm_id) {
+                if let Some((_, pending)) = shared.pending_ops.remove(&report.vm_id) {
                     let result = if state == MachineState::Failed {
                         Err(VmFailure {
                             message: report.error_message.clone(),
@@ -2409,6 +2482,144 @@ mod tests {
             err.message().contains("extra_disk_gibs"),
             "message: {}",
             err.message(),
+        );
+    }
+
+    /// Reconnect race: a fresh stream re-inserts the host's slot
+    /// before the prior stream's cleanup runs. The old cleanup must
+    /// observe its slot is no longer current and leave the new
+    /// connection's `command_tx`, `pending_ops` waiters, and
+    /// `agent_connected` metric untouched.
+    #[test]
+    fn release_agent_stream_skips_when_superseded() {
+        use tokio::sync::oneshot;
+
+        let metrics = Metrics::new(1.0).expect("metrics");
+        let agents: DashMap<String, ConnectedAgent> = DashMap::new();
+        let pending_ops: DashMap<String, PendingVmOp> = DashMap::new();
+
+        let host = "host-a";
+        let hostname = "host-a.local";
+        let old_epoch = 1;
+        let new_epoch = 2;
+
+        // New connection's command_tx — the value we must not drop.
+        let (new_tx, _new_rx) = mpsc::channel::<ControllerCommand>(1);
+        agents.insert(
+            host.to_string(),
+            ConnectedAgent {
+                command_tx: new_tx.clone(),
+                epoch: new_epoch,
+            },
+        );
+
+        // New connection's in-flight CreateMachine waiter for vm-1.
+        let (waiter_tx, waiter_rx) = oneshot::channel::<Result<(), VmFailure>>();
+        pending_ops.insert(
+            "vm-1".to_string(),
+            PendingVmOp {
+                tx: waiter_tx,
+                host_id: host.to_string(),
+            },
+        );
+
+        metrics
+            .agent_connected
+            .with_label_values(&[hostname])
+            .set(1);
+
+        release_agent_stream(&agents, &pending_ops, &metrics, host, hostname, old_epoch);
+
+        assert_eq!(
+            agents.get(host).map(|a| a.epoch),
+            Some(new_epoch),
+            "live slot must survive a stale stream's cleanup",
+        );
+        assert!(
+            pending_ops.contains_key("vm-1"),
+            "in-flight waiter for the live connection must not be cancelled",
+        );
+        assert!(!waiter_rx.is_terminated(), "waiter sender must remain live",);
+        assert_eq!(
+            metrics.agent_connected.with_label_values(&[hostname]).get(),
+            1,
+            "agent_connected gauge must not be cleared while a live stream owns it",
+        );
+    }
+
+    /// Genuine disconnect (no reconnect): the slot still belongs to
+    /// us, so we drain it — agents entry removed, host's pending
+    /// waiters cancelled, metric zeroed.
+    #[test]
+    fn release_agent_stream_drains_when_still_owner() {
+        use tokio::sync::oneshot;
+
+        let metrics = Metrics::new(1.0).expect("metrics");
+        let agents: DashMap<String, ConnectedAgent> = DashMap::new();
+        let pending_ops: DashMap<String, PendingVmOp> = DashMap::new();
+
+        let host = "host-a";
+        let hostname = "host-a.local";
+        let epoch = 7;
+
+        let (tx, _rx) = mpsc::channel::<ControllerCommand>(1);
+        agents.insert(
+            host.to_string(),
+            ConnectedAgent {
+                command_tx: tx,
+                epoch,
+            },
+        );
+
+        let (waiter_tx, mut waiter_rx) = oneshot::channel::<Result<(), VmFailure>>();
+        pending_ops.insert(
+            "vm-1".to_string(),
+            PendingVmOp {
+                tx: waiter_tx,
+                host_id: host.to_string(),
+            },
+        );
+        // A waiter for a different host must be left alone — we only
+        // cancel the disconnecting host's pipeline. Receiver bound
+        // with `_` so it lives to the end of the test scope.
+        let (other_tx, _other_rx) = oneshot::channel::<Result<(), VmFailure>>();
+        pending_ops.insert(
+            "vm-2".to_string(),
+            PendingVmOp {
+                tx: other_tx,
+                host_id: "host-b".to_string(),
+            },
+        );
+
+        metrics
+            .agent_connected
+            .with_label_values(&[hostname])
+            .set(1);
+
+        release_agent_stream(&agents, &pending_ops, &metrics, host, hostname, epoch);
+
+        assert!(agents.get(host).is_none(), "slot must be released");
+        assert!(
+            !pending_ops.contains_key("vm-1"),
+            "host's pending waiters must be cancelled",
+        );
+        assert!(
+            pending_ops.contains_key("vm-2"),
+            "other hosts' waiters must be left intact",
+        );
+        // Cancelling drops the sender; the receiver should resolve
+        // with a recv error rather than a value.
+        assert!(
+            matches!(
+                waiter_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "cancelled waiter receiver must observe channel closure",
+        );
+        assert_eq!(
+            metrics.agent_connected.with_label_values(&[hostname]).get(),
+            0,
+            "agent_connected must be zeroed on real disconnect",
         );
     }
 }
