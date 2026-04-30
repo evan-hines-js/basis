@@ -272,7 +272,15 @@ async fn cleanup(
             .get(&cluster.spec.credentials_ref, &namespace)
             .await?;
         info!(cluster_id = %id, "calling Basis.DeleteCluster");
-        basis.delete_cluster(id).await?;
+        match basis.delete_cluster(id.clone()).await {
+            Ok(()) => {}
+            // Same idempotent-delete reasoning as in machine
+            // cleanup: NotFound is the goal state.
+            Err(e) if e.is_not_found() => {
+                info!(cluster_id = %id, "cluster already absent in Basis controller; finalizer lifting");
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(Action::await_change())
 }

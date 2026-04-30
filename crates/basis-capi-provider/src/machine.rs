@@ -416,7 +416,19 @@ async fn cleanup(
     let basis = ctx.clients.get(&credentials_ref, &namespace).await?;
 
     info!(vm_id = %id, "deleting VM in Basis controller");
-    basis.delete_machine(id).await?;
+    match basis.delete_machine(id.clone()).await {
+        Ok(()) => {}
+        // NotFound is success for finalizers: the resource is gone,
+        // which is the goal state. Without this, a CreateMachine
+        // that rolled back server-side leaves the BasisMachine's
+        // status carrying a stale vm_id, and CAPI loops on
+        // "controller RPC failed: not found" until the finalizer
+        // is hand-stripped. Standard idempotent-delete pattern.
+        Err(e) if e.is_not_found() => {
+            info!(vm_id = %id, "VM already absent in Basis controller; finalizer lifting");
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(Action::await_change())
 }
 

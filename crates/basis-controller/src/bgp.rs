@@ -18,7 +18,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use basis_common::gobgp::{AfiSafi, GobgpClient, PeerSpec};
+use basis_common::gobgp::{
+    AfiSafi, ClusterIngress, GobgpClient, IngressPolicySpec, PeerSpec,
+};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -85,6 +87,15 @@ impl Reflector {
         self.client.reconcile_peers(peers, true).await?;
         debug!(peers = peers.len(), "BGP neighbor set updated");
         Ok(())
+    }
+
+    /// Reconcile the reflector's ingress policy. Restricts what each
+    /// peer can advertise so a compromised K8s node can't hijack a
+    /// sibling cluster's prefixes by announcing arbitrary routes.
+    /// See [`IngressPolicySpec`] for the trust model.
+    pub async fn update_ingress_policy(&self, spec: &IngressPolicySpec) -> anyhow::Result<()> {
+        self.ensure_running().await?;
+        self.client.reconcile_ingress_policy(spec).await
     }
 }
 
@@ -220,6 +231,96 @@ pub async fn acl_reconciler(db: Db, shutdown: CancellationToken) {
         },
     )
     .await
+}
+
+/// Periodic reconciler that pushes the cell's ingress prefix-list
+/// policy to the local gobgpd. Each tick computes the desired
+/// [`IngressPolicySpec`] from the DB (cluster prefixes + per-
+/// cluster K8s nodes + hypervisor IPs) and pushes it via
+/// `SetPolicies` + `AddPolicyAssignment`. SetPolicies is wholesale
+/// idempotent — gobgpd replaces its policy state atomically, so we
+/// don't track a `last` snapshot here, just push every tick.
+pub async fn policy_reconciler(reflector: Arc<Reflector>, db: Db, shutdown: CancellationToken) {
+    let mut ticker = tokio::time::interval(RECONCILER_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("BGP ingress policy reconciler shutting down");
+                return;
+            }
+            _ = ticker.tick() => {
+                let spec = match compute_ingress_policy(&db).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "ingress policy reconciler: compute failed");
+                        continue;
+                    }
+                };
+                if let Err(e) = reflector.update_ingress_policy(&spec).await {
+                    warn!(error = %e, "ingress policy reconciler: push failed");
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot the DB into an [`IngressPolicySpec`]. One pass over
+/// `hosts`, `clusters`, and `vms`; clusters are bucketed by id so
+/// we can map each VM to its cluster's allowed prefix set.
+async fn compute_ingress_policy(db: &Db) -> Result<IngressPolicySpec, crate::db::DbError> {
+    let hypervisors: Vec<IpAddr> = db
+        .list_hosts()
+        .await?
+        .into_iter()
+        .filter_map(|h| h.vtep_address.parse::<IpAddr>().ok())
+        .collect();
+
+    let mut clusters: std::collections::HashMap<String, ClusterIngress> =
+        std::collections::HashMap::new();
+    for c in db.list_clusters().await? {
+        let mut allowed: Vec<String> = Vec::new();
+        if !c.cidr.is_empty() {
+            allowed.push(c.cidr.clone());
+        }
+        if !c.service_block_cidr.is_empty() {
+            allowed.push(c.service_block_cidr.clone());
+        }
+        // Apiserver VIP /32 — only for PUBLIC visibility (visibility
+        // != 0 means private, the VIP lives inside the cluster CIDR
+        // and is already covered by the cluster CIDR entry above).
+        if c.apiserver_visibility == 0 && !c.control_plane_endpoint.is_empty() {
+            // Endpoint format is "host:port"; strip port.
+            let host = c
+                .control_plane_endpoint
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(&c.control_plane_endpoint);
+            if let Ok(addr) = host.parse::<IpAddr>() {
+                allowed.push(format!("{addr}/32"));
+            }
+        }
+        clusters.insert(
+            c.id.clone(),
+            ClusterIngress {
+                cluster_id: c.id,
+                allowed_prefixes: allowed,
+                nodes: Vec::new(),
+            },
+        );
+    }
+    for vm in db.list_vms(None).await? {
+        let Ok(addr) = vm.ip_address.parse::<IpAddr>() else {
+            continue;
+        };
+        if let Some(cluster) = clusters.get_mut(&vm.cluster_id) {
+            cluster.nodes.push(addr);
+        }
+    }
+
+    Ok(IngressPolicySpec {
+        clusters: clusters.into_values().collect(),
+        hypervisors,
+    })
 }
 
 /// Periodic reconciler that mirrors the `hosts` table into the BGP

@@ -16,11 +16,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use basis_proto::gobgp::{
-    attribute, family, go_bgp_service_client::GoBgpServiceClient, nlri, watch_event_request,
-    watch_event_response, AddPathRequest, AddPeerRequest, Attribute, DeletePathRequest,
-    DeletePeerRequest, Family, GetBgpRequest, Global, IpAddressPrefix, ListPathRequest,
-    ListPeerRequest, NextHopAttribute, Nlri, OriginAttribute, Path, Peer, PeerConf, RouteReflector,
-    StartBgpRequest, TableType, WatchEventRequest,
+    attribute, family, go_bgp_service_client::GoBgpServiceClient, match_set, nlri,
+    watch_event_request, watch_event_response, Actions, AddPathRequest, AddPeerRequest,
+    AddPolicyAssignmentRequest, Attribute, Conditions, DefinedSet, DefinedType, DeletePathRequest,
+    DeletePeerRequest, DeletePolicyAssignmentRequest, Family, GetBgpRequest, Global,
+    IpAddressPrefix, ListPathRequest, ListPeerRequest, MatchSet, NextHopAttribute, Nlri,
+    OriginAttribute, Path, Peer, PeerConf, Policy, PolicyAssignment, PolicyDirection, Prefix,
+    RouteAction, RouteReflector, SetPoliciesRequest, StartBgpRequest, Statement, TableType,
+    WatchEventRequest,
 };
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
@@ -322,6 +325,113 @@ impl GobgpClient {
         Ok(())
     }
 
+    /// Reconcile gobgpd's ingress prefix-list policy to exactly
+    /// `spec`. Idempotent: gobgp's `SetPolicies` replaces the
+    /// daemon's defined-sets + policies in one shot, and the
+    /// import-direction PolicyAssignment is delete-then-add
+    /// (gobgp doesn't expose a "replace" RPC for assignments).
+    ///
+    /// Effect: every BGP session's ingress is filtered. A K8s node
+    /// peer can advertise only its own cluster's allocated
+    /// prefixes; hypervisor peers (trusted) can advertise anything.
+    /// Anything not matching one of the per-cluster statements or
+    /// the hypervisor statement is dropped before reaching the
+    /// RIB, so no reflection downstream.
+    pub async fn reconcile_ingress_policy(&self, spec: &IngressPolicySpec) -> anyhow::Result<()> {
+        const POLICY_NAME: &str = "cell-ingress";
+        const ASSIGNMENT_NAME: &str = "global";
+        const HYPERVISOR_SET: &str = "hypervisors";
+
+        let mut defined_sets: Vec<DefinedSet> = Vec::new();
+        let mut statements: Vec<Statement> = Vec::new();
+
+        // Per-cluster: one prefix-set + one neighbor-set + one
+        // statement that ANDs them. Skip clusters with empty
+        // prefixes or empty nodes — the statement could never
+        // match and gobgpd rejects empty defined-sets.
+        for cluster in &spec.clusters {
+            if cluster.allowed_prefixes.is_empty() || cluster.nodes.is_empty() {
+                continue;
+            }
+            let prefix_set_name = format!("cluster-{}-prefixes", cluster.cluster_id);
+            let neighbor_set_name = format!("cluster-{}-nodes", cluster.cluster_id);
+            defined_sets.push(prefix_defined_set(&prefix_set_name, &cluster.allowed_prefixes)?);
+            defined_sets.push(neighbor_defined_set(&neighbor_set_name, &cluster.nodes));
+            statements.push(accept_statement(
+                &format!("cluster-{}-import", cluster.cluster_id),
+                &neighbor_set_name,
+                Some(&prefix_set_name),
+            ));
+        }
+
+        // Hypervisor catch-all: trusted, accept anything they
+        // advertise. Omit when no hypervisors are registered yet
+        // (an empty defined-set would just match nothing).
+        if !spec.hypervisors.is_empty() {
+            defined_sets.push(neighbor_defined_set(HYPERVISOR_SET, &spec.hypervisors));
+            statements.push(accept_statement(
+                "hypervisor-import",
+                HYPERVISOR_SET,
+                None,
+            ));
+        }
+
+        let policy = Policy {
+            name: POLICY_NAME.to_string(),
+            statements: statements.clone(),
+        };
+
+        let mut client = self.inner.lock().await;
+
+        // SetPolicies replaces defined-sets + policies wholesale —
+        // no diff needed, gobgp's atomic apply is idempotent.
+        client
+            .set_policies(req(SetPoliciesRequest {
+                defined_sets,
+                policies: vec![policy.clone()],
+                assignments: Vec::new(),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("SetPolicies: {e}"))?;
+
+        // Re-add the import-direction assignment with default
+        // REJECT. gobgp doesn't expose an idempotent "set
+        // assignment" RPC, so delete-then-add. The delete is
+        // best-effort because on first run the assignment doesn't
+        // exist yet and DeletePolicyAssignment errors with "not
+        // found" — that's a clean state, not a real failure.
+        let _ = client
+            .delete_policy_assignment(req(DeletePolicyAssignmentRequest {
+                assignment: Some(PolicyAssignment {
+                    name: ASSIGNMENT_NAME.to_string(),
+                    direction: PolicyDirection::Import as i32,
+                    policies: Vec::new(),
+                    default_action: RouteAction::Reject as i32,
+                }),
+                all: false,
+            }))
+            .await;
+        client
+            .add_policy_assignment(req(AddPolicyAssignmentRequest {
+                assignment: Some(PolicyAssignment {
+                    name: ASSIGNMENT_NAME.to_string(),
+                    direction: PolicyDirection::Import as i32,
+                    policies: vec![policy],
+                    default_action: RouteAction::Reject as i32,
+                }),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("AddPolicyAssignment: {e}"))?;
+
+        debug!(
+            clusters = spec.clusters.len(),
+            hypervisors = spec.hypervisors.len(),
+            statements = statements.len(),
+            "ingress policy reconciled",
+        );
+        Ok(())
+    }
+
     /// Subscribe to gobgpd's RIB and yield IPv4-unicast best-path
     /// updates as they happen, one [`LearnedRoute`] at a time.
     /// `init=true` on the filter so gobgpd replays its current RIB
@@ -386,6 +496,48 @@ impl GobgpClient {
 pub struct PeerSpec {
     pub address: IpAddr,
     pub asn: u32,
+}
+
+/// Per-cell ingress prefix-list policy for the route reflector.
+/// Restricts what each peer can advertise into the cell, so a
+/// compromised K8s node can't hijack a sibling cluster's IPs by
+/// announcing arbitrary prefixes.
+///
+/// Trust model:
+/// * **Hypervisors** (basis-agents) are trusted — basis owns their
+///   binaries and underlay IPs. They can advertise anything.
+/// * **K8s nodes** (VMs running customer workloads) are restricted
+///   to their own cluster's allocated address space.
+///
+/// Encoded as one global IMPORT [`PolicyAssignment`] with default
+/// REJECT, plus a [`Policy`] containing one [`Statement`] per
+/// [`ClusterIngress`] (accept if neighbor in cluster's nodes AND
+/// prefix in cluster's allowed set) and one [`Statement`] for
+/// hypervisors (accept if neighbor in hypervisor set).
+#[derive(Debug, Clone, Default)]
+pub struct IngressPolicySpec {
+    pub clusters: Vec<ClusterIngress>,
+    pub hypervisors: Vec<IpAddr>,
+}
+
+/// One cluster's contribution to [`IngressPolicySpec`]. Empty
+/// `nodes` or `allowed_prefixes` cause the cluster's statement to
+/// be omitted entirely (a statement that can't match nothing is
+/// just dead weight in gobgpd's policy evaluator).
+#[derive(Debug, Clone)]
+pub struct ClusterIngress {
+    /// Stable cluster identifier; used to namespace the
+    /// cluster-specific defined-sets and statement names so a
+    /// cluster's create/delete doesn't collide with siblings'.
+    pub cluster_id: String,
+    /// CIDRs the cluster's K8s nodes are permitted to advertise:
+    /// the LB pool slice the controller carved for this cluster,
+    /// the apiserver VIP /32 if APISERVER_PUBLIC, the cluster's
+    /// own overlay CIDR.
+    pub allowed_prefixes: Vec<String>,
+    /// Cluster-overlay IPs of every K8s node in this cluster —
+    /// the peer addresses gobgpd will see on incoming sessions.
+    pub nodes: Vec<IpAddr>,
 }
 
 /// One IPv4-unicast best-path event from gobgpd's RIB. Maps a
@@ -537,6 +689,80 @@ impl AfiSafi {
                 safi: family::Safi::Evpn as i32,
             },
         }
+    }
+}
+
+/// Build a [`DefinedSet`] of type PREFIX from a list of CIDRs.
+/// Each prefix is added without min/max length bounds, so an
+/// exact-match check (`MatchSet::Type::Any` against this set
+/// matches any prefix that is exactly one of the entries). Returns
+/// an error on any unparseable CIDR — silently dropping malformed
+/// inputs would let an attacker advertise any prefix by
+/// substituting garbage in the upstream config.
+fn prefix_defined_set(name: &str, prefixes: &[String]) -> anyhow::Result<DefinedSet> {
+    let mut out = Vec::with_capacity(prefixes.len());
+    for raw in prefixes {
+        let net: ipnet::IpNet = raw
+            .parse()
+            .map_err(|e| anyhow::anyhow!("prefix '{raw}' in defined-set '{name}': {e}"))?;
+        out.push(Prefix {
+            ip_prefix: net.to_string(),
+            mask_length_min: net.prefix_len() as u32,
+            mask_length_max: net.prefix_len() as u32,
+        });
+    }
+    Ok(DefinedSet {
+        defined_type: DefinedType::Prefix as i32,
+        name: name.to_string(),
+        list: Vec::new(),
+        prefixes: out,
+    })
+}
+
+/// Build a [`DefinedSet`] of type NEIGHBOR. gobgpd compares
+/// session source addresses against this list, so each entry is a
+/// single IP rendered as a `/32` (or `/128` for IPv6) — gobgp's
+/// neighbor-set parser interprets bare IPs as host-routes either
+/// way, but the explicit prefix length is documented and
+/// upstream-stable.
+fn neighbor_defined_set(name: &str, addrs: &[IpAddr]) -> DefinedSet {
+    DefinedSet {
+        defined_type: DefinedType::Neighbor as i32,
+        name: name.to_string(),
+        list: addrs
+            .iter()
+            .map(|a| match a {
+                IpAddr::V4(v) => format!("{v}/32"),
+                IpAddr::V6(v) => format!("{v}/128"),
+            })
+            .collect(),
+        prefixes: Vec::new(),
+    }
+}
+
+/// Build a [`Statement`] that accepts when the incoming neighbor
+/// is in `neighbor_set` and (optionally) the prefix is in
+/// `prefix_set`. Non-matching paths fall through to the next
+/// statement; the policy assignment's default action catches the
+/// unmatched tail.
+fn accept_statement(name: &str, neighbor_set: &str, prefix_set: Option<&str>) -> Statement {
+    Statement {
+        name: name.to_string(),
+        conditions: Some(Conditions {
+            prefix_set: prefix_set.map(|n| MatchSet {
+                r#type: match_set::Type::Any as i32,
+                name: n.to_string(),
+            }),
+            neighbor_set: Some(MatchSet {
+                r#type: match_set::Type::Any as i32,
+                name: neighbor_set.to_string(),
+            }),
+            ..Default::default()
+        }),
+        actions: Some(Actions {
+            route_action: RouteAction::Accept as i32,
+            ..Default::default()
+        }),
     }
 }
 

@@ -76,6 +76,14 @@ async fn main() -> anyhow::Result<()> {
         basis_controller::bgp::acl_reconciler(acl_db, acl_shutdown).await;
     });
 
+    let policy_db = db.clone();
+    let policy_reflector = reflector.clone();
+    let policy_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        basis_controller::bgp::policy_reconciler(policy_reflector, policy_db, policy_shutdown)
+            .await;
+    });
+
     let health_db = db.clone();
     let health_shutdown = shutdown.clone();
     tokio::spawn(async move {

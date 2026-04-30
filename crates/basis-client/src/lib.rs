@@ -78,6 +78,17 @@ impl ClientError {
             _ => false,
         }
     }
+
+    /// True when the controller reports the target resource doesn't
+    /// exist. Idempotent delete paths (CAPI finalizers, tombstone
+    /// reconcilers) treat this as success — the goal is "the
+    /// resource is gone," and a missing resource is the goal state
+    /// regardless of whether *we* removed it. Without this, a
+    /// finalizer with a stale `basis_vm_id` (e.g. from a CreateMachine
+    /// that rolled back server-side) loops forever.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, ClientError::Rpc(s) if s.code() == Code::NotFound)
+    }
 }
 
 /// A cluster as the caller cares about it. Carries the IDs the caller

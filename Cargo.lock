@@ -417,6 +417,7 @@ dependencies = [
  "anyhow",
  "basis-proto",
  "humantime",
+ "ipnet",
  "prost",
  "prost-types",
  "rcgen",
