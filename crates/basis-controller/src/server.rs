@@ -1270,7 +1270,10 @@ impl basis_server::Basis for BasisApiService {
                 self.shared.broadcast_cluster(&existing.id).await;
             }
             info!(cluster_id = %existing.id, name = %req.name, "CreateCluster idempotent return");
-            return Ok(Response::new(create_cluster_response(&existing)));
+            return Ok(Response::new(create_cluster_response(
+                &existing,
+                &self.shared.bgp,
+            )));
         }
 
         // Allocate-and-insert is wrapped in a bounded retry: the
@@ -1347,7 +1350,10 @@ impl basis_server::Basis for BasisApiService {
                         attempt,
                         "CreateCluster: new cluster provisioned"
                     );
-                    return Ok(Response::new(create_cluster_response(&row)));
+                    return Ok(Response::new(create_cluster_response(
+                        &row,
+                        &self.shared.bgp,
+                    )));
                 }
                 Err(DbError::Conflict(_)) => {
                     // Concurrent CreateCluster with the same name beat
@@ -1366,7 +1372,10 @@ impl basis_server::Basis for BasisApiService {
                                 req.name,
                             ))
                         })?;
-                    return Ok(Response::new(create_cluster_response(&existing)));
+                    return Ok(Response::new(create_cluster_response(
+                        &existing,
+                        &self.shared.bgp,
+                    )));
                 }
                 Err(DbError::AllocationRaced(msg)) => {
                     // VNI or CIDR collision with a concurrent winner.
@@ -2254,13 +2263,23 @@ fn cluster_to_proto(c: &ClusterRow) -> Cluster {
     }
 }
 
-fn create_cluster_response(c: &ClusterRow) -> CreateClusterResponse {
+/// `bgp` carries the cell RR address + ASN so the cluster's k8s
+/// nodes can peer with it. Same values that flow to basis-agents on
+/// `RegisterHostResponse`; surfaced at cluster scope here so
+/// basis-capi-provider can render Cilium's BGP CRDs without leaking
+/// the values into Lattice's CRD types.
+fn create_cluster_response(
+    c: &ClusterRow,
+    bgp: &crate::config::BgpConfig,
+) -> CreateClusterResponse {
     CreateClusterResponse {
         cluster_id: c.id.clone(),
         control_plane_endpoint: c.control_plane_endpoint.clone(),
         vni: c.vni as u32,
         cidr: c.cidr.clone(),
         service_block_cidr: c.service_block_cidr.clone(),
+        bgp_reflector_address: bgp.router_id.clone(),
+        bgp_asn: bgp.asn,
     }
 }
 

@@ -6,6 +6,7 @@
 //! CRDs hold user intent, the Basis controller holds infrastructure truth.
 
 pub mod bootstrap;
+pub mod cilium_bgp;
 pub mod client_cache;
 pub mod cluster;
 pub mod components;
@@ -14,3 +15,4 @@ pub mod crds;
 pub mod machine;
 pub mod reconciler;
 pub mod startup;
+pub mod workload;

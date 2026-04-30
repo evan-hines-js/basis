@@ -99,6 +99,16 @@ message CreateClusterResponse {
   // CIDR of the cluster's LoadBalancer Service block, allocated from
   // the named pool. Empty when the cluster requested 0 service IPs.
   string service_block_cidr = 5;
+  // Cell BGP route reflector address — the iBGP peer every node in
+  // this cluster talks to. Cilium on the cluster's k8s nodes opens
+  // its BGP session against this address (see
+  // `crates/lattice-cilium` BGP variant). Same RR every basis-agent
+  // peers with on its host; consumers must not assume the cluster's
+  // RR is distinct from the cell RR.
+  string bgp_reflector_address = 6;
+  // Cell ASN — single ASN cell-wide, every speaker uses it (sessions
+  // are iBGP). Communities tag per-cluster identity, not ASNs.
+  uint32 bgp_asn = 7;
 }
 
 message DeleteClusterRequest {

@@ -307,8 +307,52 @@ impl VmManager {
             std::fs::remove_dir_all(&vm_dir).ok();
         }
 
+        // Drop systemd's record of the unit. We launch with
+        // `--remain-after-exit`, so once cloud-hypervisor exits the
+        // unit object lingers in `failed`/`exited` state until
+        // explicitly reset. Without this, `list-units --all` keeps
+        // every dead unit forever (we found 1004 ghost units in one
+        // homelab) and the orphan sweep can't tell live from dead.
+        let _ = Command::new("systemctl")
+            .args(["reset-failed", &unit_name])
+            .output()
+            .await;
+
         info!(vm_id, "VM deleted");
         Ok(())
+    }
+
+    /// Every `basis-vm-*.service` unit known to systemd, regardless
+    /// of state. Distinct from [`reconcile_running`], which only
+    /// returns currently-running units. The orphan sweep uses this
+    /// so it can also clean up units that have exited (failed or
+    /// otherwise) but still linger because `--remain-after-exit`
+    /// keeps them alive until `reset-failed`.
+    pub async fn list_all_unit_vm_ids(&self) -> Result<Vec<String>, VmError> {
+        let output = Command::new("systemctl")
+            .args([
+                "list-units",
+                "--type=service",
+                "--all",
+                "--no-legend",
+                "--plain",
+                "basis-vm-*",
+            ])
+            .output()
+            .await?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut ids = Vec::new();
+        for line in stdout.lines() {
+            let unit = line.split_whitespace().next().unwrap_or("");
+            if let Some(vm_id) = unit
+                .strip_prefix("basis-vm-")
+                .and_then(|s| s.strip_suffix(".service"))
+            {
+                ids.push(vm_id.to_string());
+            }
+        }
+        Ok(ids)
     }
 
     /// Reconcile running cloud-hypervisor processes on agent startup.

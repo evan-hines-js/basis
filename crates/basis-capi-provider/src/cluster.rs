@@ -61,6 +61,12 @@ pub enum ClusterError {
 
     #[error("resolving credentials: {0}")]
     Credentials(#[from] CacheError),
+
+    /// Catch-all for control-plane plumbing errors (kubeconfig
+    /// parsing, dynamic-object SSA, GVK resolution) that aren't
+    /// transient enough to deserve their own variant.
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 impl ReconcileError for ClusterError {
@@ -72,6 +78,7 @@ impl ReconcileError for ClusterError {
             ClusterError::Basis(e) if e.is_transient() => "BasisBackpressure",
             ClusterError::Basis(_) => "BasisRpcError",
             ClusterError::Credentials(_) => "BasisCredentialsInvalid",
+            ClusterError::Internal(_) => "InternalError",
         }
     }
 
@@ -191,6 +198,17 @@ async fn apply(
         conditions::ready_true("Provisioned", generation),
     );
 
+    // BGP reflector + ASN come from `Basis.CreateCluster` and feed
+    // the per-cluster Cilium BGP CRDs. Empty values mean basis is on
+    // a build that predates the cluster-level BGP RPC fields — in
+    // that case downstream falls back to L2-announce. We leave the
+    // status fields `None` rather than emit empty strings so a stale
+    // BasisCluster from a prior basis-controller version doesn't
+    // appear to advertise a 0.0.0.0 RR.
+    let bgp_reflector_address =
+        (!created.bgp_reflector_address.is_empty()).then(|| created.bgp_reflector_address.clone());
+    let bgp_asn = (created.bgp_asn != 0).then_some(created.bgp_asn);
+
     merge_status(
         &api,
         &name,
@@ -199,6 +217,8 @@ async fn apply(
                 "basisClusterId": created.cluster_id,
                 "vni": created.vni,
                 "cidr": created.cidr,
+                "bgpReflectorAddress": bgp_reflector_address,
+                "bgpAsn": bgp_asn,
                 "ready": true,
                 "initialization": { "provisioned": true },
                 "failureMessage": serde_json::Value::Null,
@@ -207,6 +227,32 @@ async fn apply(
         }),
     )
     .await?;
+
+    // Per-cluster Cilium BGP CRDs. Best-effort: if the workload
+    // cluster's apiserver isn't reachable yet (kubeadm hasn't
+    // finished, kubeconfig Secret not written), the next reconcile
+    // retries. Skipped entirely when basis-controller didn't
+    // populate BGP fields (older controller — cluster falls back to
+    // L2-announce, which doesn't need CRDs).
+    if let (Some(reflector), Some(asn)) = (bgp_reflector_address.as_deref(), bgp_asn) {
+        let docs = crate::cilium_bgp::render_bgp_crds(&crate::cilium_bgp::BgpRenderInputs {
+            cluster_id: &created.cluster_id,
+            reflector_address: reflector,
+            asn,
+        })
+        .map_err(|e| ClusterError::Internal(format!("rendering BGP CRDs: {e}")))?;
+        match crate::workload::workload_client(&ctx.client, &name, &namespace).await? {
+            Some(workload) => {
+                crate::workload::apply_bgp_crds(&workload, &docs).await?;
+            }
+            None => {
+                info!(
+                    cluster = %name,
+                    "kubeconfig Secret not present yet; deferring BGP CRD apply"
+                );
+            }
+        }
+    }
 
     Ok(Action::requeue(Duration::from_secs(300)))
 }

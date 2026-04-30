@@ -174,9 +174,20 @@ fn render_acl_ruleset(allowed: &BTreeSet<IpAddr>) -> String {
 /// pressure on holod stays sub-1Hz steady-state.
 const RECONCILER_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Snapshot of every healthy host's underlay address — the set the
-/// reflector treats as legitimate BGP sources. Both reconcilers
-/// (peer + ACL) consume this same set so they can't disagree.
+/// Snapshot of every legitimate iBGP source in the cell — the set
+/// the reflector accepts sessions from. Two populations:
+///
+/// 1. **Hypervisor underlay addresses**: every basis-agent runs
+///    holod and advertises cluster_vips it carries.
+/// 2. **K8s node cluster-overlay addresses**: every VM that hosts a
+///    Cilium-on-k8s daemon peers with the RR over the cluster
+///    overlay (basis's per-tree VRF + the controller's
+///    `tcp_l3mdev_accept` sysctl let those sessions cross). Cilium
+///    announces the per-cluster LB pool /32s; the RR reflects them
+///    cell-wide.
+///
+/// Both reconcilers (peer + ACL) consume this same set so they can't
+/// disagree on who's allowed.
 async fn legitimate_sources(db: &Db) -> Result<BTreeSet<IpAddr>, crate::db::DbError> {
     let mut out = BTreeSet::new();
     for host in db.list_hosts().await? {
@@ -184,6 +195,18 @@ async fn legitimate_sources(db: &Db) -> Result<BTreeSet<IpAddr>, crate::db::DbEr
             continue;
         }
         if let Ok(addr) = host.vtep_address.parse::<IpAddr>() {
+            out.insert(addr);
+        }
+    }
+    // VM rows' `ip_address` is the cluster-overlay IP the k8s node
+    // boots with. Empty means the VM hasn't been placed yet
+    // (transient — the controller fills it on placement); skip those
+    // until the next tick rather than emit `0.0.0.0` peers.
+    for vm in db.list_vms(None).await? {
+        if vm.ip_address.is_empty() {
+            continue;
+        }
+        if let Ok(addr) = vm.ip_address.parse::<IpAddr>() {
             out.insert(addr);
         }
     }

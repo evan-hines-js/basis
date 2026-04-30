@@ -154,6 +154,23 @@ pub struct BasisClusterStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cidr: Option<String>,
 
+    /// Cell BGP route reflector address. Every k8s node in this
+    /// cluster peers with this RR (`bgpControlPlane.enabled=true`
+    /// in the Cilium chart variant for basis); the per-cluster
+    /// `CiliumBGPClusterConfig` + `CiliumBGPAdvertisement` CRDs are
+    /// rendered from this + [`Self::bgp_asn`]. Returned by
+    /// `Basis.CreateCluster` and stamped onto the BasisCluster
+    /// status so consumers (the bootstrap bundle, downstream
+    /// reconcilers) can read the value without re-querying the
+    /// basis-controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bgp_reflector_address: Option<String>,
+
+    /// Cell ASN. Single ASN cell-wide; same provenance as
+    /// [`Self::bgp_reflector_address`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bgp_asn: Option<u32>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initialization: Option<InitializationStatus>,
 

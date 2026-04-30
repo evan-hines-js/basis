@@ -450,9 +450,27 @@ impl Storage {
             lvremove(vg, &lv_name).await?;
         }
 
+        // `--wipesignatures y --yes`: data LVs are carved from raw
+        // extents in `basis-data`, and any extent that previously
+        // belonged to another LVM PV/LV (e.g. a recycled VG, a
+        // re-partitioned disk added as a fresh PV) still carries an
+        // `LVM2_member` magic at offset 536. Without these flags
+        // lvcreate prompts on stdin (which isn't a tty here),
+        // defaults to `[n]`, and aborts the create — surfaced to the
+        // controller as "agent reported FAILED" and to CAPI as a
+        // BasisMachine that flips to deletion before any VM exists.
         run_cmd(
             "lvcreate",
-            &["--size", &format!("{size_gib}G"), "--name", &lv_name, vg],
+            &[
+                "--wipesignatures",
+                "y",
+                "--yes",
+                "--size",
+                &format!("{size_gib}G"),
+                "--name",
+                &lv_name,
+                vg,
+            ],
         )
         .await?;
 

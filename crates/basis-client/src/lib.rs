@@ -95,6 +95,15 @@ pub struct Cluster {
     /// CIDR of the cluster's LoadBalancer Service block (e.g.
     /// `10.0.0.224/28`). Empty when the cluster requested 0 service IPs.
     pub service_block_cidr: String,
+    /// Cell BGP route reflector address. Used by basis-capi-provider
+    /// to render the per-cluster `CiliumBGPClusterConfig` so k8s
+    /// nodes peer with the cell RR. Empty against an older basis
+    /// controller that predates the cluster-level BGP RPC fields;
+    /// callers fall back to L2-announce in that case.
+    pub bgp_reflector_address: String,
+    /// Cell ASN. Same provenance as [`Self::bgp_reflector_address`];
+    /// `0` against an older controller.
+    pub bgp_asn: u32,
 }
 
 /// A successful `CreateMachine` result.
@@ -266,6 +275,8 @@ impl BasisClient {
             vni: resp.vni,
             cidr: resp.cidr,
             service_block_cidr: resp.service_block_cidr,
+            bgp_reflector_address: resp.bgp_reflector_address,
+            bgp_asn: resp.bgp_asn,
         })
     }
 
@@ -293,6 +304,13 @@ impl BasisClient {
             vni: resp.vni,
             cidr: resp.cidr,
             service_block_cidr: resp.service_block_cidr,
+            // `Basis.GetCluster`'s proto Cluster message doesn't
+            // carry BGP info — only `CreateCluster` does. Existing
+            // BasisClusters keep their reflector/ASN on
+            // `BasisClusterStatus`; readers that need the values
+            // post-create read from the CR, not from this client.
+            bgp_reflector_address: String::new(),
+            bgp_asn: 0,
         })
     }
 

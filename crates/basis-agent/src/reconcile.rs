@@ -75,8 +75,13 @@ async fn collect<G: GarbageCollectable>(gc: &G, known: &HashSet<String>, batch: 
 // --- Collectors ---
 
 /// systemd transient units whose `vm_id` is not in the agent DB.
+/// Lists every `basis-vm-*.service` regardless of state — running
+/// units need a stop+teardown, failed/exited units need a
+/// `reset-failed` to disappear from `list-units --all`. Both flow
+/// through `handlers::delete_vm`, which calls `systemctl stop` (no-op
+/// on already-stopped) and then `reset-failed` via
+/// `vm_mgr.delete_vm`.
 struct UnitCollector<'a> {
-    running_vm_ids: &'a [String],
     agent_db: &'a AgentDb,
     vm_mgr: &'a Arc<VmManager>,
     net_mgr: &'a NetworkManager,
@@ -88,7 +93,7 @@ impl<'a> GarbageCollectable for UnitCollector<'a> {
         "unit"
     }
     async fn list(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self.running_vm_ids.to_vec())
+        Ok(self.vm_mgr.list_all_unit_vm_ids().await?)
     }
     async fn reclaim(&self, vm_id: &str) -> anyhow::Result<()> {
         crate::handlers::delete_vm(
@@ -99,6 +104,46 @@ impl<'a> GarbageCollectable for UnitCollector<'a> {
             self.storage,
         )
         .await
+    }
+}
+
+/// VM working directories under `<vms_dir>/<vm_id>` whose vm_id is
+/// not in the agent DB. These leak when `create_vm_inner` aborts
+/// after `mkdir vm_dir` but before the rollback path takes the dir
+/// down — most often when a later step (`lvcreate`, tap attach, vfio
+/// bind) fails and the rollback hits its own error and bails. The
+/// dir holds at most a few hundred KiB (cidata.iso + an empty
+/// cloud-hypervisor.sock), but at homelab scale they reach the
+/// thousands and slow `ls`.
+struct VmDirCollector<'a> {
+    vm_mgr: &'a Arc<VmManager>,
+}
+
+impl<'a> GarbageCollectable for VmDirCollector<'a> {
+    fn kind(&self) -> &'static str {
+        "vm_dir"
+    }
+    async fn list(&self) -> anyhow::Result<Vec<String>> {
+        let mut ids = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&self.vm_mgr.vms_dir).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                ids.push(name.to_string());
+            }
+        }
+        Ok(ids)
+    }
+    async fn reclaim(&self, vm_id: &str) -> anyhow::Result<()> {
+        let path = self.vm_mgr.vms_dir.join(vm_id);
+        tokio::fs::remove_dir_all(&path).await?;
+        Ok(())
     }
 }
 
@@ -226,15 +271,7 @@ pub async fn reconcile_on_startup(
         }
     }
 
-    report.orphans = sweep_orphans(
-        &running_vm_ids,
-        &known_ids,
-        agent_db,
-        vm_mgr,
-        net_mgr,
-        storage,
-    )
-    .await;
+    report.orphans = sweep_orphans(&known_ids, agent_db, vm_mgr, net_mgr, storage).await;
 
     Ok(report)
 }
@@ -243,7 +280,6 @@ pub async fn reconcile_on_startup(
 /// agent DB. Safe to call at any time — the DB is the authoritative
 /// source of live VMs on this host.
 pub async fn sweep_orphans(
-    running_vm_ids: &[String],
     known_ids: &HashSet<String>,
     agent_db: &AgentDb,
     vm_mgr: &Arc<VmManager>,
@@ -251,9 +287,10 @@ pub async fn sweep_orphans(
     storage: &Storage,
 ) -> u32 {
     // Unit reclamation runs first because its reclaim path
-    // (`handlers::delete_vm`) drops the associated LV and TAPs.
+    // (`handlers::delete_vm`) drops the associated LV, dir, and
+    // tap, and resets the failed-unit record so the same vm_id
+    // doesn't show up here again on the next sweep.
     let units = UnitCollector {
-        running_vm_ids,
         agent_db,
         vm_mgr,
         net_mgr,
@@ -264,6 +301,13 @@ pub async fn sweep_orphans(
     let lvs = LvCollector { storage };
     let lv_reclaimed = collect(&lvs, known_ids, ORPHAN_LV_BATCH).await;
 
+    // Dir reclamation runs last so the previous two collectors have
+    // first crack at any vm_id whose unit/LV is still around. What
+    // remains is dirs whose VM never made it past mkdir — i.e.
+    // creates that aborted before any unit or LV was committed.
+    let dirs = VmDirCollector { vm_mgr };
+    let dir_reclaimed = collect(&dirs, known_ids, usize::MAX).await;
+
     // Taps are deliberately NOT swept here. Taps are owned by the VM
     // lifecycle: `create_vm_inner` writes the agent DB row before
     // `attach_vm_primary` creates the tap, and `delete_vm` stops
@@ -272,7 +316,7 @@ pub async fn sweep_orphans(
     // produce one is wiping `agent.db` out from under live VMs —
     // recovered from on the next register via the controller's
     // `RegisterHostResponse.initial_state`, not by a defensive sweep.
-    unit_reclaimed + lv_reclaimed
+    unit_reclaimed + lv_reclaimed + dir_reclaimed
 }
 
 /// Live orphan sweep — gathers authoritative sets on its own and
@@ -283,19 +327,14 @@ pub async fn periodic_sweep(
     net_mgr: &NetworkManager,
     storage: &Storage,
 ) -> anyhow::Result<u32> {
-    let running_vm_ids = vm_mgr.reconcile_running().await?;
     let known_vms = agent_db.list_vms().await?;
     let mut known_ids: HashSet<String> = known_vms.iter().map(|v| v.vm_id.clone()).collect();
+    // Pending creates aren't in the DB yet (the agent_db row is
+    // written after `mkdir vm_dir` and before `systemd-run`), so the
+    // dir/unit collector would otherwise reap a VM mid-create. Pull
+    // them in from the in-memory pending set.
     known_ids.extend(vm_mgr.live_vm_ids().await);
-    Ok(sweep_orphans(
-        &running_vm_ids,
-        &known_ids,
-        agent_db,
-        vm_mgr,
-        net_mgr,
-        storage,
-    )
-    .await)
+    Ok(sweep_orphans(&known_ids, agent_db, vm_mgr, net_mgr, storage).await)
 }
 
 enum RestartError {
