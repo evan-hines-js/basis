@@ -16,10 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use basis_proto::gobgp::{
-    attribute, family, go_bgp_service_client::GoBgpServiceClient, nlri, AddPathRequest,
-    AddPeerRequest, Attribute, DeletePathRequest, DeletePeerRequest, Family, GetBgpRequest, Global,
-    IpAddressPrefix, ListPathRequest, ListPeerRequest, Nlri, OriginAttribute, Path, Peer, PeerConf,
-    RouteReflector, StartBgpRequest, StopBgpRequest, TableType,
+    attribute, family, go_bgp_service_client::GoBgpServiceClient, nlri, watch_event_request,
+    watch_event_response, AddPathRequest, AddPeerRequest, Attribute, DeletePathRequest,
+    DeletePeerRequest, Family, GetBgpRequest, Global, IpAddressPrefix, ListPathRequest,
+    ListPeerRequest, NextHopAttribute, Nlri, OriginAttribute, Path, Peer, PeerConf, RouteReflector,
+    StartBgpRequest, TableType, WatchEventRequest,
 };
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
@@ -27,6 +28,27 @@ use tonic::transport::Channel;
 use tracing::debug;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-RPC deadline. Bounds the worst case where gobgpd is wedged
+/// (its management goroutine stuck on a slow peer, internal mutex,
+/// etc.) so basis-controller / basis-agent surface a real error
+/// instead of hanging forever and silently failing to bind their
+/// own listeners. 5s is generous for any sane gobgpd state operation
+/// — even ListPath against a populated RIB returns within a few
+/// hundred ms — and conservative enough that a pathological wedge
+/// reliably trips it.
+const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wrap a unary or streaming gRPC payload in a `tonic::Request` with
+/// the per-call deadline applied. tonic propagates this as the
+/// `grpc-timeout` metadata header so gobgpd aborts the RPC server-
+/// side at the same instant the client gives up — no orphaned
+/// goroutines on the daemon, no client-side leak.
+fn req<T>(payload: T) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(payload);
+    r.set_timeout(RPC_TIMEOUT);
+    r
+}
 
 /// Connected client to a local gobgpd instance.
 #[derive(Clone)]
@@ -52,20 +74,30 @@ impl GobgpClient {
         })
     }
 
-    /// Idempotent — boots the BGP instance with the given ASN +
-    /// router-id + families, or no-ops if it's already running with
-    /// equivalent state.
+    /// Idempotent boot of the BGP instance with the given ASN +
+    /// router-id + families. No-op if gobgpd already has equivalent
+    /// state.
     ///
     /// gobgp v4.4.0's `GetBgp` only reports asn/router-id/listen-port,
-    /// not the families list, so the families check is done by
-    /// probing each desired AFI/SAFI via a `ListPath` call: a
+    /// not the families list, so the families check is a probe:
+    /// each desired AFI/SAFI is queried via `ListPath` — a
     /// configured family answers with its (possibly empty)
     /// destination set; an unconfigured family returns "address
-    /// family: <fam> not supported." On any mismatch (asn,
-    /// router-id, or any missing family), we tear down via
-    /// `StopBgp` and recreate with the desired Global. This
-    /// self-heals across both gobgpd restarts (which drop in-memory
-    /// state) and stale state from a previous incompatible binary.
+    /// family: <fam> not supported."
+    ///
+    /// On mismatch, we issue a fresh `StartBgp`. We deliberately do
+    /// NOT call `StopBgp` first: gobgpd's mgmt goroutine processes
+    /// requests serially, and a back-to-back StopBgp+StartBgp from a
+    /// single client deadlocks the daemon when the previous
+    /// shutdown's peer-FSM drain is still in flight (we observed
+    /// gobgpd silent for >5min after StopBgp before the next
+    /// StartBgp made any progress). If gobgpd's state is wrong, the
+    /// `StartBgp` below errors with "gobgp is already started" and
+    /// the operator must `systemctl restart gobgpd` to recover. This
+    /// is the only client-recovery pattern that doesn't risk
+    /// wedging the daemon further; ansible's basis-gobgpd role
+    /// re-applies the unit (and hence restarts gobgpd) on every
+    /// site.yml run, so deploys naturally clear stale state.
     pub async fn start_bgp(
         &self,
         asn: u32,
@@ -78,22 +110,10 @@ impl GobgpClient {
         {
             return Ok(());
         }
-        // Best-effort tear-down. StopBgp errors when no instance is
-        // running; we don't care — the next StartBgp is what
-        // matters. Letting StopBgp errors propagate would mask the
-        // real failure path.
-        let mut client = self.inner.lock().await;
-        let _ = client
-            .stop_bgp(StopBgpRequest {
-                allow_graceful_restart: false,
-            })
-            .await;
         let global = Global {
             asn,
             router_id: router_id.to_string(),
             families: families.iter().map(|f| f.families_index()).collect(),
-            // The rest are GoBGP defaults; explicitly defaulted so
-            // they don't drift if the proto evolves.
             listen_port: 179,
             listen_addresses: Vec::new(),
             use_multiple_paths: false,
@@ -103,12 +123,19 @@ impl GobgpClient {
             graceful_restart: None,
             bind_to_device: String::new(),
         };
+        let mut client = self.inner.lock().await;
         client
-            .start_bgp(StartBgpRequest {
+            .start_bgp(req(StartBgpRequest {
                 global: Some(global),
-            })
+            }))
             .await
-            .map_err(|e| anyhow::anyhow!("StartBgp: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "StartBgp: {e} — if gobgpd has stale state from a previous run, \
+                     `systemctl restart gobgpd` and retry; basis-controller will not \
+                     attempt to tear down gobgpd's BGP instance from this side."
+                )
+            })?;
         debug!(asn, router_id = %router_id, "started gobgpd BGP instance");
         Ok(())
     }
@@ -125,7 +152,7 @@ impl GobgpClient {
         want: &[AfiSafi],
     ) -> anyhow::Result<bool> {
         let mut client = self.inner.lock().await;
-        let global = match client.get_bgp(GetBgpRequest {}).await {
+        let global = match client.get_bgp(req(GetBgpRequest {})).await {
             Ok(resp) => resp.into_inner().global,
             Err(_) => return Ok(false),
         };
@@ -135,11 +162,11 @@ impl GobgpClient {
         }
         for f in want {
             let probe = client
-                .list_path(ListPathRequest {
+                .list_path(req(ListPathRequest {
                     table_type: TableType::Global as i32,
                     family: Some(f.to_family()),
                     ..Default::default()
-                })
+                }))
                 .await;
             // The error path matches gobgp's "address family: %s not
             // supported" — any error here means this family isn't in
@@ -199,7 +226,7 @@ impl GobgpClient {
         };
         let mut client = self.inner.lock().await;
         client
-            .add_peer(AddPeerRequest { peer: Some(peer) })
+            .add_peer(req(AddPeerRequest { peer: Some(peer) }))
             .await
             .map_err(|e| anyhow::anyhow!("AddPeer({}): {e}", spec.address))?;
         debug!(peer = %spec.address, asn = spec.asn, rr_client, "added gobgp peer");
@@ -209,10 +236,10 @@ impl GobgpClient {
     async fn delete_peer(&self, address: IpAddr) -> anyhow::Result<()> {
         let mut client = self.inner.lock().await;
         client
-            .delete_peer(DeletePeerRequest {
+            .delete_peer(req(DeletePeerRequest {
                 address: address.to_string(),
                 interface: String::new(),
-            })
+            }))
             .await
             .map_err(|e| anyhow::anyhow!("DeletePeer({address}): {e}"))?;
         debug!(peer = %address, "deleted gobgp peer");
@@ -222,7 +249,7 @@ impl GobgpClient {
     async fn list_peer_addresses(&self) -> anyhow::Result<BTreeSet<IpAddr>> {
         let mut client = self.inner.lock().await;
         let mut stream = client
-            .list_peer(ListPeerRequest::default())
+            .list_peer(req(ListPeerRequest::default()))
             .await
             .map_err(|e| anyhow::anyhow!("ListPeer: {e}"))?
             .into_inner();
@@ -241,62 +268,105 @@ impl GobgpClient {
     }
 
     /// Reconcile the locally-originated IPv4-unicast prefix set to
-    /// exactly `desired`. Each prefix is advertised with NEXT_HOP =
-    /// the local BGP router-id (GoBGP's default for self-originated
-    /// IPv4-unicast paths) and ORIGIN = IGP.
-    pub async fn reconcile_ipv4_paths(&self, desired: &[String]) -> anyhow::Result<()> {
+    /// exactly `desired`. Each prefix is advertised with `next_hop`
+    /// (the speaker's underlay IP, i.e. its BGP router-id) and
+    /// ORIGIN = IGP. gobgp v4 rejects AddPath with "nexthop not
+    /// found" when the NEXT_HOP attribute is absent — every path
+    /// must carry it explicitly.
+    pub async fn reconcile_ipv4_paths(
+        &self,
+        desired: &[String],
+        next_hop: Ipv4Addr,
+    ) -> anyhow::Result<()> {
         let current = self.list_ipv4_prefixes().await?;
         let desired_set: BTreeSet<String> = desired.iter().cloned().collect();
 
         for prefix in desired_set.difference(&current) {
-            self.add_ipv4_path(prefix).await?;
+            self.add_ipv4_path(prefix, next_hop).await?;
         }
         for prefix in current.difference(&desired_set) {
-            self.delete_ipv4_path(prefix).await?;
+            self.delete_ipv4_path(prefix, next_hop).await?;
         }
         Ok(())
     }
 
-    async fn add_ipv4_path(&self, prefix: &str) -> anyhow::Result<()> {
-        let path = ipv4_unicast_path(prefix)?;
+    async fn add_ipv4_path(&self, prefix: &str, next_hop: Ipv4Addr) -> anyhow::Result<()> {
+        let path = ipv4_unicast_path(prefix, next_hop)?;
         let mut client = self.inner.lock().await;
         client
-            .add_path(AddPathRequest {
+            .add_path(req(AddPathRequest {
                 table_type: TableType::Global as i32,
                 vrf_id: String::new(),
                 path: Some(path),
-            })
+            }))
             .await
             .map_err(|e| anyhow::anyhow!("AddPath({prefix}): {e}"))?;
-        debug!(prefix, "advertised path via gobgp");
+        debug!(prefix, %next_hop, "advertised path via gobgp");
         Ok(())
     }
 
-    async fn delete_ipv4_path(&self, prefix: &str) -> anyhow::Result<()> {
-        let path = ipv4_unicast_path(prefix)?;
+    async fn delete_ipv4_path(&self, prefix: &str, next_hop: Ipv4Addr) -> anyhow::Result<()> {
+        let path = ipv4_unicast_path(prefix, next_hop)?;
         let mut client = self.inner.lock().await;
         client
-            .delete_path(DeletePathRequest {
+            .delete_path(req(DeletePathRequest {
                 table_type: TableType::Global as i32,
                 vrf_id: String::new(),
                 family: Some(AfiSafi::Ipv4Unicast.to_family()),
                 path: Some(path),
                 uuid: Vec::new(),
-            })
+            }))
             .await
             .map_err(|e| anyhow::anyhow!("DeletePath({prefix}): {e}"))?;
-        debug!(prefix, "withdrew path via gobgp");
+        debug!(prefix, %next_hop, "withdrew path via gobgp");
         Ok(())
+    }
+
+    /// Subscribe to gobgpd's RIB and yield IPv4-unicast best-path
+    /// updates as they happen, one [`LearnedRoute`] at a time.
+    /// `init=true` on the filter so gobgpd replays its current RIB
+    /// to the client on subscribe; the watcher converges to live
+    /// state without a separate ListPath bootstrap.
+    ///
+    /// The mutex is surrendered immediately after the stream handle
+    /// is acquired so other reconcile RPCs aren't blocked for the
+    /// watcher's lifetime — the long-lived stream lives on a cloned
+    /// gRPC client (cheap; tonic Channel is HTTP/2-multiplexed).
+    pub async fn watch_paths(&self) -> anyhow::Result<LearnedRouteStream> {
+        let mut client = {
+            let guard = self.inner.lock().await;
+            guard.clone()
+        };
+        let inner = client
+            .watch_event(req(WatchEventRequest {
+                peer: None,
+                table: Some(watch_event_request::Table {
+                    filters: vec![watch_event_request::table::Filter {
+                        r#type: watch_event_request::table::filter::Type::Best as i32,
+                        init: true,
+                        peer_address: String::new(),
+                        peer_group: String::new(),
+                    }],
+                }),
+                batch_size: 0,
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("WatchEvent: {e}"))?
+            .into_inner();
+        Ok(LearnedRouteStream {
+            inner,
+            buffered: Vec::new(),
+        })
     }
 
     async fn list_ipv4_prefixes(&self) -> anyhow::Result<BTreeSet<String>> {
         let mut client = self.inner.lock().await;
         let mut stream = client
-            .list_path(ListPathRequest {
+            .list_path(req(ListPathRequest {
                 table_type: TableType::Global as i32,
                 family: Some(AfiSafi::Ipv4Unicast.to_family()),
                 ..Default::default()
-            })
+            }))
             .await
             .map_err(|e| anyhow::anyhow!("ListPath: {e}"))?
             .into_inner();
@@ -316,6 +386,118 @@ impl GobgpClient {
 pub struct PeerSpec {
     pub address: IpAddr,
     pub asn: u32,
+}
+
+/// One IPv4-unicast best-path event from gobgpd's RIB. Maps a
+/// remotely-originated `prefix` to the `next_hop` the local kernel
+/// should route through. Withdrawals are signalled by
+/// `is_withdraw=true` on the same shape.
+#[derive(Debug, Clone)]
+pub struct LearnedRoute {
+    /// Prefix announced by the remote speaker, e.g. "10.0.0.209/32".
+    pub prefix: String,
+    /// Length of `prefix` in bits, e.g. 32 for a /32. Pre-parsed so
+    /// callers don't redo the split.
+    pub prefix_len: u32,
+    /// Next-hop IP from the path's NEXT_HOP attribute. The address
+    /// the local kernel should forward through to reach the prefix.
+    pub next_hop: IpAddr,
+    /// True iff this is a withdrawal — the kernel route should be
+    /// removed.
+    pub is_withdraw: bool,
+}
+
+/// Stream of best-path RIB events from gobgpd, one
+/// [`LearnedRoute`] per `next()` call. gobgpd batches multiple paths
+/// into a single TableEvent gRPC message; this stream flattens that
+/// batching plus filters out non-IPv4-unicast NLRI shapes and paths
+/// without a usable next-hop. Errors on the gRPC stream end the
+/// iteration — callers re-subscribe after a delay if they want to
+/// resume.
+pub struct LearnedRouteStream {
+    inner: tonic::Streaming<basis_proto::gobgp::WatchEventResponse>,
+    /// Paths from a partially-consumed TableEvent. Drained
+    /// FIFO-from-front; refilled when `inner.next()` yields the next
+    /// TableEvent.
+    buffered: Vec<Path>,
+}
+
+impl LearnedRouteStream {
+    /// Yield the next route event, or `None` if the underlying gRPC
+    /// stream has terminated. PeerEvent payloads are discarded —
+    /// peer-state changes don't shift the RIB on their own.
+    pub async fn next(&mut self) -> Option<LearnedRoute> {
+        loop {
+            while let Some(p) = self.buffered.pop() {
+                if let Some(route) = LearnedRoute::from_path(&p) {
+                    return Some(route);
+                }
+            }
+            let resp = self.inner.next().await?.ok()?;
+            match resp.event? {
+                watch_event_response::Event::Table(t) => {
+                    self.buffered = t.paths;
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+impl LearnedRoute {
+    /// Parse one [`Path`] into a [`LearnedRoute`], or `None` if the
+    /// path isn't an IPv4-unicast prefix with a NEXT_HOP we can
+    /// install. Filters out:
+    ///
+    /// * non-prefix NLRI types (EVPN, flowspec, etc.) — Stage 1 only
+    ///   handles plain ipv4 unicast, callers already constrain the
+    ///   subscribe filter, but the response payload is structurally
+    ///   any NLRI shape so we re-check here.
+    /// * paths with no NEXT_HOP — the kernel needs one to install a
+    ///   route. (Self-originated next-hops would arrive without one
+    ///   from gobgpd's perspective; no harm filtering them.)
+    fn from_path(p: &Path) -> Option<Self> {
+        let nlri = match p.nlri.as_ref()?.nlri.as_ref()? {
+            nlri::Nlri::Prefix(ip) => ip,
+            _ => return None,
+        };
+        let prefix_addr: IpAddr = nlri.prefix.parse().ok()?;
+        if !prefix_addr.is_ipv4() {
+            return None;
+        }
+        let next_hop = next_hop_from_attrs(&p.pattrs)?;
+        Some(Self {
+            prefix: format!("{}/{}", nlri.prefix, nlri.prefix_len),
+            prefix_len: nlri.prefix_len,
+            next_hop,
+            is_withdraw: p.is_withdraw,
+        })
+    }
+}
+
+/// Extract a NEXT_HOP IP from a path's attribute list. Returns
+/// `None` if neither `NextHopAttribute` nor an IPv4 nexthop in
+/// `MpReachNlriAttribute` is present — gobgp may put the next-hop
+/// in either depending on the address family of the path.
+fn next_hop_from_attrs(attrs: &[Attribute]) -> Option<IpAddr> {
+    for attr in attrs {
+        match attr.attr.as_ref()? {
+            attribute::Attr::NextHop(nh) => {
+                if let Ok(ip) = nh.next_hop.parse::<IpAddr>() {
+                    return Some(ip);
+                }
+            }
+            attribute::Attr::MpReach(mp) => {
+                for nh in &mp.next_hops {
+                    if let Ok(ip) = nh.parse::<IpAddr>() {
+                        return Some(ip);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// AFI/SAFI selector. Stage 1 only uses `Ipv4Unicast`; the EVPN
@@ -358,11 +540,11 @@ impl AfiSafi {
     }
 }
 
-/// Build a Path advertising an IPv4-unicast prefix. NLRI is the
-/// prefix itself; attributes are ORIGIN=IGP only — GoBGP fills in
-/// NEXT_HOP from the session's local address at AddPath time when
-/// no NEXT_HOP attribute is supplied.
-fn ipv4_unicast_path(prefix: &str) -> anyhow::Result<Path> {
+/// Build a Path advertising an IPv4-unicast prefix with explicit
+/// NEXT_HOP and ORIGIN=IGP. gobgp v4 rejects AddPath without a
+/// NEXT_HOP attribute (the daemon doesn't synthesise one from the
+/// session's local address at insert time).
+fn ipv4_unicast_path(prefix: &str, next_hop: Ipv4Addr) -> anyhow::Result<Path> {
     let (addr, len) = split_prefix(prefix)?;
     Ok(Path {
         nlri: Some(Nlri {
@@ -371,9 +553,16 @@ fn ipv4_unicast_path(prefix: &str) -> anyhow::Result<Path> {
                 prefix_len: len,
             })),
         }),
-        pattrs: vec![Attribute {
-            attr: Some(attribute::Attr::Origin(OriginAttribute { origin: 0 })),
-        }],
+        pattrs: vec![
+            Attribute {
+                attr: Some(attribute::Attr::Origin(OriginAttribute { origin: 0 })),
+            },
+            Attribute {
+                attr: Some(attribute::Attr::NextHop(NextHopAttribute {
+                    next_hop: next_hop.to_string(),
+                })),
+            },
+        ],
         family: Some(AfiSafi::Ipv4Unicast.to_family()),
         ..Default::default()
     })
@@ -397,14 +586,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ipv4_unicast_path_round_trips_prefix() {
-        let p = ipv4_unicast_path("10.0.0.212/32").unwrap();
+    fn ipv4_unicast_path_round_trips_prefix_and_nexthop() {
+        let p = ipv4_unicast_path("10.0.0.212/32", "10.0.0.206".parse().unwrap()).unwrap();
         let prefix_nlri = match p.nlri.unwrap().nlri.unwrap() {
             nlri::Nlri::Prefix(ip) => ip,
             other => panic!("expected IPAddressPrefix, got {other:?}"),
         };
         assert_eq!(prefix_nlri.prefix, "10.0.0.212");
         assert_eq!(prefix_nlri.prefix_len, 32);
+        // NEXT_HOP must be present — gobgp v4 rejects AddPath
+        // without one.
+        let nh = p
+            .pattrs
+            .iter()
+            .find_map(|a| match a.attr.as_ref()? {
+                attribute::Attr::NextHop(nh) => Some(nh.next_hop.clone()),
+                _ => None,
+            })
+            .expect("NEXT_HOP attribute present");
+        assert_eq!(nh, "10.0.0.206");
     }
 
     /// Pin the gobgp v4.4.0 `IntToAfiSafiTypeMap` indexes — getting

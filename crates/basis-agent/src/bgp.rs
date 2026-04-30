@@ -14,11 +14,9 @@
 //! the diff between desired and current state, so a re-push doesn't
 //! disturb running sessions.
 
-use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 
 use basis_common::gobgp::{AfiSafi, GobgpClient, PeerSpec};
-use tokio::sync::Mutex;
 use tracing::info;
 
 /// Static speaker parameters: cell ASN (learned from the controller's
@@ -38,10 +36,6 @@ pub struct SpeakerConfig {
 pub struct Speaker {
     config: SpeakerConfig,
     client: GobgpClient,
-    /// Last-pushed prefix set, deduplicated. Cached so the reconcile
-    /// path can short-circuit when an unchanged set comes back; saves
-    /// a gRPC round-trip on the steady-state hot path.
-    routes: Mutex<BTreeSet<String>>,
 }
 
 impl Speaker {
@@ -50,11 +44,7 @@ impl Speaker {
     /// populate them via [`Self::update_routes`].
     pub async fn start(config: SpeakerConfig) -> anyhow::Result<Self> {
         let client = GobgpClient::connect(&config.gobgpd_endpoint).await?;
-        let speaker = Self {
-            config,
-            client,
-            routes: Mutex::new(BTreeSet::new()),
-        };
+        let speaker = Self { config, client };
         speaker.ensure_running().await?;
         info!(
             asn = speaker.config.asn,
@@ -68,13 +58,26 @@ impl Speaker {
     /// Idempotently configure gobgpd's BGP instance + peers. Called
     /// from every entry point that touches the RIB so a gobgpd
     /// restart (which drops in-memory state) self-heals on the next
-    /// reconcile tick. `start_bgp` and `reconcile_peers` are both
-    /// no-ops when state matches, so steady-state cost is two gRPC
-    /// round-trips per reconcile.
+    /// reconcile tick. `start_bgp` is a no-op when state matches.
+    ///
+    /// Peer config is skipped when this host is co-located with the
+    /// route reflector (controller and agent on the same host share
+    /// one gobgpd). Adding the local underlay IP as a peer of itself
+    /// would (a) trip gobgpd into trying to dial 127.0.0.1:179 in a
+    /// loop, which we observed wedging the daemon's management
+    /// goroutine and stalling every later RPC for ~5 minutes, and
+    /// (b) fight basis-controller's `peer_reconciler`, which is the
+    /// authoritative writer of the peer set on the same gobgpd. The
+    /// Speaker still advertises paths via [`Self::update_routes`];
+    /// those land directly in the shared global RIB and the
+    /// reflector reflects them to remote peers.
     async fn ensure_running(&self) -> anyhow::Result<()> {
         self.client
             .start_bgp(self.config.asn, self.config.router_id, &[AfiSafi::Ipv4Unicast])
             .await?;
+        if self.config.router_id == self.config.reflector_address {
+            return Ok(());
+        }
         self.client
             .reconcile_peers(
                 &[PeerSpec {
@@ -89,22 +92,17 @@ impl Speaker {
 
     /// Replace the prefix set the speaker advertises. Each prefix is
     /// announced with the speaker's router-id (this host's underlay
-    /// IP) as next-hop. Idempotent — unchanged sets skip the gRPC
-    /// roundtrip via the cached `routes` set.
+    /// IP) as NEXT_HOP. Idempotent — `reconcile_ipv4_paths` diffs
+    /// against gobgpd's actual RIB and issues only the necessary
+    /// AddPath/DeletePath RPCs, so an unchanged set is one ListPath
+    /// round-trip and no writes.
     pub async fn update_routes(&self, prefixes: &[ipnet::Ipv4Net]) -> anyhow::Result<()> {
         self.ensure_running().await?;
-        let new: BTreeSet<String> = prefixes.iter().map(|p| p.to_string()).collect();
-        {
-            let last = self.routes.lock().await;
-            if *last == new {
-                return Ok(());
-            }
-        }
-        let ordered: Vec<String> = new.iter().cloned().collect();
-        self.client.reconcile_ipv4_paths(&ordered).await?;
-        let mut last = self.routes.lock().await;
-        *last = new;
-        info!(prefixes = last.len(), "BGP advertised prefix set updated");
+        let ordered: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
+        self.client
+            .reconcile_ipv4_paths(&ordered, self.config.router_id)
+            .await?;
+        info!(prefixes = ordered.len(), "BGP advertised prefix set reconciled");
         Ok(())
     }
 }

@@ -41,13 +41,6 @@ pub struct ReflectorConfig {
     pub gobgpd_endpoint: String,
 }
 
-/// One BGP peer the reflector should accept a session from.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PeerConfig {
-    pub address: IpAddr,
-    pub asn: u32,
-}
-
 /// Handle to the configured reflector. The underlying gobgpd runs
 /// independently of basis-controller's lifecycle; dropping this
 /// handle disconnects the gRPC client but does not touch gobgpd.
@@ -87,22 +80,11 @@ impl Reflector {
     /// kept, missing peers are torn down, new peers come up.
     /// `route_reflector_client=true` so cell speakers get reflected
     /// routes between each other.
-    pub async fn update_peers(&self, peers: Vec<PeerConfig>) -> anyhow::Result<()> {
+    pub async fn update_peers(&self, peers: &[PeerSpec]) -> anyhow::Result<()> {
         self.ensure_running().await?;
-        let specs: Vec<PeerSpec> = peers
-            .iter()
-            .map(|p| PeerSpec {
-                address: p.address,
-                asn: p.asn,
-            })
-            .collect();
-        self.client.reconcile_peers(&specs, true).await?;
+        self.client.reconcile_peers(peers, true).await?;
         debug!(peers = peers.len(), "BGP neighbor set updated");
         Ok(())
-    }
-
-    fn asn(&self) -> u32 {
-        self.config.asn
     }
 }
 
@@ -218,37 +200,26 @@ async fn legitimate_sources(db: &Db) -> Result<BTreeSet<IpAddr>, crate::db::DbEr
 /// certificate exchange. The cell management LAN's address space
 /// *is* the trust boundary.
 pub async fn acl_reconciler(db: Db, shutdown: CancellationToken) {
-    let mut ticker = tokio::time::interval(RECONCILER_INTERVAL);
-    let mut last: BTreeSet<IpAddr> = BTreeSet::new();
-    let mut applied_once = false;
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                info!("BGP source-IP ACL reconciler shutting down");
-                return;
-            }
-            _ = ticker.tick() => {
-                let current = match legitimate_sources(&db).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(error = %e, "BGP ACL reconciler: legitimate_sources failed");
-                        continue;
-                    }
-                };
-                if applied_once && current == last {
-                    continue;
-                }
-                let ruleset = render_acl_ruleset(&current);
-                debug!(allowed = current.len(), "applying BGP source-IP ACL");
-                if let Err(e) = nft_apply(&ruleset).await {
-                    warn!(error = %e, "BGP ACL reconciler: nft apply failed (is nftables installed?)");
-                    continue;
-                }
-                last = current;
-                applied_once = true;
-            }
-        }
-    }
+    // ACL must be applied at least once to install the drop-by-
+    // default rule on tcp/179, even if `legitimate_sources` is
+    // initially empty. After that, only push when the permitted set
+    // changes.
+    reconcile_loop(
+        "BGP source-IP ACL reconciler",
+        db,
+        shutdown,
+        ApplyOnFirstTick::Always,
+        |current| async move {
+            let count = current.len();
+            let ruleset = render_acl_ruleset(&current);
+            nft_apply(&ruleset)
+                .await
+                .map_err(|e| anyhow::anyhow!("nft apply: {e} (is nftables installed?)"))?;
+            debug!(allowed = count, "applied BGP source-IP ACL");
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// Periodic reconciler that mirrors the `hosts` table into the BGP
@@ -257,37 +228,95 @@ pub async fn acl_reconciler(db: Db, shutdown: CancellationToken) {
 /// next tick. Diffs against gobgpd's current peer set, only issues
 /// Add/Delete RPCs for the difference.
 pub async fn peer_reconciler(reflector: Arc<Reflector>, db: Db, shutdown: CancellationToken) {
+    reconcile_loop(
+        "BGP peer reconciler",
+        db,
+        shutdown,
+        ApplyOnFirstTick::OnlyIfChanged,
+        |current| {
+            let reflector = reflector.clone();
+            async move {
+                let peers: Vec<PeerSpec> = current
+                    .into_iter()
+                    .map(|address| PeerSpec {
+                        address,
+                        asn: reflector.config.asn,
+                    })
+                    .collect();
+                reflector.update_peers(&peers).await
+            }
+        },
+    )
+    .await
+}
+
+/// Whether [`reconcile_loop`] applies on the very first tick when
+/// the desired set is (initially) empty. ACL needs `Always` so the
+/// kernel ruleset gets the default-drop on tcp/179 even when no
+/// hosts are registered yet; peer-set updates are no-ops on the
+/// empty set, so they use `OnlyIfChanged`.
+#[derive(Debug, Clone, Copy)]
+enum ApplyOnFirstTick {
+    Always,
+    OnlyIfChanged,
+}
+
+/// Tick-driven diff-and-apply loop shared by [`acl_reconciler`] and
+/// [`peer_reconciler`]. Each tick samples [`legitimate_sources`]
+/// (cheap — one DB read), and only invokes `apply` when the snapshot
+/// has changed since the last successful apply.
+///
+/// Returning `Err` from `apply` is logged and the loop continues —
+/// transient gobgpd or DB errors shouldn't stop reconciliation; the
+/// next tick re-attempts because `last` only advances on success.
+///
+/// Exits cleanly on `shutdown.cancelled()`.
+async fn reconcile_loop<F, Fut>(
+    name: &'static str,
+    db: Db,
+    shutdown: CancellationToken,
+    policy: ApplyOnFirstTick,
+    mut apply: F,
+) where
+    F: FnMut(BTreeSet<IpAddr>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let mut ticker = tokio::time::interval(RECONCILER_INTERVAL);
     let mut last: BTreeSet<IpAddr> = BTreeSet::new();
+    let mut applied_once = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
-                info!("BGP peer reconciler shutting down");
+                info!(reconciler = name, "shutting down");
                 return;
             }
             _ = ticker.tick() => {
                 let current = match legitimate_sources(&db).await {
                     Ok(s) => s,
                     Err(e) => {
-                        warn!(error = %e, "BGP peer reconciler: legitimate_sources failed");
+                        warn!(reconciler = name, error = %e, "legitimate_sources failed");
                         continue;
                     }
                 };
-                if current == last {
+                let must_apply_first = !applied_once
+                    && matches!(policy, ApplyOnFirstTick::Always);
+                if !must_apply_first && current == last {
                     continue;
                 }
-                let peers: Vec<PeerConfig> = current
-                    .iter()
-                    .map(|address| PeerConfig {
-                        address: *address,
-                        asn: reflector.asn(),
-                    })
-                    .collect();
-                if let Err(e) = reflector.update_peers(peers).await {
-                    warn!(error = %e, "BGP peer reconciler: update_peers failed");
+                // Move ownership into apply — `BTreeSet<IpAddr>` is
+                // small (~24 bytes/entry) and the apply closure
+                // ergonomically owns the data without lifetime
+                // gymnastics. We retain a copy in `last` for the
+                // next tick's diff.
+                let snapshot = current.clone();
+                if let Err(e) = apply(current).await {
+                    warn!(reconciler = name, error = %e, "reconcile apply failed");
+                    // Don't advance `last`/`applied_once` — a future
+                    // tick retries the same diff.
                     continue;
                 }
-                last = current;
+                last = snapshot;
+                applied_once = true;
             }
         }
     }

@@ -16,6 +16,7 @@
 //! source host before they ever reach a peer's `vxc<vni>`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::IpAddr;
 
 use basis_proto::{ClusterState, ClusterVip};
 use tokio::process::Command;
@@ -183,6 +184,84 @@ impl ClusterManager {
     /// proxy-ARP gating skips every VIP and LAN ingress drops.
     pub async fn set_host_id(&self, host_id: String) {
         *self.host_id.lock().await = host_id;
+    }
+
+    /// Install a kernel route for `prefix` reachable via `next_hop`,
+    /// resolving the routing context (bridge + VRF table) by looking
+    /// up which live cluster's CIDR contains `next_hop`. No-op if
+    /// no live cluster matches — those events come from clusters
+    /// this host doesn't carry, and routing them through a non-
+    /// existent bridge would just produce kernel errors.
+    ///
+    /// Used by the BGP-RIB watcher in `basis-agent` to install
+    /// routes Cilium advertised for K8s LoadBalancer IPs. The route
+    /// uses `via <next-hop>` (not `dev <bridge>`-only) so the kernel
+    /// ARPs for the K8s node IP — which the node answers — instead
+    /// of the LB IP itself, which under BGP-mode Cilium has no L2
+    /// claimant on the cluster bridge.
+    ///
+    /// Routes are installed in **both** the main table (so LAN
+    /// ingress via vmbr0 routes to the holder node) and the
+    /// cluster's VRF table when present (so cluster-internal
+    /// forwarding routes to the holder node). A LAN-pool cluster
+    /// has no VRF; only the main install runs. This is symmetric
+    /// with how `add_prefix_route` already places `lan_prefixes` in
+    /// main and `tree_prefixes` in VRF — the via-form refines those
+    /// with a usable next-hop instead of just `dev`.
+    ///
+    /// `ip route replace` is idempotent and atomically overwrites
+    /// any prior `dev <bridge>`-only install for the same prefix.
+    pub async fn install_learned_route(
+        &self,
+        prefix: &str,
+        next_hop: IpAddr,
+    ) -> Result<(), NetworkError> {
+        let Some((bridge, vrf_table)) = self.locate_next_hop(next_hop).await else {
+            return Ok(());
+        };
+        for table in tables_for(vrf_table) {
+            replace_via_route(prefix, next_hop, &bridge, table).await?;
+        }
+        Ok(())
+    }
+
+    /// Remove the kernel route for `prefix` previously installed by
+    /// [`Self::install_learned_route`]. Idempotent: no-op if the
+    /// route is already gone or the cluster carrying its next-hop
+    /// has been torn down.
+    pub async fn withdraw_learned_route(
+        &self,
+        prefix: &str,
+        next_hop: IpAddr,
+    ) -> Result<(), NetworkError> {
+        let Some((bridge, vrf_table)) = self.locate_next_hop(next_hop).await else {
+            return Ok(());
+        };
+        for table in tables_for(vrf_table) {
+            // Delete is best-effort per table — the route may have
+            // never been installed in one of them (e.g. main if the
+            // host briefly lacked the cluster's VRF when the path
+            // arrived). Errors are surfaced only on the last try
+            // so withdrawal completes for the table that did have
+            // the route.
+            let _ = delete_via_route(prefix, next_hop, &bridge, table).await;
+        }
+        Ok(())
+    }
+
+    /// Find the (bridge, vrf-table) pair for the cluster whose CIDR
+    /// contains `next_hop`. Returns `None` if no live cluster
+    /// matches — caller treats this as "ignore this event."
+    async fn locate_next_hop(&self, next_hop: IpAddr) -> Option<(String, Option<u32>)> {
+        let live = self.live.lock().await;
+        for (vni, lc) in live.iter() {
+            let Some(cidr) = lc.cidr.as_deref() else { continue };
+            let Ok(net) = cidr.parse::<ipnet::IpNet>() else { continue };
+            if net.contains(&next_hop) {
+                return Some((bridge_name(*vni), lc.vrf.as_ref().map(|v| v.table_id)));
+            }
+        }
+        None
     }
 
     pub fn inner_mtu(&self) -> u32 {
@@ -891,6 +970,57 @@ async fn del_prefix_route(
         args.extend_from_slice(&["table", t]);
     }
     trace!(prefix, bridge, table = ?table, "prefix route del");
+    run_cmd("ip", &args).await
+}
+
+/// Install (or replace) a route with an explicit next-hop, e.g.
+/// `ip route replace 10.0.0.209/32 via 10.100.0.34 dev brc10000`.
+/// Used for BGP-learned routes where the next-hop is a node IP
+/// inside the cluster overlay — the kernel then ARPs for the node,
+/// not the prefix. `replace` makes this safe against the existing
+/// `add_prefix_route` install for the same prefix; whichever runs
+/// last wins, and BGP routes converge to the via-form.
+async fn replace_via_route(
+    prefix: &str,
+    next_hop: IpAddr,
+    bridge: &str,
+    table: Option<u32>,
+) -> Result<(), NetworkError> {
+    let next_hop_str = next_hop.to_string();
+    let table_str = table.map(|t| t.to_string());
+    let mut args: Vec<&str> = vec!["route", "replace", prefix, "via", &next_hop_str, "dev", bridge];
+    if let Some(t) = table_str.as_deref() {
+        args.extend_from_slice(&["table", t]);
+    }
+    trace!(prefix, %next_hop, bridge, table = ?table, "via route replace");
+    run_cmd("ip", &args).await
+}
+
+/// Tables a learned via-route should land in, given the cluster's
+/// VRF (if any). Always includes `None` (main table) so LAN-side
+/// ingress through `vmbr0` resolves the prefix to the holder node;
+/// when the cluster has a VRF, also includes that VRF's table so
+/// cluster-internal traffic ingressing on `brc<vni>` resolves it
+/// the same way. Tree-only pools never appear in BGP-learned routes
+/// for now — they don't escape the VRF anyway, and the extra main-
+/// table entry for an unused tree prefix is inert.
+fn tables_for(vrf: Option<u32>) -> impl Iterator<Item = Option<u32>> {
+    std::iter::once(None).chain(vrf.map(Some))
+}
+
+async fn delete_via_route(
+    prefix: &str,
+    next_hop: IpAddr,
+    bridge: &str,
+    table: Option<u32>,
+) -> Result<(), NetworkError> {
+    let next_hop_str = next_hop.to_string();
+    let table_str = table.map(|t| t.to_string());
+    let mut args: Vec<&str> = vec!["route", "del", prefix, "via", &next_hop_str, "dev", bridge];
+    if let Some(t) = table_str.as_deref() {
+        args.extend_from_slice(&["table", t]);
+    }
+    trace!(prefix, %next_hop, bridge, table = ?table, "via route del");
     run_cmd("ip", &args).await
 }
 

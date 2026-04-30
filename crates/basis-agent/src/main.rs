@@ -141,6 +141,20 @@ async fn main() -> anyhow::Result<()> {
     }
     spawn_orphan_sweep_loop(runtime.clone());
 
+    // Single per-process BGP-RIB watcher: subscribes to gobgpd's
+    // best-path stream and installs `<prefix> via <next-hop> dev
+    // brc<vni>` for each remotely-originated path. Spawning here
+    // (not inside `handshake`) means exactly one watcher per agent
+    // lifetime, regardless of how many controller reconnects happen.
+    {
+        let rt = runtime.read().await;
+        let net = rt.net_mgr.clone();
+        let endpoint = rt.spec.gobgpd_endpoint.clone();
+        tokio::spawn(async move {
+            basis_agent::bgp_routes::run_route_watcher(net, endpoint).await;
+        });
+    }
+
     loop {
         let (endpoint, reconnect) = {
             let rt = runtime.read().await;
@@ -528,25 +542,34 @@ async fn handshake(
 
     // Bring up the host BGP speaker against local gobgpd, peering
     // with the cell reflector. gobgpd runs as its own systemd
-    // service — basis-agent restarts don't drop the session. The
-    // speaker's prefix cache short-circuits no-op re-pushes on
-    // reconnect.
-    {
-        let mut rt = runtime.write().await;
-        if rt.bgp_speaker.is_none() {
-            let router_id = parse_ipv4(&rt.vtep_address, "vtep_address")?;
-            let reflector = parse_ipv4(&bgp_reflector, "bgp_reflector_address")?;
-            let speaker = Speaker::start(SpeakerConfig {
-                asn: bgp_asn,
-                router_id,
-                reflector_address: reflector,
-                gobgpd_endpoint: rt.spec.gobgpd_endpoint.clone(),
-            })
-            .await
-            .context("starting BGP speaker against local gobgpd")?;
-            rt.bgp_speaker = Some(speaker);
+    // service — basis-agent restarts don't drop the session. BGP
+    // setup is best-effort: a wedged or stale-state gobgpd is the
+    // operator's problem to recover (e.g. `systemctl restart
+    // gobgpd`), not a reason to crashloop the agent. The agent's
+    // primary job is VM hosting; failing the handshake on a
+    // sidecar concern would mask real handshake failures and lock
+    // VMs out of reconciles for as long as gobgpd is unhealthy.
+    let mut rt = runtime.write().await;
+    let router_id = parse_ipv4(&rt.vtep_address, "vtep_address")?;
+    let reflector = parse_ipv4(&bgp_reflector, "bgp_reflector_address")?;
+    if rt.bgp_speaker.is_none() {
+        match Speaker::start(SpeakerConfig {
+            asn: bgp_asn,
+            router_id,
+            reflector_address: reflector,
+            gobgpd_endpoint: rt.spec.gobgpd_endpoint.clone(),
+        })
+        .await
+        {
+            Ok(speaker) => rt.bgp_speaker = Some(speaker),
+            Err(e) => warn!(
+                error = %e,
+                "BGP speaker start failed; agent continues without local BGP. \
+                 Recover with `systemctl restart gobgpd` on this host."
+            ),
         }
     }
+    drop(rt);
 
     Ok(host_id)
 }
