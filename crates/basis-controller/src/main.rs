@@ -51,15 +51,14 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics = Metrics::new(config.cpu_overcommit_ratio)?;
 
-    // Connect to local holod and seed the reflector's running config.
-    // holod is a separate systemd service so its lifecycle survives
+    // Connect to local gobgpd and bring up the BGP instance. gobgpd
+    // is a separate systemd service so its lifecycle survives
     // basis-controller restarts — VIPs don't flap on bounce.
     let reflector = std::sync::Arc::new(
         Reflector::start(ReflectorConfig {
             asn: config.bgp.asn,
             router_id: config.bgp.router_id_ipv4(),
-            holod_endpoint: config.bgp.holod_endpoint.clone(),
-            instance_name: config.bgp.instance_name.clone(),
+            gobgpd_endpoint: config.bgp.gobgpd_endpoint.clone(),
         })
         .await?,
     );

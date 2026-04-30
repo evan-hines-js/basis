@@ -67,7 +67,7 @@ pub struct BasisControllerSpec {
     #[serde(default = "default_cpu_overcommit_ratio")]
     pub cpu_overcommit_ratio: f32,
     /// Cell BGP route reflector. basis-controller doesn't speak BGP
-    /// itself — `holod` runs as a sibling systemd service on the
+    /// itself — `gobgpd` runs as a sibling systemd service on the
     /// same host and basis pushes config to it via gRPC.
     pub bgp: BgpConfig,
     /// Safety policies that gate destructive controller actions.
@@ -131,23 +131,15 @@ pub struct BgpConfig {
     pub asn: u32,
     /// BGP router-id. Use the controller's underlay LAN IP.
     pub router_id: String,
-    /// gRPC endpoint of the local holod, e.g. `http://127.0.0.1:50051`.
-    /// Defaults to holod's upstream default; override only if you've
-    /// rebound holod's gRPC plugin.
-    #[serde(default = "default_holod_endpoint")]
-    pub holod_endpoint: String,
-    /// Logical name basis registers the BGP instance under. Surfaces
-    /// in `holod`'s `Get` state for debugging.
-    #[serde(default = "default_bgp_instance_name")]
-    pub instance_name: String,
+    /// gRPC endpoint of the local gobgpd, e.g. `http://127.0.0.1:50051`.
+    /// Defaults to gobgpd's upstream default; override only if you've
+    /// rebound gobgpd's gRPC plugin.
+    #[serde(default = "default_gobgpd_endpoint")]
+    pub gobgpd_endpoint: String,
 }
 
-fn default_holod_endpoint() -> String {
+fn default_gobgpd_endpoint() -> String {
     "http://127.0.0.1:50051".to_string()
-}
-
-fn default_bgp_instance_name() -> String {
-    "basis".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -294,9 +286,6 @@ impl BgpConfig {
             .router_id
             .parse()
             .map_err(|e| anyhow::anyhow!("bgp.routerId '{}' invalid: {e}", self.router_id))?;
-        if self.instance_name.is_empty() {
-            anyhow::bail!("bgp.instanceName must not be empty");
-        }
         Ok(())
     }
 

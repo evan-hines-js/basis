@@ -16,17 +16,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .boxed(".basis.v1.ControllerCommand.command.register_ack")
         .compile_protos(&["proto/basis.proto"], &["proto"])?;
 
-    // holo.proto — the upstream holo daemon's gRPC northbound. Vendored
-    // verbatim from holo-routing/holo at the same tag pinned by the
-    // ansible installer. We compile a client only — basis is a
-    // consumer of holod, never a server.
+    // gobgp.proto and friends — vendored verbatim from osrg/gobgp v4.4.0.
+    // Imported as `package api` (GoBGP's choice). Client-only.
     tonic_prost_build::configure()
         .build_server(false)
         .build_client(true)
-        .compile_protos(&["proto/holo.proto"], &["proto"])?;
+        .compile_protos(
+            &[
+                "proto/gobgp/api/attribute.proto",
+                "proto/gobgp/api/capability.proto",
+                "proto/gobgp/api/common.proto",
+                "proto/gobgp/api/extcom.proto",
+                "proto/gobgp/api/gobgp.proto",
+                "proto/gobgp/api/nlri.proto",
+            ],
+            &["proto/gobgp"],
+        )?;
 
     println!("cargo:rerun-if-changed=proto/basis.proto");
-    println!("cargo:rerun-if-changed=proto/holo.proto");
+    println!("cargo:rerun-if-changed=proto/gobgp");
 
     Ok(())
 }

@@ -76,8 +76,8 @@ struct AgentRuntime {
     reconnect_signal: CancellationToken,
     /// Lazily started in `handshake` once the controller's first
     /// `RegisterAck` provides the cell ASN + reflector address.
-    /// Stays put across reconnects — re-pushing the same config to
-    /// holod on every handshake would be a no-op transaction.
+    /// Stays put across reconnects — the speaker's prefix cache
+    /// short-circuits no-op pushes against gobgpd.
     bgp_speaker: Option<Speaker>,
 }
 
@@ -526,11 +526,11 @@ async fn handshake(
         }
     }
 
-    // Bring up the host BGP speaker against local holod, peering
-    // with the cell reflector. holod runs as its own systemd service
-    // — basis-agent restarts don't drop the session. Idempotent at
-    // holod's level: re-pushing the same config on reconnect is a
-    // no-op transaction.
+    // Bring up the host BGP speaker against local gobgpd, peering
+    // with the cell reflector. gobgpd runs as its own systemd
+    // service — basis-agent restarts don't drop the session. The
+    // speaker's prefix cache short-circuits no-op re-pushes on
+    // reconnect.
     {
         let mut rt = runtime.write().await;
         if rt.bgp_speaker.is_none() {
@@ -540,11 +540,10 @@ async fn handshake(
                 asn: bgp_asn,
                 router_id,
                 reflector_address: reflector,
-                holod_endpoint: rt.spec.holod_endpoint.clone(),
-                instance_name: "basis".to_string(),
+                gobgpd_endpoint: rt.spec.gobgpd_endpoint.clone(),
             })
             .await
-            .context("starting BGP speaker against local holod")?;
+            .context("starting BGP speaker against local gobgpd")?;
             rt.bgp_speaker = Some(speaker);
         }
     }

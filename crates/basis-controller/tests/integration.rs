@@ -98,8 +98,7 @@ impl RunningController {
             basis_controller::config::BgpConfig {
                 asn: 64500,
                 router_id: "10.0.0.1".to_string(),
-                holod_endpoint: "http://127.0.0.1:50051".to_string(),
-                instance_name: "basis-test".to_string(),
+                gobgpd_endpoint: "http://127.0.0.1:50051".to_string(),
             },
             safety,
         )

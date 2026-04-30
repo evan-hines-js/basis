@@ -349,10 +349,10 @@ message RegisterHostResponse {
   // next tick — sent inline so the agent can converge before
   // accepting CreateVm commands.
   ReconcileHostCommand initial_state = 2;
-  // Cell BGP parameters. Every host runs `holod` and peers iBGP with
-  // the cell route reflector (running as the controller's local
-  // holod) at the cell ASN. The agent uses these to seed its own
-  // local holod's BGP instance.
+  // Cell BGP parameters. Every host runs `gobgpd` and peers iBGP
+  // with the cell route reflector (running as the controller's
+  // local gobgpd) at the cell ASN. The agent uses these to seed
+  // its own local gobgpd's BGP instance.
   uint32 bgp_asn = 3;
   // Underlay IP of the controller's BGP listener (tcp/179). Sourced
   // from `BasisControllerSpec.bgp.routerId` in the controller config.

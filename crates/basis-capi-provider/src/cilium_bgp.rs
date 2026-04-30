@@ -74,9 +74,20 @@ pub fn render_bgp_crds(inputs: &BgpRenderInputs<'_>) -> Result<Vec<String>, serd
             },
             // Advertise IPv4 unicast only. Match the export
             // advertisement below; mismatched AFI/SAFI on the
-            // session means the prefix never moves.
+            // session means the prefix never moves. The
+            // `advertisements.matchLabels` selector is what binds
+            // the peer to the `CiliumBGPAdvertisement` rendered
+            // below — without it the session establishes but
+            // announces nothing, and LB pool /32s never reach the
+            // RR.
             "families": [
-                { "afi": "ipv4", "safi": "unicast" }
+                {
+                    "afi": "ipv4",
+                    "safi": "unicast",
+                    "advertisements": {
+                        "matchLabels": { "advertise": "default-lb" },
+                    },
+                }
             ],
         }),
     })?;
@@ -249,5 +260,40 @@ mod tests {
         let advert = &docs[2];
         assert!(advert.contains("\"advertisementType\":\"Service\""));
         assert!(advert.contains("\"addresses\":[\"LoadBalancerIP\"]"));
+    }
+
+    /// The peer-config's `families[].advertisements.matchLabels`
+    /// must match the advertisement's labels — that selector is the
+    /// only thing that binds the BGP session to the
+    /// `CiliumBGPAdvertisement`. If the labels drift, the session
+    /// establishes but announces nothing, and LB pool /32s never
+    /// reach the RR (symptom: cluster LB IPs unreachable from
+    /// outside the workload cluster, ICMP-unreachable from the
+    /// fabric).
+    #[test]
+    fn peer_config_selects_advertisement_via_matching_labels() {
+        let docs = render_bgp_crds(&BgpRenderInputs {
+            cluster_id: "abc-123",
+            reflector_address: "10.0.0.206",
+            asn: 65000,
+        })
+        .unwrap();
+        let peer_config = &docs[0];
+        let advert = &docs[2];
+        let peer_config_json: serde_json::Value = serde_json::from_str(peer_config).unwrap();
+        let advert_json: serde_json::Value = serde_json::from_str(advert).unwrap();
+        let selector = &peer_config_json["spec"]["families"][0]["advertisements"]["matchLabels"];
+        assert!(
+            selector.is_object(),
+            "peer-config missing advertisements.matchLabels"
+        );
+        let advert_labels = &advert_json["metadata"]["labels"];
+        for (k, v) in selector.as_object().unwrap() {
+            assert_eq!(
+                advert_labels.get(k),
+                Some(v),
+                "advertisement labels missing peer-config selector key {k}"
+            );
+        }
     }
 }

@@ -1,0 +1,23 @@
+[Unit]
+Description=GoBGP daemon (cell BGP route reflector / per-host speaker)
+Documentation=https://github.com/osrg/gobgp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# No `-f`: gobgpd starts with no static config and only listens on
+# the gRPC northbound. basis-controller / basis-agent push the
+# Global (ASN, router-id, families) via StartBgp, which is what
+# binds tcp/179. A static toml that sets a Global would make
+# gobgpd bind 179 eagerly and the gRPC StartBgp would then collide.
+ExecStart=/usr/local/bin/gobgpd --api-hosts={{ gobgp_grpc_host }}:{{ gobgp_grpc_port }}
+Restart=on-failure
+RestartSec=2s
+# tcp/179 needs CAP_NET_BIND_SERVICE; gobgpd doesn't otherwise need
+# root, but we run as root for now to avoid the capability dance.
+# Tighten in a follow-up.
+User=root
+
+[Install]
+WantedBy=multi-user.target

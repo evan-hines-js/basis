@@ -57,11 +57,12 @@ pub struct HostSpec {
     #[serde(default = "default_metrics_listen")]
     pub metrics_listen: String,
 
-    /// gRPC endpoint of the local holod (the BGP daemon basis-agent
-    /// drives via the YANG northbound). Defaults to holod's upstream
-    /// default; override only if you've rebound holod's gRPC plugin.
-    #[serde(default = "default_holod_endpoint")]
-    pub holod_endpoint: String,
+    /// gRPC endpoint of the local gobgpd (the BGP daemon basis-agent
+    /// drives via its typed gRPC northbound). Defaults to gobgpd's
+    /// upstream default; override only if you've rebound gobgpd's
+    /// gRPC plugin.
+    #[serde(default = "default_gobgpd_endpoint")]
+    pub gobgpd_endpoint: String,
 
     /// Operator-assigned placement preference, lower wins. The
     /// scheduler uses this as a tiebreaker after capacity + GPU
@@ -86,7 +87,7 @@ fn default_metrics_listen() -> String {
     "0.0.0.0:9444".to_string()
 }
 
-fn default_holod_endpoint() -> String {
+fn default_gobgpd_endpoint() -> String {
     "http://127.0.0.1:50051".to_string()
 }
 

@@ -1,0 +1,93 @@
+---
+# gobgpd — the BGP daemon basis-controller drives via gRPC for cell
+# route reflection, and basis-agent drives for per-host advertisement
+# of cluster_vips. gobgpd ships statically-linked Go binaries with
+# no glibc dependencies, so we pull a release tarball instead of
+# building from source. Independent systemd lifecycle from basis: a
+# basis bounce must not drop sessions and flap VIPs.
+
+- name: Decide gobgp release asset for this host's arch
+  ansible.builtin.set_fact:
+    _gobgp_arch: >-
+      {% if ansible_facts.architecture == 'x86_64' %}amd64
+      {%- elif ansible_facts.architecture == 'aarch64' %}arm64
+      {%- elif ansible_facts.architecture == 'armv7l' %}armv6
+      {%- else %}{{ ansible_facts.architecture }}{% endif %}
+    _gobgp_version_no_v: "{{ gobgp_version | regex_replace('^v', '') }}"
+
+- name: Check installed gobgpd version on the host
+  ansible.builtin.command: /usr/local/bin/gobgpd --version
+  register: _gobgpd_version_check
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Refresh apt cache if stale
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts['pkg_mgr'] == 'apt'
+  failed_when: false
+
+- name: Install gobgpd runtime deps
+  # nftables for the source-IP ACL the controller maintains.
+  # gobgpd itself has no other runtime dependencies.
+  ansible.builtin.package:
+    name:
+      - nftables
+    state: present
+
+- name: Download gobgp release tarball
+  # Pinned tarball; idempotent under `creates`. Lands in /tmp so a
+  # successful unpack leaves no debris on the host.
+  ansible.builtin.get_url:
+    url: "https://github.com/osrg/gobgp/releases/download/{{ gobgp_version }}/gobgp_{{ _gobgp_version_no_v }}_linux_{{ _gobgp_arch }}.tar.gz"
+    dest: "/tmp/gobgp_{{ _gobgp_version_no_v }}_{{ _gobgp_arch }}.tar.gz"
+    mode: "0644"
+  when:
+    - _gobgpd_version_check.rc != 0
+      or _gobgp_version_no_v not in (_gobgpd_version_check.stdout | default(''))
+  register: _gobgp_download
+
+- name: Unpack gobgpd binary
+  ansible.builtin.unarchive:
+    src: "/tmp/gobgp_{{ _gobgp_version_no_v }}_{{ _gobgp_arch }}.tar.gz"
+    dest: /usr/local/bin/
+    remote_src: true
+    include:
+      - gobgpd
+      - gobgp
+    owner: root
+    group: root
+    mode: "0755"
+  when: _gobgp_download is changed
+  notify: Restart gobgpd
+
+- name: Remove downloaded tarball
+  ansible.builtin.file:
+    path: "/tmp/gobgp_{{ _gobgp_version_no_v }}_{{ _gobgp_arch }}.tar.gz"
+    state: absent
+
+- name: Install gobgpd.service unit
+  ansible.builtin.template:
+    src: gobgpd.service.j2
+    dest: /etc/systemd/system/gobgpd.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart gobgpd
+
+- name: Enable + start gobgpd
+  ansible.builtin.systemd:
+    name: gobgpd
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for gobgpd gRPC to accept connections
+  ansible.builtin.wait_for:
+    host: "{{ gobgp_grpc_host }}"
+    port: "{{ gobgp_grpc_port }}"
+    timeout: 30

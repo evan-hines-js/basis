@@ -3,6 +3,7 @@
 pki/
 inventory.ini
 
-# Control-node staging dir for `cargo install holo-daemon` (basis-holod
-# role). ~10s of MB of build artifacts; rebuilt on demand.
+# Build / cache dirs left behind by older roles (e.g. the cargo build
+# of holod when basis used Holo as its BGP daemon). Kept ignored so
+# stale dirs from past playbook runs don't pollute git status.
 build/

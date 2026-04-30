@@ -3,8 +3,8 @@
 //! The rule: anything that would otherwise be duplicated across crates lives
 //! here. Anything used by only one crate stays local to that crate.
 
+pub mod gobgp;
 pub mod gpu;
-pub mod holo;
 pub mod resource;
 pub mod time;
 pub mod tls;

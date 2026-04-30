@@ -39,6 +39,6 @@ spec:
   bgp:
     asn: {{ basis_bgp_asn }}
     routerId: {{ basis_bgp_router_id }}
-    holodEndpoint: "http://{{ holo_grpc_host }}:{{ holo_grpc_port }}"
+    gobgpdEndpoint: "http://{{ gobgp_grpc_host }}:{{ gobgp_grpc_port }}"
   safety:
     autoReconcileOrphanInventory: {{ basis_auto_reconcile_orphan_inventory | default(false) | bool | string | lower }}

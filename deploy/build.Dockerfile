@@ -6,8 +6,7 @@
 #
 # Pin rust to an exact patch version. `rust:1` and `rust:1-bookworm` are
 # moving tags — when they shift to a new rustc, every cached cargo
-# fingerprint becomes stale. Keep this in sync with holo_rust_version
-# in deploy/ansible/group_vars/all.yml.
+# fingerprint becomes stale.
 FROM rust:1.88.0-bookworm
 
 RUN apt-get update -qq \

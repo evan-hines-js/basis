@@ -1,9 +1,9 @@
 ---
 - name: Reload systemd
   ansible.builtin.systemd:
-    daemon_reload: yes
+    daemon_reload: true
 
-- name: Restart holod
+- name: Restart gobgpd
   ansible.builtin.systemd:
-    name: holod
+    name: gobgpd
     state: restarted

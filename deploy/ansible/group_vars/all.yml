@@ -1,25 +1,14 @@
 ---
-# holo (the routing daemon basis uses for cell BGP). Runs as its own
-# systemd service on every basis host so its lifecycle is independent
-# of basis-controller / basis-agent. Bumping holo_version requires
-# re-validating basis-controller's bgp module against any YANG schema
-# changes.
-holo_version: v0.9.0
-holo_grpc_host: 127.0.0.1
-holo_grpc_port: 50051
-# Rust toolchain holod is built with. Distro-packaged rustc on
-# Ubuntu LTS lags the holo MSRV — and holo's source uses recently
-# stabilized syntax (e.g. `_` array lengths in holo-yang) that even
-# tags claiming MSRV 1.88 won't actually compile under. We track
-# `stable` so rustup fetches whatever current stable is; pin to a
-# specific version only if you need reproducible builds.
-holo_rust_version: stable
-# Control-node staging dir for the holod build. Used only when the
-# control host is Linux + same arch as targets — then `cargo install`
-# writes the binary to ${holo_build_dir}/bin/holod and the role copies
-# it to /usr/local/bin/holod on each managed host. Excluded from the
-# repo by deploy/ansible/.gitignore.
-holo_build_dir: "{{ playbook_dir }}/build/holo"
+# gobgpd (the BGP daemon basis uses for cell route reflection +
+# per-host speakers). Runs as its own systemd service on every basis
+# host so its lifecycle is independent of basis-controller /
+# basis-agent — a basis bounce doesn't drop BGP sessions or flap
+# VIPs. We pull a prebuilt release tarball from upstream rather than
+# building from source: gobgp ships statically-linked Go binaries
+# with no glibc dependencies, so cross-distro portability is free.
+gobgp_version: v4.4.0
+gobgp_grpc_host: 127.0.0.1
+gobgp_grpc_port: 50051
 
 # Paths on managed hosts.
 basis_bin_dir: /usr/local/bin
@@ -109,9 +98,9 @@ basis_controller_metrics_port: 9443
 # the time. Must be >= 1.0.
 basis_cpu_overcommit_ratio: 4.0
 
-# Cell BGP route reflector. Every basis host runs `holod` (installed
-# by the basis-holod role); the controller drives its local holod as
-# the cell route reflector, and every agent's local holod peers to it
+# Cell BGP route reflector. Every basis host runs `gobgpd` (installed
+# by the basis-gobgpd role); the controller drives its local gobgpd as
+# the cell route reflector, and every agent's local gobgpd peers to it
 # at this ASN. routerId is the controller's underlay LAN IP — the
 # address every agent connects to via BGP. Default is the first
 # basis_controller host's ansible_host.
