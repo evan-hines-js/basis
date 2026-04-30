@@ -19,7 +19,7 @@ use basis_proto::gobgp::{
     attribute, family, go_bgp_service_client::GoBgpServiceClient, nlri, AddPathRequest,
     AddPeerRequest, Attribute, DeletePathRequest, DeletePeerRequest, Family, GetBgpRequest, Global,
     IpAddressPrefix, ListPathRequest, ListPeerRequest, Nlri, OriginAttribute, Path, Peer, PeerConf,
-    RouteReflector, StartBgpRequest, TableType,
+    RouteReflector, StartBgpRequest, StopBgpRequest, TableType,
 };
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
@@ -53,20 +53,45 @@ impl GobgpClient {
     }
 
     /// Idempotent — boots the BGP instance with the given ASN +
-    /// router-id, or no-ops if it's already running.
-    /// `families` is the list of AFI/SAFI pairs the speaker is
-    /// configured for; pass [`AfiSafi::Ipv4Unicast`] for the Stage-1
-    /// IPv4-unicast cell.
+    /// router-id + families, or no-ops if it's already running with
+    /// equivalent state.
+    ///
+    /// gobgp v4.4.0's `GetBgp` only reports asn/router-id/listen-port,
+    /// not the families list, so the families check is done by
+    /// probing each desired AFI/SAFI via a `ListPath` call: a
+    /// configured family answers with its (possibly empty)
+    /// destination set; an unconfigured family returns "address
+    /// family: <fam> not supported." On any mismatch (asn,
+    /// router-id, or any missing family), we tear down via
+    /// `StopBgp` and recreate with the desired Global. This
+    /// self-heals across both gobgpd restarts (which drop in-memory
+    /// state) and stale state from a previous incompatible binary.
     pub async fn start_bgp(
         &self,
         asn: u32,
         router_id: Ipv4Addr,
         families: &[AfiSafi],
     ) -> anyhow::Result<()> {
+        if self
+            .has_running_bgp_with(asn, router_id, families)
+            .await?
+        {
+            return Ok(());
+        }
+        // Best-effort tear-down. StopBgp errors when no instance is
+        // running; we don't care — the next StartBgp is what
+        // matters. Letting StopBgp errors propagate would mask the
+        // real failure path.
+        let mut client = self.inner.lock().await;
+        let _ = client
+            .stop_bgp(StopBgpRequest {
+                allow_graceful_restart: false,
+            })
+            .await;
         let global = Global {
             asn,
             router_id: router_id.to_string(),
-            families: families.iter().map(|f| f.encoded()).collect(),
+            families: families.iter().map(|f| f.families_index()).collect(),
             // The rest are GoBGP defaults; explicitly defaulted so
             // they don't drift if the proto evolves.
             listen_port: 179,
@@ -78,17 +103,6 @@ impl GobgpClient {
             graceful_restart: None,
             bind_to_device: String::new(),
         };
-        let mut client = self.inner.lock().await;
-
-        if client
-            .get_bgp(GetBgpRequest {})
-            .await
-            .ok()
-            .and_then(|r| r.into_inner().global)
-            .is_some_and(|g| g.asn == asn && g.router_id == router_id.to_string())
-        {
-            return Ok(());
-        }
         client
             .start_bgp(StartBgpRequest {
                 global: Some(global),
@@ -97,6 +111,48 @@ impl GobgpClient {
             .map_err(|e| anyhow::anyhow!("StartBgp: {e}"))?;
         debug!(asn, router_id = %router_id, "started gobgpd BGP instance");
         Ok(())
+    }
+
+    /// True iff gobgpd has a Global with matching asn+router-id AND
+    /// every family in `want` is in the global RIB. The families
+    /// check is a probe: gobgpd's `ListPath` returns "address
+    /// family: <fam> not supported" for any AFI/SAFI not in the
+    /// global table, and a (possibly empty) result for any that is.
+    async fn has_running_bgp_with(
+        &self,
+        asn: u32,
+        router_id: Ipv4Addr,
+        want: &[AfiSafi],
+    ) -> anyhow::Result<bool> {
+        let mut client = self.inner.lock().await;
+        let global = match client.get_bgp(GetBgpRequest {}).await {
+            Ok(resp) => resp.into_inner().global,
+            Err(_) => return Ok(false),
+        };
+        let Some(g) = global else { return Ok(false) };
+        if g.asn != asn || g.router_id != router_id.to_string() {
+            return Ok(false);
+        }
+        for f in want {
+            let probe = client
+                .list_path(ListPathRequest {
+                    table_type: TableType::Global as i32,
+                    family: Some(f.to_family()),
+                    ..Default::default()
+                })
+                .await;
+            // The error path matches gobgp's "address family: %s not
+            // supported" — any error here means this family isn't in
+            // the global RIB and we need a fresh Start.
+            if probe.is_err() {
+                return Ok(false);
+            }
+            // Drain the stream so the gRPC response slot is freed
+            // before the next iteration borrows the client again.
+            let mut stream = probe.unwrap().into_inner();
+            while stream.next().await.is_some() {}
+        }
+        Ok(true)
     }
 
     /// Reconcile the peer set to exactly `desired`. Adds peers in
@@ -272,11 +328,20 @@ pub enum AfiSafi {
 }
 
 impl AfiSafi {
-    /// GoBGP encodes the (AFI<<16 | SAFI) family value as a single
-    /// uint32 in `Global.families`. Wire semantics match RFC 4760.
-    fn encoded(self) -> u32 {
-        let f = self.to_family();
-        ((f.afi as u32) << 16) | (f.safi as u32)
+    /// GoBGP v4 keys `Global.families` by an internal enum index
+    /// (`oc.IntToAfiSafiTypeMap` in
+    /// `pkg/config/oc/bgp_configs.go`), NOT by the BGP wire-format
+    /// `(AFI<<16) | SAFI`. Wrong indexes silently fail to register
+    /// the AFI/SAFI, leaving the global RIB without the
+    /// corresponding table — and every later `ListPath` / `AddPath`
+    /// returns "address family: <fam> not supported". Pin the
+    /// indexes here against gobgp v4.4.0; bumping gobgp_version in
+    /// ansible requires re-validating these mappings.
+    fn families_index(self) -> u32 {
+        match self {
+            Self::Ipv4Unicast => 0,
+            Self::L2vpnEvpn => 9,
+        }
     }
 
     fn to_family(self) -> Family {
@@ -342,10 +407,14 @@ mod tests {
         assert_eq!(prefix_nlri.prefix_len, 32);
     }
 
+    /// Pin the gobgp v4.4.0 `IntToAfiSafiTypeMap` indexes — getting
+    /// these wrong silently corrupts the global RIB tables and every
+    /// subsequent ListPath/AddPath fails with "address family not
+    /// supported."
     #[test]
-    fn afisafi_encodes_per_rfc4760() {
-        assert_eq!(AfiSafi::Ipv4Unicast.encoded(), (1 << 16) | 1);
-        assert_eq!(AfiSafi::L2vpnEvpn.encoded(), (25 << 16) | 70);
+    fn afisafi_indexes_match_gobgp_v4() {
+        assert_eq!(AfiSafi::Ipv4Unicast.families_index(), 0);
+        assert_eq!(AfiSafi::L2vpnEvpn.families_index(), 9);
     }
 
     #[test]

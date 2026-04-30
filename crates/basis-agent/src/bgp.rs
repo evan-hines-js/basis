@@ -36,6 +36,7 @@ pub struct SpeakerConfig {
 /// agent; dropping this handle disconnects the gRPC client but does
 /// not touch gobgpd or its sessions.
 pub struct Speaker {
+    config: SpeakerConfig,
     client: GobgpClient,
     /// Last-pushed prefix set, deduplicated. Cached so the reconcile
     /// path can short-circuit when an unchanged set comes back; saves
@@ -49,28 +50,41 @@ impl Speaker {
     /// populate them via [`Self::update_routes`].
     pub async fn start(config: SpeakerConfig) -> anyhow::Result<Self> {
         let client = GobgpClient::connect(&config.gobgpd_endpoint).await?;
-        client
-            .start_bgp(config.asn, config.router_id, &[AfiSafi::Ipv4Unicast])
+        let speaker = Self {
+            config,
+            client,
+            routes: Mutex::new(BTreeSet::new()),
+        };
+        speaker.ensure_running().await?;
+        info!(
+            asn = speaker.config.asn,
+            router_id = %speaker.config.router_id,
+            reflector = %speaker.config.reflector_address,
+            "BGP speaker configured via gobgpd"
+        );
+        Ok(speaker)
+    }
+
+    /// Idempotently configure gobgpd's BGP instance + peers. Called
+    /// from every entry point that touches the RIB so a gobgpd
+    /// restart (which drops in-memory state) self-heals on the next
+    /// reconcile tick. `start_bgp` and `reconcile_peers` are both
+    /// no-ops when state matches, so steady-state cost is two gRPC
+    /// round-trips per reconcile.
+    async fn ensure_running(&self) -> anyhow::Result<()> {
+        self.client
+            .start_bgp(self.config.asn, self.config.router_id, &[AfiSafi::Ipv4Unicast])
             .await?;
-        client
+        self.client
             .reconcile_peers(
                 &[PeerSpec {
-                    address: IpAddr::V4(config.reflector_address),
-                    asn: config.asn,
+                    address: IpAddr::V4(self.config.reflector_address),
+                    asn: self.config.asn,
                 }],
                 false,
             )
             .await?;
-        info!(
-            asn = config.asn,
-            router_id = %config.router_id,
-            reflector = %config.reflector_address,
-            "BGP speaker configured via gobgpd"
-        );
-        Ok(Self {
-            client,
-            routes: Mutex::new(BTreeSet::new()),
-        })
+        Ok(())
     }
 
     /// Replace the prefix set the speaker advertises. Each prefix is
@@ -78,6 +92,7 @@ impl Speaker {
     /// IP) as next-hop. Idempotent — unchanged sets skip the gRPC
     /// roundtrip via the cached `routes` set.
     pub async fn update_routes(&self, prefixes: &[ipnet::Ipv4Net]) -> anyhow::Result<()> {
+        self.ensure_running().await?;
         let new: BTreeSet<String> = prefixes.iter().map(|p| p.to_string()).collect();
         {
             let last = self.routes.lock().await;

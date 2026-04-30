@@ -62,15 +62,24 @@ impl Reflector {
     /// already running with matching config, no-op.
     pub async fn start(config: ReflectorConfig) -> anyhow::Result<Self> {
         let client = GobgpClient::connect(&config.gobgpd_endpoint).await?;
-        client
-            .start_bgp(config.asn, config.router_id, &[AfiSafi::Ipv4Unicast])
-            .await?;
+        let reflector = Self { config, client };
+        reflector.ensure_running().await?;
         info!(
-            asn = config.asn,
-            router_id = %config.router_id,
+            asn = reflector.config.asn,
+            router_id = %reflector.config.router_id,
             "BGP reflector configured via gobgpd"
         );
-        Ok(Self { config, client })
+        Ok(reflector)
+    }
+
+    /// Idempotently configure gobgpd's BGP instance. Called from
+    /// every entry point that touches the daemon so a gobgpd restart
+    /// (which drops in-memory state) self-heals on the next
+    /// reconcile tick. `start_bgp` is a no-op when state matches.
+    async fn ensure_running(&self) -> anyhow::Result<()> {
+        self.client
+            .start_bgp(self.config.asn, self.config.router_id, &[AfiSafi::Ipv4Unicast])
+            .await
     }
 
     /// Reconcile the reflector's neighbor set to exactly `peers`.
@@ -79,6 +88,7 @@ impl Reflector {
     /// `route_reflector_client=true` so cell speakers get reflected
     /// routes between each other.
     pub async fn update_peers(&self, peers: Vec<PeerConfig>) -> anyhow::Result<()> {
+        self.ensure_running().await?;
         let specs: Vec<PeerSpec> = peers
             .iter()
             .map(|p| PeerSpec {
