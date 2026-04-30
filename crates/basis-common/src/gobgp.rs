@@ -1,14 +1,13 @@
 //! Thin client for the GoBGP daemon's gRPC northbound.
 //!
-//! Replaces [`super::holo`] for the basis BGP plane. Both basis-
-//! controller (cell route reflector) and basis-agent (host speaker)
-//! drive their *local* gobgpd via this module. Operations are typed
-//! gRPC calls (`AddPeer`, `AddPath`, etc.) — there's no
-//! `commit_replace` whole-tree analogue, so reconcilers diff against
-//! the daemon's current state and issue Add/Delete RPCs to converge.
+//! Both basis-controller (cell route reflector) and basis-agent
+//! (host speaker) drive their *local* gobgpd via this module.
+//! Operations are typed gRPC calls (`AddPeer`, `AddPath`, etc.);
+//! reconcilers diff against the daemon's current state and issue
+//! Add/Delete RPCs to converge.
 //!
 //! All calls go through a single mutex so concurrent reconciliations
-//! don't interleave on the wire — same property the holo client had.
+//! don't interleave on the wire.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -193,81 +192,38 @@ impl GobgpClient {
     /// `route_reflector_client` is set on every peer in `desired`
     /// — only meaningful on the route-reflector side; agents pass
     /// `false`.
+    ///
+    /// Holds the gRPC client mutex for the whole reconcile so all
+    /// list/add/delete RPCs see a single consistent view of the
+    /// peer set.
     pub async fn reconcile_peers(
         &self,
         desired: &[PeerSpec],
         route_reflector_client: bool,
     ) -> anyhow::Result<()> {
-        let current = self.list_peer_addresses().await?;
+        let mut client = self.inner.lock().await;
+        let current = list_peer_addresses(&mut client).await?;
         let desired_set: BTreeSet<IpAddr> = desired.iter().map(|p| p.address).collect();
 
         for spec in desired.iter().filter(|p| !current.contains(&p.address)) {
-            self.add_peer(spec, route_reflector_client).await?;
+            let peer = peer_message(spec, route_reflector_client);
+            client
+                .add_peer(req(AddPeerRequest { peer: Some(peer) }))
+                .await
+                .map_err(|e| anyhow::anyhow!("AddPeer({}): {e}", spec.address))?;
+            debug!(peer = %spec.address, asn = spec.asn, rr_client = route_reflector_client, "added gobgp peer");
         }
         for addr in current.difference(&desired_set) {
-            self.delete_peer(*addr).await?;
+            client
+                .delete_peer(req(DeletePeerRequest {
+                    address: addr.to_string(),
+                    interface: String::new(),
+                }))
+                .await
+                .map_err(|e| anyhow::anyhow!("DeletePeer({addr}): {e}"))?;
+            debug!(peer = %addr, "deleted gobgp peer");
         }
         Ok(())
-    }
-
-    async fn add_peer(&self, spec: &PeerSpec, rr_client: bool) -> anyhow::Result<()> {
-        let peer = Peer {
-            conf: Some(PeerConf {
-                neighbor_address: spec.address.to_string(),
-                peer_asn: spec.asn,
-                ..Default::default()
-            }),
-            route_reflector: if rr_client {
-                Some(RouteReflector {
-                    route_reflector_client: true,
-                    route_reflector_cluster_id: String::new(),
-                })
-            } else {
-                None
-            },
-            ..Default::default()
-        };
-        let mut client = self.inner.lock().await;
-        client
-            .add_peer(req(AddPeerRequest { peer: Some(peer) }))
-            .await
-            .map_err(|e| anyhow::anyhow!("AddPeer({}): {e}", spec.address))?;
-        debug!(peer = %spec.address, asn = spec.asn, rr_client, "added gobgp peer");
-        Ok(())
-    }
-
-    async fn delete_peer(&self, address: IpAddr) -> anyhow::Result<()> {
-        let mut client = self.inner.lock().await;
-        client
-            .delete_peer(req(DeletePeerRequest {
-                address: address.to_string(),
-                interface: String::new(),
-            }))
-            .await
-            .map_err(|e| anyhow::anyhow!("DeletePeer({address}): {e}"))?;
-        debug!(peer = %address, "deleted gobgp peer");
-        Ok(())
-    }
-
-    async fn list_peer_addresses(&self) -> anyhow::Result<BTreeSet<IpAddr>> {
-        let mut client = self.inner.lock().await;
-        let mut stream = client
-            .list_peer(req(ListPeerRequest::default()))
-            .await
-            .map_err(|e| anyhow::anyhow!("ListPeer: {e}"))?
-            .into_inner();
-        let mut out = BTreeSet::new();
-        while let Some(item) = stream.next().await {
-            let resp = item.map_err(|e| anyhow::anyhow!("ListPeer stream: {e}"))?;
-            if let Some(addr) = resp
-                .peer
-                .and_then(|p| p.conf)
-                .and_then(|c| c.neighbor_address.parse::<IpAddr>().ok())
-            {
-                out.insert(addr);
-            }
-        }
-        Ok(out)
     }
 
     /// Reconcile the locally-originated IPv4-unicast prefix set to
@@ -276,52 +232,44 @@ impl GobgpClient {
     /// ORIGIN = IGP. gobgp v4 rejects AddPath with "nexthop not
     /// found" when the NEXT_HOP attribute is absent — every path
     /// must carry it explicitly.
+    ///
+    /// Holds the gRPC client mutex for the whole reconcile so all
+    /// list/add/delete RPCs see a single consistent view of the RIB.
     pub async fn reconcile_ipv4_paths(
         &self,
         desired: &[String],
         next_hop: Ipv4Addr,
     ) -> anyhow::Result<()> {
-        let current = self.list_ipv4_prefixes().await?;
+        let mut client = self.inner.lock().await;
+        let current = list_ipv4_prefixes(&mut client).await?;
         let desired_set: BTreeSet<String> = desired.iter().cloned().collect();
 
         for prefix in desired_set.difference(&current) {
-            self.add_ipv4_path(prefix, next_hop).await?;
+            let path = ipv4_unicast_path(prefix, next_hop)?;
+            client
+                .add_path(req(AddPathRequest {
+                    table_type: TableType::Global as i32,
+                    vrf_id: String::new(),
+                    path: Some(path),
+                }))
+                .await
+                .map_err(|e| anyhow::anyhow!("AddPath({prefix}): {e}"))?;
+            debug!(prefix, %next_hop, "advertised path via gobgp");
         }
         for prefix in current.difference(&desired_set) {
-            self.delete_ipv4_path(prefix, next_hop).await?;
+            let path = ipv4_unicast_path(prefix, next_hop)?;
+            client
+                .delete_path(req(DeletePathRequest {
+                    table_type: TableType::Global as i32,
+                    vrf_id: String::new(),
+                    family: Some(AfiSafi::Ipv4Unicast.to_family()),
+                    path: Some(path),
+                    uuid: Vec::new(),
+                }))
+                .await
+                .map_err(|e| anyhow::anyhow!("DeletePath({prefix}): {e}"))?;
+            debug!(prefix, %next_hop, "withdrew path via gobgp");
         }
-        Ok(())
-    }
-
-    async fn add_ipv4_path(&self, prefix: &str, next_hop: Ipv4Addr) -> anyhow::Result<()> {
-        let path = ipv4_unicast_path(prefix, next_hop)?;
-        let mut client = self.inner.lock().await;
-        client
-            .add_path(req(AddPathRequest {
-                table_type: TableType::Global as i32,
-                vrf_id: String::new(),
-                path: Some(path),
-            }))
-            .await
-            .map_err(|e| anyhow::anyhow!("AddPath({prefix}): {e}"))?;
-        debug!(prefix, %next_hop, "advertised path via gobgp");
-        Ok(())
-    }
-
-    async fn delete_ipv4_path(&self, prefix: &str, next_hop: Ipv4Addr) -> anyhow::Result<()> {
-        let path = ipv4_unicast_path(prefix, next_hop)?;
-        let mut client = self.inner.lock().await;
-        client
-            .delete_path(req(DeletePathRequest {
-                table_type: TableType::Global as i32,
-                vrf_id: String::new(),
-                family: Some(AfiSafi::Ipv4Unicast.to_family()),
-                path: Some(path),
-                uuid: Vec::new(),
-            }))
-            .await
-            .map_err(|e| anyhow::anyhow!("DeletePath({prefix}): {e}"))?;
-        debug!(prefix, %next_hop, "withdrew path via gobgp");
         Ok(())
     }
 
@@ -469,25 +417,74 @@ impl GobgpClient {
         })
     }
 
-    async fn list_ipv4_prefixes(&self) -> anyhow::Result<BTreeSet<String>> {
-        let mut client = self.inner.lock().await;
-        let mut stream = client
-            .list_path(req(ListPathRequest {
-                table_type: TableType::Global as i32,
-                family: Some(AfiSafi::Ipv4Unicast.to_family()),
-                ..Default::default()
-            }))
-            .await
-            .map_err(|e| anyhow::anyhow!("ListPath: {e}"))?
-            .into_inner();
-        let mut out = BTreeSet::new();
-        while let Some(item) = stream.next().await {
-            let resp = item.map_err(|e| anyhow::anyhow!("ListPath stream: {e}"))?;
-            if let Some(dest) = resp.destination {
-                out.insert(dest.prefix);
-            }
+}
+
+/// Snapshot the global IPv4-unicast prefix set currently advertised
+/// by gobgpd. Free function (not `&self`) because callers hold the
+/// gRPC client mutex during a reconcile and pass `&mut client` —
+/// this avoids the lock-unlock-relock pattern that arises when each
+/// helper re-locks internally.
+async fn list_ipv4_prefixes(
+    client: &mut GoBgpServiceClient<Channel>,
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut stream = client
+        .list_path(req(ListPathRequest {
+            table_type: TableType::Global as i32,
+            family: Some(AfiSafi::Ipv4Unicast.to_family()),
+            ..Default::default()
+        }))
+        .await
+        .map_err(|e| anyhow::anyhow!("ListPath: {e}"))?
+        .into_inner();
+    let mut out = BTreeSet::new();
+    while let Some(item) = stream.next().await {
+        let resp = item.map_err(|e| anyhow::anyhow!("ListPath stream: {e}"))?;
+        if let Some(dest) = resp.destination {
+            out.insert(dest.prefix);
         }
-        Ok(out)
+    }
+    Ok(out)
+}
+
+/// Snapshot the configured peer addresses on gobgpd. Same lock-
+/// borrow contract as [`list_ipv4_prefixes`] — caller holds the
+/// mutex.
+async fn list_peer_addresses(
+    client: &mut GoBgpServiceClient<Channel>,
+) -> anyhow::Result<BTreeSet<IpAddr>> {
+    let mut stream = client
+        .list_peer(req(ListPeerRequest::default()))
+        .await
+        .map_err(|e| anyhow::anyhow!("ListPeer: {e}"))?
+        .into_inner();
+    let mut out = BTreeSet::new();
+    while let Some(item) = stream.next().await {
+        let resp = item.map_err(|e| anyhow::anyhow!("ListPeer stream: {e}"))?;
+        if let Some(addr) = resp
+            .peer
+            .and_then(|p| p.conf)
+            .and_then(|c| c.neighbor_address.parse::<IpAddr>().ok())
+        {
+            out.insert(addr);
+        }
+    }
+    Ok(out)
+}
+
+/// Build a gobgp `Peer` message for [`reconcile_peers`]. Pure —
+/// nothing async, no locks; testable in isolation.
+fn peer_message(spec: &PeerSpec, rr_client: bool) -> Peer {
+    Peer {
+        conf: Some(PeerConf {
+            neighbor_address: spec.address.to_string(),
+            peer_asn: spec.asn,
+            ..Default::default()
+        }),
+        route_reflector: rr_client.then(|| RouteReflector {
+            route_reflector_client: true,
+            route_reflector_cluster_id: String::new(),
+        }),
+        ..Default::default()
     }
 }
 
@@ -853,5 +850,104 @@ mod tests {
     #[test]
     fn split_prefix_rejects_missing_slash() {
         assert!(split_prefix("10.0.0.0").is_err());
+    }
+
+    /// PREFIX defined-set must round-trip to gobgp's wire shape:
+    /// `defined_type=PREFIX`, `prefixes` populated (not `list`),
+    /// each Prefix's mask-length min/max pinned to the prefix's
+    /// own length so an exact-match check (gobgp's MatchSet ANY)
+    /// matches only the literal CIDR.
+    #[test]
+    fn prefix_defined_set_emits_exact_match_bounds() {
+        let s = prefix_defined_set("test", &["10.0.0.0/24".to_string(), "10.0.0.5/32".to_string()])
+            .unwrap();
+        assert_eq!(s.defined_type, DefinedType::Prefix as i32);
+        assert_eq!(s.name, "test");
+        assert!(s.list.is_empty());
+        assert_eq!(s.prefixes.len(), 2);
+        // Both bounds equal the prefix length → exact match.
+        let p24 = s.prefixes.iter().find(|p| p.ip_prefix == "10.0.0.0/24").unwrap();
+        assert_eq!(p24.mask_length_min, 24);
+        assert_eq!(p24.mask_length_max, 24);
+        let p32 = s.prefixes.iter().find(|p| p.ip_prefix == "10.0.0.5/32").unwrap();
+        assert_eq!(p32.mask_length_min, 32);
+        assert_eq!(p32.mask_length_max, 32);
+    }
+
+    /// Malformed CIDRs must fail the build, not silently drop into
+    /// an empty defined-set — silent drops would let an attacker
+    /// neutralize the policy by submitting garbage in upstream
+    /// config.
+    #[test]
+    fn prefix_defined_set_rejects_garbage() {
+        assert!(prefix_defined_set("test", &["not-a-cidr".to_string()]).is_err());
+    }
+
+    /// NEIGHBOR defined-set must round-trip with `list` populated
+    /// (not `prefixes`); IPv4 addresses are rendered as `/32`,
+    /// IPv6 as `/128`. Mismatching the field gobgp expects produces
+    /// a silently-empty match in the daemon.
+    #[test]
+    fn neighbor_defined_set_renders_v4_and_v6_as_host_routes() {
+        let s = neighbor_defined_set(
+            "test",
+            &["10.0.0.1".parse().unwrap(), "fe80::1".parse().unwrap()],
+        );
+        assert_eq!(s.defined_type, DefinedType::Neighbor as i32);
+        assert!(s.prefixes.is_empty());
+        assert!(s.list.contains(&"10.0.0.1/32".to_string()));
+        assert!(s.list.contains(&"fe80::1/128".to_string()));
+    }
+
+    /// `accept_statement` builds the standard "if neighbor in NS
+    /// AND prefix in PS → accept" shape: both sets joined by ANY
+    /// match-type, route-action ACCEPT, no other actions touched.
+    #[test]
+    fn accept_statement_with_prefix_and_neighbor() {
+        let s = accept_statement("stmt", "neighbors", Some("prefixes"));
+        assert_eq!(s.name, "stmt");
+        let conds = s.conditions.unwrap();
+        let ns = conds.neighbor_set.unwrap();
+        assert_eq!(ns.name, "neighbors");
+        assert_eq!(ns.r#type, match_set::Type::Any as i32);
+        let ps = conds.prefix_set.unwrap();
+        assert_eq!(ps.name, "prefixes");
+        assert_eq!(ps.r#type, match_set::Type::Any as i32);
+        let actions = s.actions.unwrap();
+        assert_eq!(actions.route_action, RouteAction::Accept as i32);
+    }
+
+    /// `accept_statement` with `prefix_set: None` (the hypervisor
+    /// catch-all shape) emits no prefix_set in conditions —
+    /// otherwise gobgp would fail to compile a policy referencing
+    /// a missing prefix-set.
+    #[test]
+    fn accept_statement_omits_prefix_set_when_none() {
+        let s = accept_statement("stmt", "neighbors", None);
+        let conds = s.conditions.unwrap();
+        assert!(conds.prefix_set.is_none());
+        assert!(conds.neighbor_set.is_some());
+    }
+
+    /// `peer_message` with `rr_client=true` (the route-reflector's
+    /// view of cell speakers) sets `route_reflector_client=true`
+    /// on the peer; with `rr_client=false` (a host speaker's view
+    /// of the RR) the route-reflector field is absent entirely.
+    /// Both shapes are what gobgp v4 expects on AddPeer.
+    #[test]
+    fn peer_message_rr_client_flag() {
+        let spec = PeerSpec {
+            address: "10.0.0.1".parse().unwrap(),
+            asn: 64512,
+        };
+        let p = peer_message(&spec, true);
+        let conf = p.conf.as_ref().unwrap();
+        assert_eq!(conf.neighbor_address, "10.0.0.1");
+        assert_eq!(conf.peer_asn, 64512);
+        let rr = p.route_reflector.unwrap();
+        assert!(rr.route_reflector_client);
+
+        let p = peer_message(&spec, false);
+        assert!(p.route_reflector.is_none());
     }
 }
