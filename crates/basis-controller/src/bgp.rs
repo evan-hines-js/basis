@@ -211,15 +211,10 @@ async fn legitimate_sources(db: &Db) -> Result<BTreeSet<IpAddr>, crate::db::DbEr
 /// certificate exchange. The cell management LAN's address space
 /// *is* the trust boundary.
 pub async fn acl_reconciler(db: Db, shutdown: CancellationToken) {
-    // ACL must be applied at least once to install the drop-by-
-    // default rule on tcp/179, even if `legitimate_sources` is
-    // initially empty. After that, only push when the permitted set
-    // changes.
     reconcile_loop(
         "BGP source-IP ACL reconciler",
         db,
         shutdown,
-        ApplyOnFirstTick::Always,
         |current| async move {
             let count = current.len();
             let ruleset = render_acl_ruleset(&current);
@@ -333,7 +328,6 @@ pub async fn peer_reconciler(reflector: Arc<Reflector>, db: Db, shutdown: Cancel
         "BGP peer reconciler",
         db,
         shutdown,
-        ApplyOnFirstTick::OnlyIfChanged,
         |current| {
             let reflector = reflector.clone();
             async move {
@@ -351,40 +345,34 @@ pub async fn peer_reconciler(reflector: Arc<Reflector>, db: Db, shutdown: Cancel
     .await
 }
 
-/// Whether [`reconcile_loop`] applies on the very first tick when
-/// the desired set is (initially) empty. ACL needs `Always` so the
-/// kernel ruleset gets the default-drop on tcp/179 even when no
-/// hosts are registered yet; peer-set updates are no-ops on the
-/// empty set, so they use `OnlyIfChanged`.
-#[derive(Debug, Clone, Copy)]
-enum ApplyOnFirstTick {
-    Always,
-    OnlyIfChanged,
-}
-
-/// Tick-driven diff-and-apply loop shared by [`acl_reconciler`] and
-/// [`peer_reconciler`]. Each tick samples [`legitimate_sources`]
-/// (cheap — one DB read), and only invokes `apply` when the snapshot
-/// has changed since the last successful apply.
+/// Tick-driven apply loop shared by [`acl_reconciler`] and
+/// [`peer_reconciler`]. Every tick samples [`legitimate_sources`]
+/// and re-invokes `apply`. We do NOT short-circuit on "desired set
+/// unchanged" because gobgpd / nftables are external state stores
+/// that can be wiped out from under us (gobgpd restart, nft flush);
+/// trusting an in-process cache there cost an outage when gobgpd
+/// restarted after the controller's first push and reconciler's
+/// `last` lied that we were in sync.
+///
+/// Both `apply` implementations are wholesale-replace and idempotent
+/// against the live state, so re-running is cheap (a couple of gRPC
+/// calls or one `nft -f`) and self-healing.
 ///
 /// Returning `Err` from `apply` is logged and the loop continues —
 /// transient gobgpd or DB errors shouldn't stop reconciliation; the
-/// next tick re-attempts because `last` only advances on success.
+/// next tick re-attempts.
 ///
 /// Exits cleanly on `shutdown.cancelled()`.
 async fn reconcile_loop<F, Fut>(
     name: &'static str,
     db: Db,
     shutdown: CancellationToken,
-    policy: ApplyOnFirstTick,
     mut apply: F,
 ) where
     F: FnMut(BTreeSet<IpAddr>) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let mut ticker = tokio::time::interval(RECONCILER_INTERVAL);
-    let mut last: BTreeSet<IpAddr> = BTreeSet::new();
-    let mut applied_once = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -399,25 +387,9 @@ async fn reconcile_loop<F, Fut>(
                         continue;
                     }
                 };
-                let must_apply_first = !applied_once
-                    && matches!(policy, ApplyOnFirstTick::Always);
-                if !must_apply_first && current == last {
-                    continue;
-                }
-                // Move ownership into apply — `BTreeSet<IpAddr>` is
-                // small (~24 bytes/entry) and the apply closure
-                // ergonomically owns the data without lifetime
-                // gymnastics. We retain a copy in `last` for the
-                // next tick's diff.
-                let snapshot = current.clone();
                 if let Err(e) = apply(current).await {
                     warn!(reconciler = name, error = %e, "reconcile apply failed");
-                    // Don't advance `last`/`applied_once` — a future
-                    // tick retries the same diff.
-                    continue;
                 }
-                last = snapshot;
-                applied_once = true;
             }
         }
     }

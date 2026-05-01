@@ -331,8 +331,10 @@ impl GobgpClient {
 
         let mut client = self.inner.lock().await;
 
-        // SetPolicies replaces defined-sets + policies wholesale —
-        // no diff needed, gobgp's atomic apply is idempotent.
+        // SetPolicies wholesale-resets defined-sets + policies. The
+        // `assignments` field on this RPC is ignored by gobgp v4.4.0
+        // (only Reset's first two args are honored), so we drive the
+        // assignment via the dedicated Delete + Add pair below.
         client
             .set_policies(req(SetPoliciesRequest {
                 defined_sets,
@@ -342,12 +344,14 @@ impl GobgpClient {
             .await
             .map_err(|e| anyhow::anyhow!("SetPolicies: {e}"))?;
 
-        // Re-add the import-direction assignment with default
-        // REJECT. gobgp doesn't expose an idempotent "set
-        // assignment" RPC, so delete-then-add. The delete is
-        // best-effort because on first run the assignment doesn't
-        // exist yet and DeletePolicyAssignment errors with "not
-        // found" — that's a clean state, not a real failure.
+        // Delete-then-add the import-direction assignment with
+        // default REJECT. `all: true` is load-bearing: with
+        // `all: false`, gobgp removes only the policies listed
+        // in `policies`, so an empty vec is a no-op delete and
+        // the subsequent AddPolicyAssignment errors with
+        // "duplicated policy". The delete is best-effort because
+        // on first run the assignment doesn't exist yet and gobgp
+        // returns "not found".
         let _ = client
             .delete_policy_assignment(req(DeletePolicyAssignmentRequest {
                 assignment: Some(PolicyAssignment {
@@ -356,7 +360,7 @@ impl GobgpClient {
                     policies: Vec::new(),
                     default_action: RouteAction::Reject as i32,
                 }),
-                all: false,
+                all: true,
             }))
             .await;
         client
