@@ -324,9 +324,16 @@ impl GobgpClient {
             ));
         }
 
+        let statement_count = statements.len();
         let policy = Policy {
             name: POLICY_NAME.to_string(),
-            statements: statements.clone(),
+            statements,
+        };
+        let assignment = |policies: Vec<Policy>| PolicyAssignment {
+            name: ASSIGNMENT_NAME.to_string(),
+            direction: PolicyDirection::Import as i32,
+            policies,
+            default_action: RouteAction::Reject as i32,
         };
 
         let mut client = self.inner.lock().await;
@@ -344,33 +351,22 @@ impl GobgpClient {
             .await
             .map_err(|e| anyhow::anyhow!("SetPolicies: {e}"))?;
 
-        // Delete-then-add the import-direction assignment with
-        // default REJECT. `all: true` is load-bearing: with
-        // `all: false`, gobgp removes only the policies listed
-        // in `policies`, so an empty vec is a no-op delete and
-        // the subsequent AddPolicyAssignment errors with
-        // "duplicated policy". The delete is best-effort because
-        // on first run the assignment doesn't exist yet and gobgp
-        // returns "not found".
+        // Delete-then-add the import-direction assignment. `all: true`
+        // is load-bearing: with `all: false`, gobgp removes only the
+        // policies listed in `policies`, so an empty vec is a no-op
+        // delete and the subsequent AddPolicyAssignment errors with
+        // "duplicated policy". The delete is best-effort because on
+        // first run the assignment doesn't exist yet and gobgp returns
+        // "not found".
         let _ = client
             .delete_policy_assignment(req(DeletePolicyAssignmentRequest {
-                assignment: Some(PolicyAssignment {
-                    name: ASSIGNMENT_NAME.to_string(),
-                    direction: PolicyDirection::Import as i32,
-                    policies: Vec::new(),
-                    default_action: RouteAction::Reject as i32,
-                }),
+                assignment: Some(assignment(Vec::new())),
                 all: true,
             }))
             .await;
         client
             .add_policy_assignment(req(AddPolicyAssignmentRequest {
-                assignment: Some(PolicyAssignment {
-                    name: ASSIGNMENT_NAME.to_string(),
-                    direction: PolicyDirection::Import as i32,
-                    policies: vec![policy],
-                    default_action: RouteAction::Reject as i32,
-                }),
+                assignment: Some(assignment(vec![policy])),
             }))
             .await
             .map_err(|e| anyhow::anyhow!("AddPolicyAssignment: {e}"))?;
@@ -378,7 +374,7 @@ impl GobgpClient {
         debug!(
             clusters = spec.clusters.len(),
             hypervisors = spec.hypervisors.len(),
-            statements = statements.len(),
+            statements = statement_count,
             "ingress policy reconciled",
         );
         Ok(())

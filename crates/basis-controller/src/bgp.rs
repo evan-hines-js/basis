@@ -8,10 +8,14 @@
 //! must not drop the cell's BGP sessions, otherwise every cluster's
 //! apiserver VIP flaps for the duration of the bounce.
 //!
-//! Per-cluster peer state is mirrored from the `hosts` table via
-//! [`peer_reconciler`]; the source-IP ACL on tcp/179 is mirrored via
-//! [`acl_reconciler`]. Both run on a fixed tick and only push when
-//! the source set changed.
+//! Three reconcilers run on a fixed tick and re-apply every cycle
+//! (no in-process cache — gobgpd state can be wiped under us by a
+//! daemon restart, so trusting "we already pushed this" causes
+//! silent divergence): [`peer_reconciler`] mirrors hosts + cluster
+//! VMs into gobgpd's neighbor set; [`acl_reconciler`] mirrors the
+//! same set into nftables on tcp/179; [`policy_reconciler`] pushes
+//! the per-cluster ingress prefix-list filter that constrains what
+//! each peer is allowed to advertise.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -211,52 +215,29 @@ async fn legitimate_sources(db: &Db) -> Result<BTreeSet<IpAddr>, crate::db::DbEr
 /// certificate exchange. The cell management LAN's address space
 /// *is* the trust boundary.
 pub async fn acl_reconciler(db: Db, shutdown: CancellationToken) {
-    reconcile_loop(
-        "BGP source-IP ACL reconciler",
-        db,
-        shutdown,
-        |current| async move {
-            let count = current.len();
-            let ruleset = render_acl_ruleset(&current);
-            nft_apply(&ruleset)
-                .await
-                .map_err(|e| anyhow::anyhow!("nft apply: {e} (is nftables installed?)"))?;
-            debug!(allowed = count, "applied BGP source-IP ACL");
-            Ok(())
-        },
-    )
+    reconcile_loop("BGP source-IP ACL reconciler", shutdown, || async {
+        let allowed = legitimate_sources(&db).await?;
+        let count = allowed.len();
+        nft_apply(&render_acl_ruleset(&allowed))
+            .await
+            .map_err(|e| anyhow::anyhow!("nft apply: {e} (is nftables installed?)"))?;
+        debug!(allowed = count, "applied BGP source-IP ACL");
+        Ok(())
+    })
     .await
 }
 
 /// Periodic reconciler that pushes the cell's ingress prefix-list
 /// policy to the local gobgpd. Each tick computes the desired
-/// [`IngressPolicySpec`] from the DB (cluster prefixes + per-
-/// cluster K8s nodes + hypervisor IPs) and pushes it via
-/// `SetPolicies` + `AddPolicyAssignment`. SetPolicies is wholesale
-/// idempotent — gobgpd replaces its policy state atomically, so we
-/// don't track a `last` snapshot here, just push every tick.
+/// [`IngressPolicySpec`] from the DB (cluster prefixes + per-cluster
+/// K8s nodes + hypervisor IPs) and pushes it via SetPolicies +
+/// DeletePolicyAssignment + AddPolicyAssignment.
 pub async fn policy_reconciler(reflector: Arc<Reflector>, db: Db, shutdown: CancellationToken) {
-    let mut ticker = tokio::time::interval(RECONCILER_INTERVAL);
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                info!("BGP ingress policy reconciler shutting down");
-                return;
-            }
-            _ = ticker.tick() => {
-                let spec = match compute_ingress_policy(&db).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(error = %e, "ingress policy reconciler: compute failed");
-                        continue;
-                    }
-                };
-                if let Err(e) = reflector.update_ingress_policy(&spec).await {
-                    warn!(error = %e, "ingress policy reconciler: push failed");
-                }
-            }
-        }
-    }
+    reconcile_loop("BGP ingress policy reconciler", shutdown, || async {
+        let spec = compute_ingress_policy(&db).await?;
+        reflector.update_ingress_policy(&spec).await
+    })
+    .await
 }
 
 /// Snapshot the DB into an [`IngressPolicySpec`]. One pass over
@@ -318,43 +299,35 @@ async fn compute_ingress_policy(db: &Db) -> Result<IngressPolicySpec, crate::db:
     })
 }
 
-/// Periodic reconciler that mirrors the `hosts` table into the BGP
-/// reflector's neighbor set. Each registered host with a non-empty
-/// `vtep_address` becomes a peer; vanished hosts are removed on the
-/// next tick. Diffs against gobgpd's current peer set, only issues
-/// Add/Delete RPCs for the difference.
+/// Periodic reconciler that mirrors `hosts` (vtep addresses) plus
+/// every cluster VM's IP — the cell's [`legitimate_sources`] — into
+/// the reflector's neighbor set. `Reflector::update_peers` diffs
+/// against gobgpd's live peer set and only issues Add/Delete RPCs
+/// for the difference.
 pub async fn peer_reconciler(reflector: Arc<Reflector>, db: Db, shutdown: CancellationToken) {
-    reconcile_loop(
-        "BGP peer reconciler",
-        db,
-        shutdown,
-        |current| {
-            let reflector = reflector.clone();
-            async move {
-                let peers: Vec<PeerSpec> = current
-                    .into_iter()
-                    .map(|address| PeerSpec {
-                        address,
-                        asn: reflector.config.asn,
-                    })
-                    .collect();
-                reflector.update_peers(&peers).await
-            }
-        },
-    )
+    reconcile_loop("BGP peer reconciler", shutdown, || async {
+        let peers: Vec<PeerSpec> = legitimate_sources(&db)
+            .await?
+            .into_iter()
+            .map(|address| PeerSpec {
+                address,
+                asn: reflector.config.asn,
+            })
+            .collect();
+        reflector.update_peers(&peers).await
+    })
     .await
 }
 
-/// Tick-driven apply loop shared by [`acl_reconciler`] and
-/// [`peer_reconciler`]. Every tick samples [`legitimate_sources`]
-/// and re-invokes `apply`. We do NOT short-circuit on "desired set
-/// unchanged" because gobgpd / nftables are external state stores
+/// Tick-driven apply loop shared by every reconciler in this module.
+/// Every tick re-invokes `apply`. We do NOT short-circuit on "desired
+/// set unchanged" because gobgpd / nftables are external state stores
 /// that can be wiped out from under us (gobgpd restart, nft flush);
 /// trusting an in-process cache there cost an outage when gobgpd
-/// restarted after the controller's first push and reconciler's
-/// `last` lied that we were in sync.
+/// restarted after the controller's first push and the reconciler
+/// believed it was in sync.
 ///
-/// Both `apply` implementations are wholesale-replace and idempotent
+/// Each `apply` implementation is wholesale-replace and idempotent
 /// against the live state, so re-running is cheap (a couple of gRPC
 /// calls or one `nft -f`) and self-healing.
 ///
@@ -363,13 +336,9 @@ pub async fn peer_reconciler(reflector: Arc<Reflector>, db: Db, shutdown: Cancel
 /// next tick re-attempts.
 ///
 /// Exits cleanly on `shutdown.cancelled()`.
-async fn reconcile_loop<F, Fut>(
-    name: &'static str,
-    db: Db,
-    shutdown: CancellationToken,
-    mut apply: F,
-) where
-    F: FnMut(BTreeSet<IpAddr>) -> Fut,
+async fn reconcile_loop<F, Fut>(name: &'static str, shutdown: CancellationToken, mut apply: F)
+where
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let mut ticker = tokio::time::interval(RECONCILER_INTERVAL);
@@ -380,14 +349,7 @@ async fn reconcile_loop<F, Fut>(
                 return;
             }
             _ = ticker.tick() => {
-                let current = match legitimate_sources(&db).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(reconciler = name, error = %e, "legitimate_sources failed");
-                        continue;
-                    }
-                };
-                if let Err(e) = apply(current).await {
+                if let Err(e) = apply().await {
                     warn!(reconciler = name, error = %e, "reconcile apply failed");
                 }
             }
