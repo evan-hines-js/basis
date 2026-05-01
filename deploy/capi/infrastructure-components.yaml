@@ -146,6 +146,27 @@ spec:
                   and used on delete.
                 nullable: true
                 type: string
+              bgpAsn:
+                description: |-
+                  Cell ASN. Single ASN cell-wide; same provenance as
+                  [`Self::bgp_reflector_address`].
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              bgpReflectorAddress:
+                description: |-
+                  Cell BGP route reflector address. Every k8s node in this
+                  cluster peers with this RR (`bgpControlPlane.enabled=true`
+                  in the Cilium chart variant for basis); the per-cluster
+                  `CiliumBGPClusterConfig` + `CiliumBGPAdvertisement` CRDs are
+                  rendered from this + [`Self::bgp_asn`]. Returned by
+                  `Basis.CreateCluster` and stamped onto the BasisCluster
+                  status so consumers (the bootstrap bundle, downstream
+                  reconcilers) can read the value without re-querying the
+                  basis-controller.
+                nullable: true
+                type: string
               cidr:
                 description: |-
                   CIDR of the cluster's overlay (e.g. `10.42.0.0/24`). Same
@@ -262,9 +283,10 @@ spec:
                       extraDiskGibs:
                         description: |-
                           Raw data disks (GiB each) to attach alongside the rootfs. Basis
-                          hands them to the guest unformatted so a Kubernetes storage
-                          operator (Rook/Ceph) can claim and manage them. Order is stable;
-                          the N'th entry becomes `/dev/vd{c,d,...}` in the guest.
+                          hands them to the guest unformatted; an in-cluster CSI driver
+                          (Rook, Longhorn, Mayastor, OpenEBS LocalPV, …) claims and
+                          manages them. Order is stable; the N'th entry becomes
+                          `/dev/vd{c,d,...}` in the guest.
                         items:
                           format: uint32
                           minimum: 0.0
@@ -404,9 +426,10 @@ spec:
               extraDiskGibs:
                 description: |-
                   Raw data disks (GiB each) to attach alongside the rootfs. Basis
-                  hands them to the guest unformatted so a Kubernetes storage
-                  operator (Rook/Ceph) can claim and manage them. Order is stable;
-                  the N'th entry becomes `/dev/vd{c,d,...}` in the guest.
+                  hands them to the guest unformatted; an in-cluster CSI driver
+                  (Rook, Longhorn, Mayastor, OpenEBS LocalPV, …) claims and
+                  manages them. Order is stable; the N'th entry becomes
+                  `/dev/vd{c,d,...}` in the guest.
                 items:
                   format: uint32
                   minimum: 0.0

@@ -56,11 +56,13 @@ basis_lvm_chunk_size: 256K
 basis_lvm_zero_allocation: false
 
 # Block devices (or file-backed loopbacks) that compose the basis-data
-# VG — the plain VG that holds VM extra-disk LVs (Rook OSD backing,
-# etc.). Kept distinct from the rootfs thin pool because bluestore on
-# dm-thin double-books allocation, fragments I/O, breaks TRIM
-# passthrough, and shares a blast radius with VM rootfs. See
-# crates/basis-agent/src/lvm.rs and docs/storage-pools.md.
+# VG — the plain VG that holds VM extra-disk LVs (raw block exposed to
+# the guest for in-cluster CSI drivers: Rook OSDs, Longhorn replicas,
+# Mayastor pools, OpenEBS LocalPV, …). Kept distinct from the rootfs
+# thin pool because bluestore-style consumers on dm-thin double-book
+# allocation, fragment I/O, break TRIM passthrough, and share a blast
+# radius with VM rootfs. See crates/basis-agent/src/lvm.rs and
+# docs/storage-pools.md.
 #
 # Each entry is either:
 #   * a string path to a real block device (production):

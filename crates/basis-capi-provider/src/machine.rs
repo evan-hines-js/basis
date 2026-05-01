@@ -200,8 +200,28 @@ async fn apply(
     // side replaces the machine — standard CAPI flow, no Basis-specific
     // hook required.
     if let Some(vm_id) = machine.status.as_ref().and_then(|s| s.basis_vm_id.clone()) {
-        let vm = basis.get_machine(vm_id).await?;
-        return observe_vm(&api, &name, &vm, &machine, generation).await;
+        match basis.get_machine(vm_id.clone()).await {
+            Ok(vm) => return observe_vm(&api, &name, &vm, &machine, generation).await,
+            // VM recorded in status but absent in basis: external delete,
+            // host loss with no recovery, or a stale id from an earlier
+            // failed apply. Either way, retrying won't bring it back.
+            // Mark terminal so CAPI's KubeadmControlPlane (or any
+            // MachineHealthCheck) replaces the Machine instead of
+            // looping forever on `not found: vm '...'`.
+            Err(e) if e.is_not_found() => {
+                record_terminal_failure(
+                    &api,
+                    &name,
+                    generation,
+                    &machine,
+                    "VmDisappeared",
+                    &format!("Basis VM {vm_id} not found"),
+                )
+                .await;
+                return Ok(Action::await_change());
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 
     let bootstrap_secret = find_bootstrap_secret(&ctx.client, namespace, &name).await?;
@@ -229,15 +249,19 @@ async fn apply(
         })
         .await?;
 
-    // If status/spec patches fail after a successful CreateMachine, the
-    // basis-side VM exists but k8s doesn't know its vm_id — on BasisMachine
-    // deletion, `cleanup()` skips DeleteMachine for lack of basis_vm_id and
-    // the VM leaks. Roll back the create so the next reconcile starts
-    // clean. `create_machine` is idempotent by name, so if the rollback
-    // itself fails (e.g. controller unreachable), the next reconcile will
-    // find the ghost and either finish patching it or delete it via the
-    // CAPI deletion path.
-    if let Err(e) = write_success_status(
+    // No rollback on patch failure. `Basis.CreateMachine` is idempotent
+    // by name (server-side; see basis-controller/src/server.rs), so a
+    // retried apply hits the same VM. Any partial commit converges:
+    //   * status patch failed: no `basis_vm_id` in k8s, so the next
+    //     reconcile re-enters this no-vm-id branch, calls
+    //     `create_machine` (idempotent → same id), and re-attempts
+    //     both patches.
+    //   * status committed, spec failed: `basis_vm_id` is in k8s, so
+    //     the next reconcile takes the observe path and `observe_vm`
+    //     re-runs both patches idempotently. `cleanup()` can also
+    //     find the VM via `basis_vm_id` if the BasisMachine is
+    //     deleted in this state — no leak.
+    commit_status(
         &api,
         &name,
         &created,
@@ -245,25 +269,8 @@ async fn apply(
         &machine,
         generation,
     )
-    .await
-    {
-        warn!(
-            machine = %name,
-            vm_id = %created.id,
-            error = %e,
-            "patches failed after CreateMachine; rolling back basis-side VM",
-        );
-        if let Err(rb) = basis.delete_machine(created.id.clone()).await {
-            warn!(
-                machine = %name,
-                vm_id = %created.id,
-                error = %rb,
-                "rollback DeleteMachine failed; leaving cleanup to next reconcile",
-            );
-        }
-        return Err(e);
-    }
-
+    .await?;
+    commit_spec_provider_id(&api, &name, &created.provider_id).await?;
     Ok(Action::requeue(Duration::from_secs(60)))
 }
 
@@ -297,7 +304,8 @@ async fn observe_vm(
                 .as_ref()
                 .and_then(|s| s.credentials_ref.clone())
                 .ok_or(MachineError::Missing("status.credentialsRef"))?;
-            write_success_status(api, name, &created, &creds, machine, generation).await?;
+            commit_status(api, name, &created, &creds, machine, generation).await?;
+            commit_spec_provider_id(api, name, &created.provider_id).await?;
             Ok(Action::requeue(Duration::from_secs(60)))
         }
         MachineState::Failed => {
@@ -324,15 +332,19 @@ async fn observe_vm(
     }
 }
 
-/// Patch status (with the `basisVmId` marker) first, then spec. Status
-/// carries the durable id; writing it before spec means a crash between
-/// the two patches is self-healing on the next reconcile — the basis-side
-/// VM is re-created idempotently and spec is finished. The opposite order
-/// would leave spec populated without the id k8s uses to clean up.
+/// Commit the durable `basisVmId` plus addresses, conditions, and
+/// readiness onto status. Idempotent. Splitting status from spec means
+/// the failure modes are disjoint:
+///   * If this fails, k8s has no `basis_vm_id`. Next reconcile re-enters
+///     the no-vm-id branch and CreateMachine (idempotent by name) re-
+///     produces the same VM, then re-attempts both patches.
+///   * If this succeeds, `basis_vm_id` is durable. `cleanup()` can find
+///     the VM on finalizer fire even if the spec patch later fails, so
+///     the basis-side VM never leaks.
 ///
 /// Also clears any prior `Ready=False` / `failureMessage` so a recovered
 /// machine doesn't keep advertising its last failure.
-async fn write_success_status(
+async fn commit_status(
     api: &Api<BasisMachine>,
     name: &str,
     created: &CreatedMachine,
@@ -370,20 +382,68 @@ async fn write_success_status(
                 "credentialsRef": credentials_ref,
                 "addresses": addresses,
                 "failureMessage": serde_json::Value::Null,
+                "failureReason": serde_json::Value::Null,
                 "conditions": conditions,
             }
         }),
     )
     .await?;
 
-    merge_spec(
-        api,
-        name,
-        &json!({ "spec": { "providerID": created.provider_id } }),
-    )
-    .await?;
-
     Ok(())
+}
+
+/// Patch `spec.providerID`. Separate from status because (a) spec writes
+/// can fail independently and (b) on retry through `observe_vm`, we
+/// re-run both — splitting keeps each patch's intent local. Idempotent.
+async fn commit_spec_provider_id(
+    api: &Api<BasisMachine>,
+    name: &str,
+    provider_id: &str,
+) -> Result<(), MachineError> {
+    merge_spec(api, name, &json!({ "spec": { "providerID": provider_id } })).await?;
+    Ok(())
+}
+
+/// Mark the BasisMachine as a terminal failure. Sets both `failureReason`
+/// and `failureMessage`; CAPI's Machine controller propagates them onto
+/// `Machine.status.failureReason` / `failureMessage`, which KCP and any
+/// MachineHealthCheck treat as "this Machine is dead, replace it." Use
+/// only for non-recoverable conditions — a transient blip set as terminal
+/// causes a needless replacement cycle. Best-effort: a patch failure is
+/// logged but never returned, since the caller has already decided to
+/// stop reconciling.
+async fn record_terminal_failure(
+    api: &Api<BasisMachine>,
+    name: &str,
+    generation: Option<i64>,
+    machine: &BasisMachine,
+    reason: &'static str,
+    message: &str,
+) {
+    let mut conditions = machine
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    conditions::upsert(
+        &mut conditions,
+        conditions::ready_false(reason, message.to_string(), generation),
+    );
+    let payload = json!({
+        "status": {
+            "ready": false,
+            "failureReason": reason,
+            "failureMessage": message,
+            "conditions": conditions,
+        }
+    });
+    if let Err(patch_err) = merge_status(api, name, &payload).await {
+        warn!(
+            machine = name,
+            error = %patch_err,
+            "could not patch terminal failure status",
+        );
+    }
 }
 
 async fn cleanup(

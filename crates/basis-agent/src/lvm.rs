@@ -32,8 +32,11 @@
 //!      in the data VG, full allocation, blank.
 //!   4. [`Storage::remove_vm_lv`] / [`Storage::remove_vm_data_disks`]
 //!      — `lvremove`, returning extents to their respective VG. With
-//!      `issue_discards = 1` in lvm.conf the TRIM propagates to the
-//!      physical SSD.
+//!      `issue_discards = 1` in lvm.conf, lvm2 issues a discard on
+//!      those extents at lvremove time. Independently, the rootfs
+//!      thin pool is created with `discards=passdown` (lvm2 default)
+//!      so in-flight guest TRIMs reach the physical SSD continuously,
+//!      not just at LV teardown.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -422,8 +425,9 @@ impl Storage {
 
     /// Create a blank linear LV in the data VG.
     ///
-    /// Linear (not thin) is the right shape under bluestore: stable,
-    /// fully-allocated, no CoW indirection. Rook wipes OSD devices at
+    /// Linear (not thin) is the right shape for in-guest CSI consumers:
+    /// stable, fully-allocated, no CoW indirection. CSI drivers
+    /// (bluestore, mayastor, longhorn, LocalPV-LVM) format these at
     /// claim time so there's no benefit to lazy allocation, and
     /// linear's pass-through TRIM means guest discards reach the
     /// physical NVMe immediately.

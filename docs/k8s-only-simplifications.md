@@ -200,42 +200,55 @@ future operators.
 
 **Current.** `MachineRequest.extra_disk_gibs: Vec<u32>`
 (`crates/basis-client/src/lib.rs:142`,
-`basis.proto:197 ExtraDisk`) lets a CAPI machine request an
-arbitrary list of additional disks by size.
+`basis.proto:160 ExtraDisk`) lets a CAPI machine request an
+arbitrary list of additional disks by size. Several comments
+across the codebase named Rook/Ceph as the consumer.
 
-**Why it's generic-VM.** The premise is "users want N disks of
-varying sizes, mounted wherever." Kubelet workloads don't —
-they get storage via PVCs, which are backed by Rook/Ceph PVs
-on storage hosts. The only disk shapes basis actually needs:
-- root disk (OS image)
-- containerd scratch (large, ephemeral, on every node)
-- raw block devices for Rook (storage-host nodes only,
-  consumed whole, not mounted)
+**Why the rename matters more than a schema cut.** The naming
+implied basis knows about a specific storage operator. It
+doesn't, and shouldn't. basis terminates at raw block: it
+hands the guest unformatted virtio-blk devices (`/dev/vd{c,d,…}`),
+and the in-cluster CSI driver — chosen at cluster-deploy time,
+not at basis-build time — formats and serves them.
 
-**Target.** Replace the `Vec<u32>` with explicit named roles:
+The earlier proposal here (rename to `rook_raw_disk_gib`, add a
+`role: Worker | Storage` enum to the proto) is rejected: it
+re-bakes a vendor name into the API surface, which is exactly
+the coupling we want to remove.
 
-```proto
-message MachineRequest {
-  // …
-  uint32 root_disk_gib = 8;
-  uint32 containerd_scratch_gib = 9;
-  // For storage-host nodes only. Each entry is a raw block device
-  // exposed to the guest; Rook claims them whole.
-  repeated uint32 rook_raw_disk_gib = 10;
-}
-```
+**Target.** No proto change. The `extra_disks` plumbing is
+already vendor-neutral; the work is documentation and comment
+hygiene:
 
-CAPI provider sets `rook_raw_disk_gib` only for machines whose
-KubeadmConfig role-labels them as storage hosts. Non-storage
-machines never get extra disks.
+- Comments in `basis.proto`, `crds.rs`, `metrics.rs`,
+  `resources.rs`, `lvm.rs`, and `group_vars/all.yml` list
+  Rook/Ceph as one example among several CSIs (Longhorn,
+  Mayastor, OpenEBS LocalPV, …) rather than as the consumer.
+- The "which CSI to deploy" decision lives in cluster
+  manifests, not in basis.
 
-**Implementation.**
-- Schema change on the proto + agent disk-creation code.
-- BasisMachine spec gets a `role: Worker | Storage` enum;
-  provider keys disk shape off it.
-- Drop `ExtraDisk` and `extra_disk_gibs`.
+**Reference matrix (deployment-time, not basis's concern).**
 
-**Risk.** Low. Mechanical refactor; the surface narrows.
+| Hardware shape | Recommended CSI | Notes |
+|---|---|---|
+| ≥3 storage nodes, ≥4 NVMe each, dedicated 25/100GbE, PLP SSDs | Rook-Ceph | Heaviest and most capable; RWX + RWO + object. |
+| Mid-tier mixed drives, want RWO + simple ops | Longhorn | userspace iSCSI per volume; backups to S3. |
+| NVMe + SPDK / NVMe-oF, perf-sensitive | OpenEBS Mayastor | Needs hugepages; highest perf OSS option. |
+| Local block per-node (homelab, single-node, GPU dev) | OpenEBS LocalPV-LVM or rancher/local-path-provisioner | No replication; basis's dual-VG plumbing maps directly. |
+| Existing SAN / array | Vendor CSI (Pure, NetApp, Dell, …) | Plug into the array, don't run SDS on top. |
+| HPC / training fleets | DAOS / WEKA / VAST / Lightbits | Commercial; basis still just hands raw block. |
+
+If the operator wants a `BasisMachine.role: Worker | Storage`
+enum to key disk shape off, that's a CAPI-provider concern
+(`crates/basis-capi-provider/src/crds.rs`) — basis itself stays
+oblivious. Not done here because no current consumer needs it
+(per "no speculative additions").
+
+**Implementation.** Already done in this pass: comment edits
+across the six files listed above; CRD regen via
+`scripts/generate-capi-components.sh`.
+
+**Risk.** None. Comment-only change; no behavior, no schema.
 
 ---
 
@@ -305,23 +318,6 @@ controlled by the pool's scope, which is the right axis.
 
 ---
 
-## 9. NodePort (never built — keep it that way)
-
-There is no NodePort code path in basis or its CAPI provider.
-This entry exists to be explicit: external Service reachability
-is always via VIP allocated from an external pool and advertised
-over BGP. NodePort would mean clients hit `<node-ip>:<random-high-port>`
-which gives us:
-- ephemeral node IPs (nodes are cattle),
-- non-standard ports clients can't use directly,
-- forced SNAT or `externalTrafficPolicy: Local` correctness
-  footguns.
-
-The fabric is the load balancer. There's no "but what if there's
-no LB" fallback to plan for.
-
----
-
 ## Summary of cuts
 
 | # | Area | Change shape | Blast radius |
@@ -331,10 +327,9 @@ no LB" fallback to plan for.
 | 3 | Network-config | Drop hostname/search-domains | Agent template |
 | 4 | MAC | Random + persisted (drop determinism) | Agent + DB |
 | 5 | LAN VIP | Drop L2 fallback, require BGP | Controller + ansible |
-| 6 | Disks | Named roles, drop free-form list | Proto + provider |
+| 6 | Disks | Affirm raw-block contract, drop CSI vendor names from comments | Comments + docs only |
 | 7 | CPU overcommit | Pin to 1.0, drop knob | Controller |
 | 8 | Apiserver visibility | Drop enum, always external | Proto + controller |
-| 9 | NodePort | (already absent — document non-goal) | Doc only |
 
 Recommended order: 1, 3, 4, 7, 8 first (small, mostly-mechanical,
 low risk); then 6; then 5 (deployment-shape change); then 2

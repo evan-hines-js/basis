@@ -256,10 +256,10 @@ async fn compute_ingress_policy(db: &Db) -> Result<IngressPolicySpec, crate::db:
         if !c.service_block_cidr.is_empty() {
             allowed.push(c.service_block_cidr.clone());
         }
-        // Apiserver VIP /32 — only for PUBLIC visibility (visibility
-        // != 0 means private, the VIP lives inside the cluster CIDR
-        // and is already covered by the cluster CIDR entry above).
-        if c.apiserver_visibility == 0 && !c.control_plane_endpoint.is_empty() {
+        // Apiserver VIP /32 — only for PUBLIC visibility. PRIVATE
+        // apiservers live inside the cluster CIDR and are already
+        // covered by the cluster CIDR entry above.
+        if c.is_apiserver_public() && !c.control_plane_endpoint.is_empty() {
             // Endpoint format is "host:port"; strip port.
             let host = c
                 .control_plane_endpoint

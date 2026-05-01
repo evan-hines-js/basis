@@ -155,8 +155,9 @@ message CreateMachineRequest {
   GPUConstraints gpu_constraints = 9;
   // Additional raw block devices attached alongside the rootfs. Each
   // becomes a plain virtio-blk device (`/dev/vdc`, `/dev/vdd`, …) —
-  // handed to the guest unformatted so an in-cluster storage operator
-  // (Rook/Ceph) can claim and manage them directly.
+  // handed to the guest unformatted. basis terminates at raw block;
+  // an in-cluster CSI driver (Rook, Longhorn, Mayastor, OpenEBS
+  // LocalPV, …) claims and manages them.
   repeated ExtraDisk extra_disks = 10;
   // Optional placement spec. Both `requires` and `prefers` default to
   // empty — empty means "no constraint" and the scheduler picks
@@ -502,7 +503,8 @@ message HeartbeatRequest {
 }
 
 // Per-pool capacity numbers, in bytes. Two pools by design: a thin
-// pool for VM rootfs and a plain VG for raw data disks (Rook OSDs).
+// pool for VM rootfs and a plain VG for raw data disks consumed by
+// in-cluster CSI drivers.
 // Reported on register and on every heartbeat so the scheduler's
 // per-pool budgets stay live, not registration-stale.
 message StorageCapacity {

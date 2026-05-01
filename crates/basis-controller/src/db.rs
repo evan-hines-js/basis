@@ -2022,6 +2022,13 @@ pub struct ClusterIdentity {
 }
 
 impl ClusterRow {
+    /// True iff the cluster's apiserver VIP is allocated from the
+    /// external pool and BGP-advertised cell-wide (proto enum value
+    /// `APISERVER_PUBLIC`). Predicate hides the i64-vs-enum boundary.
+    pub fn is_apiserver_public(&self) -> bool {
+        self.apiserver_visibility == 0
+    }
+
     /// Build a row from the allocator's output and the caller's
     /// pre-decided identity, ready to write via `insert_cluster`.
     /// Centralises the conversion so server.rs doesn't reach into

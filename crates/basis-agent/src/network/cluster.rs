@@ -205,9 +205,9 @@ impl ClusterManager {
     /// cluster's VRF table when present (so cluster-internal
     /// forwarding routes to the holder node). A LAN-pool cluster
     /// has no VRF; only the main install runs. This is symmetric
-    /// with how `add_prefix_route` already places `lan_prefixes` in
-    /// main and `tree_prefixes` in VRF — the via-form refines those
-    /// with a usable next-hop instead of just `dev`.
+    /// with the cluster reconciler placing `lan_prefixes` in main
+    /// and `tree_prefixes` in VRF — the via-form refines those with
+    /// a usable next-hop instead of just `dev`.
     ///
     /// `ip route replace` is idempotent and atomically overwrites
     /// any prior `dev <bridge>`-only install for the same prefix.
@@ -225,7 +225,7 @@ impl ClusterManager {
             return Ok(());
         };
         for table in tables_for(vrf_table) {
-            replace_via_route(prefix, next_hop, &bridge, table).await?;
+            ip_route("replace", prefix, Some(next_hop), &bridge, table).await?;
         }
         Ok(())
     }
@@ -248,7 +248,7 @@ impl ClusterManager {
             // after the route was first installed. Don't propagate
             // the error so withdrawal completes for tables that did
             // have the route.
-            let _ = delete_via_route(prefix, next_hop, &bridge, table).await;
+            let _ = ip_route("del", prefix, Some(next_hop), &bridge, table).await;
         }
         Ok(())
     }
@@ -409,19 +409,19 @@ impl ClusterManager {
                 set.extend(tree_prefixes.iter().cloned());
                 set
             };
-            // Add-before-delete on every diff loop: `add_prefix_route`
-            // uses `ip route replace` (kernel-idempotent), so adding
-            // first never errors on duplicates and never disturbs
-            // existing routes. With del-first, traffic to a "new"
-            // prefix would black-hole for the duration of the install
-            // burst — sticky-owner makes this rare on member-add but
-            // the order is the right shape regardless.
+            // Add-before-delete on every diff loop: `ip route replace`
+            // is kernel-idempotent, so adding first never errors on
+            // duplicates and never disturbs existing routes. With
+            // del-first, traffic to a "new" prefix would black-hole
+            // for the duration of the install burst — sticky-owner
+            // makes this rare on member-add but the order is the
+            // right shape regardless.
             let kernel_main = list_kernel_prefix_routes(&bridge, None).await?;
             for new in want_main.difference(&kernel_main) {
-                add_prefix_route(new, &bridge, None).await?;
+                ip_route("replace", new, None, &bridge, None).await?;
             }
             for stale in kernel_main.difference(&want_main) {
-                if let Err(e) = del_prefix_route(stale, &bridge, None).await {
+                if let Err(e) = ip_route("del", stale, None, &bridge, None).await {
                     warn!(prefix = %stale, vni = cluster.vni, error = %e, "main prefix route del");
                 }
             }
@@ -436,8 +436,8 @@ impl ClusterManager {
             // and keep it across reconciles, so reply-path lookups for
             // VMs in this cluster's CIDR resolve via the bridge.
             // Hosts that DO carry a VM keep the kernel's `proto kernel`
-            // connected route untouched — `add_prefix_route` would
-            // replace it, but `list_kernel_prefix_routes` skips
+            // connected route untouched — `ip_route("replace", ...)`
+            // would replace it, but `list_kernel_prefix_routes` skips
             // proto-kernel rows so the diff never sees it as missing.
             if table_id.is_some() && cluster.gateway_ip.is_empty() && !cluster.cidr.is_empty() {
                 want_combined.insert(cluster.cidr.clone());
@@ -446,10 +446,10 @@ impl ClusterManager {
             if let Some(t) = table_id {
                 let kernel_vrf = list_kernel_prefix_routes(&bridge, Some(t)).await?;
                 for new in want_combined.difference(&kernel_vrf) {
-                    add_prefix_route(new, &bridge, Some(t)).await?;
+                    ip_route("replace", new, None, &bridge, Some(t)).await?;
                 }
                 for stale in kernel_vrf.difference(&want_combined) {
-                    if let Err(e) = del_prefix_route(stale, &bridge, Some(t)).await {
+                    if let Err(e) = ip_route("del", stale, None, &bridge, Some(t)).await {
                         warn!(prefix = %stale, vni = cluster.vni, table = t, error = %e,
                             "vrf prefix route del");
                     }
@@ -892,86 +892,34 @@ fn expand_tree_prefixes(prefixes: &[String]) -> BTreeSet<String> {
 /// table (so the route only resolves for traffic ingressing through
 /// a bridge in the same VRF), `None` for the main table (LAN-pool
 /// cluster, no VRF — host kernel and uplink see the route directly).
-async fn add_prefix_route(
+/// Apply `ip route <action> <prefix> [via <next_hop>] dev <bridge>
+/// [table <id>]`. `action` is `"replace"` for idempotent install or
+/// `"del"` for removal. Per-shape (link vs via) and per-table
+/// variants funnel through one helper so the argv shape is impossible
+/// to drift between callers.
+///
+/// `replace` lets a `via` install overwrite a previous `dev`-only
+/// install (or vice versa) for the same prefix without erroring on
+/// duplicates — whichever caller runs last wins, and BGP-learned
+/// routes converge to the via-form.
+async fn ip_route(
+    action: &str,
     prefix: &str,
+    next_hop: Option<IpAddr>,
     bridge: &str,
     table: Option<u32>,
 ) -> Result<(), NetworkError> {
+    let next_hop_str = next_hop.map(|nh| nh.to_string());
     let table_str = table.map(|t| t.to_string());
-    let mut args: Vec<&str> = vec!["route", "replace", prefix, "dev", bridge];
+    let mut args: Vec<&str> = vec!["route", action, prefix];
+    if let Some(nh) = next_hop_str.as_deref() {
+        args.extend_from_slice(&["via", nh]);
+    }
+    args.extend_from_slice(&["dev", bridge]);
     if let Some(t) = table_str.as_deref() {
         args.extend_from_slice(&["table", t]);
     }
-    trace!(prefix, bridge, table = ?table, "prefix route add");
-    run_cmd("ip", &args).await
-}
-
-async fn del_prefix_route(
-    prefix: &str,
-    bridge: &str,
-    table: Option<u32>,
-) -> Result<(), NetworkError> {
-    let table_str = table.map(|t| t.to_string());
-    let mut args: Vec<&str> = vec!["route", "del", prefix, "dev", bridge];
-    if let Some(t) = table_str.as_deref() {
-        args.extend_from_slice(&["table", t]);
-    }
-    trace!(prefix, bridge, table = ?table, "prefix route del");
-    run_cmd("ip", &args).await
-}
-
-/// Install (or replace) a route with an explicit next-hop, e.g.
-/// `ip route replace 10.0.0.209/32 via 10.100.0.34 dev brc10000`.
-/// Used for BGP-learned routes where the next-hop is a node IP
-/// inside the cluster overlay — the kernel then ARPs for the node,
-/// not the prefix. `replace` makes this safe against the existing
-/// `add_prefix_route` install for the same prefix; whichever runs
-/// last wins, and BGP routes converge to the via-form.
-async fn replace_via_route(
-    prefix: &str,
-    next_hop: IpAddr,
-    bridge: &str,
-    table: Option<u32>,
-) -> Result<(), NetworkError> {
-    let next_hop_str = next_hop.to_string();
-    let table_str = table.map(|t| t.to_string());
-    let mut args: Vec<&str> = vec![
-        "route",
-        "replace",
-        prefix,
-        "via",
-        &next_hop_str,
-        "dev",
-        bridge,
-    ];
-    if let Some(t) = table_str.as_deref() {
-        args.extend_from_slice(&["table", t]);
-    }
-    trace!(prefix, %next_hop, bridge, table = ?table, "via route replace");
-    run_cmd("ip", &args).await
-}
-
-/// Tables a learned via-route should land in, given the cluster's
-/// VRF (if any). Always includes `None` (main table) so LAN-side
-/// ingress through `vmbr0` resolves the prefix to the holder node;
-/// when the cluster has a VRF, also includes that VRF's table so
-/// cluster-internal traffic ingressing on `brc<vni>` resolves it
-/// the same way. Tree-only pools never appear in BGP-learned routes
-/// for now — they don't escape the VRF anyway, and the extra main-
-/// table entry for an unused tree prefix is inert.
-async fn delete_via_route(
-    prefix: &str,
-    next_hop: IpAddr,
-    bridge: &str,
-    table: Option<u32>,
-) -> Result<(), NetworkError> {
-    let next_hop_str = next_hop.to_string();
-    let table_str = table.map(|t| t.to_string());
-    let mut args: Vec<&str> = vec!["route", "del", prefix, "via", &next_hop_str, "dev", bridge];
-    if let Some(t) = table_str.as_deref() {
-        args.extend_from_slice(&["table", t]);
-    }
-    trace!(prefix, %next_hop, bridge, table = ?table, "via route del");
+    trace!(action, prefix, next_hop = ?next_hop, bridge, table = ?table, "ip route");
     run_cmd("ip", &args).await
 }
 
@@ -1051,30 +999,24 @@ async fn list_kernel_cluster_vnis() -> Result<Vec<u32>, NetworkError> {
     Ok(vnis)
 }
 
-/// List the agent-installed prefix routes attached to `bridge` in the
-/// given routing table. The per-cluster connected route (`<cidr> proto
-/// kernel scope link src <gateway>`) is filtered out because it isn't
-/// an agent install — it's auto-acquired from the bridge's IPv4
-/// address. Bare-address destinations are normalised to `<addr>/32`
-/// so the set comparison matches the `<addr>/<prefix>` form produced
-/// by `expand_lan_vips` / `expand_tree_prefixes`.
+/// Snapshot the cluster reconciler's own dev-link prefix routes on
+/// `bridge` in `table` (`None` = main). Bare-address destinations
+/// are normalised to `<addr>/32` so the set comparison matches the
+/// `<addr>/<prefix>` form `expand_lan_vips` / `expand_tree_prefixes`
+/// produce. `table` must match the table the reconciler writes to,
+/// otherwise the diff would re-install routes that already exist or
+/// never delete the ones we wrote.
 ///
-/// `table` must match the table `add_prefix_route` writes to —
-/// otherwise the diff would re-install routes that already exist in
-/// the VRF table (or never delete ones we wrote there).
-/// Snapshot the cluster reconciler's own routes — `dev <bridge>`
-/// scope-link entries only. Skips:
+/// Two row shapes are filtered out — they belong to other writers,
+/// and including them would make the reconciler's diff cull them on
+/// every tick:
 ///   * `proto kernel` rows: the connected route from the bridge's
-///     own IP, owned by the netlink layer; replacing it would
+///     IPv4 address. Owned by the netlink layer; replacing it would
 ///     bounce the bridge.
-///   * `via ...` rows: BGP-RIB-watcher-installed next-hop routes
-///     for LB-IP /32s reflected by the cell RR. Those are owned by
-///     `bgp_routes::install_learned_route` (in this same crate);
-///     including them in the reconciler's diff makes it cull
-///     watcher-installed routes every tick, so kernel forwarding
-///     of LB-IP traffic flaps in step with the reconciler interval.
-///     Disjoint ownership by route shape — reconciler owns dev-link
-///     routes, watcher owns via-next-hop routes.
+///   * `via ...` rows: BGP-RIB-watcher-installed next-hop routes for
+///     LB-IP /32s. Owned by `install_learned_route` in this same
+///     crate. Disjoint ownership by route shape — reconciler owns
+///     dev-link routes, watcher owns via-next-hop routes.
 async fn list_kernel_prefix_routes(
     bridge: &str,
     table: Option<u32>,

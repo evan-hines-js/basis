@@ -85,8 +85,8 @@
   # only picks up the small set of mutable fields (controllerEndpoint),
   # and quietly logs a warning for everything else. New fields landing
   # on existing hosts (e.g. the dual-VG `storage` block added with the
-  # Rook handoff) are immutable and were silently ignored under reload
-  # until the next manual restart. Restart is cheap — VMs run in
+  # extra-disk handoff) are immutable and were silently ignored under
+  # reload until the next manual restart. Restart is cheap — VMs run in
   # independent systemd scopes and survive across agent bounces.
   notify: restart basis-agent
 

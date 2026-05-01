@@ -58,7 +58,7 @@ pub struct Metrics {
     /// overcommitted at the scheduler — exhaustion blocks placement.
     pub host_rootfs_bytes_assigned: IntGaugeVec,
     /// Total bytes of the data VG on each host. The VG backs raw
-    /// data disks (Rook OSDs and other guest-managed block devices).
+    /// data disks consumed by in-cluster CSI drivers in the guest.
     pub host_data_bytes_total: IntGaugeVec,
     /// Sum of VM data-disk allocations (bytes) on each host. Never
     /// overcommitted.

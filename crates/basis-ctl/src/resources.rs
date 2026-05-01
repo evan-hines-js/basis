@@ -84,8 +84,8 @@ pub struct MachineSpec {
     #[serde(default, rename = "minGpuGroupSize")]
     pub min_gpu_group_size: Option<u32>,
     /// Extra raw data disks (GiB each) to attach alongside the rootfs,
-    /// in allocation order. Handed to the guest unformatted so a
-    /// storage operator (Rook/Ceph) can claim them.
+    /// in allocation order. Handed to the guest unformatted; an
+    /// in-cluster CSI driver claims them.
     #[serde(default, rename = "extraDiskGibs")]
     pub extra_disk_gibs: Vec<u32>,
     /// Optional placement constraints (label-based requires/prefers).

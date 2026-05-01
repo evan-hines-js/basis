@@ -156,7 +156,14 @@ apt-get upgrade -y -o Dpkg::Options::=--force-confnew
 # generic meta-package so `/boot/vmlinuz-*` + `/boot/initrd.img-*`
 # exist on-disk for direct-kernel boot (see build-node-image.sh top).
 apt-get install -y linux-image-generic
-apt-get install -y curl ca-certificates apt-transport-https gnupg socat conntrack ebtables ethtool containerd
+apt-get install -y curl ca-certificates apt-transport-https gnupg socat conntrack ebtables ethtool containerd chrony
+# chrony replaces systemd-timesyncd: timesyncd's default poll stretches to
+# ~34min and lets VM clocks drift 20–30ms between corrections, which trips
+# Ceph's 50ms MON_CLOCK_SKEW threshold when two mons drift in opposite
+# directions. chrony polls aggressively and disciplines the kernel clock
+# continuously, holding VMs inside ±1ms.
+systemctl disable --now systemd-timesyncd 2>/dev/null || true
+systemctl enable chrony
 
 mkdir -p /etc/apt/keyrings
 curl -fsSL https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
