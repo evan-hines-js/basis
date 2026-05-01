@@ -93,28 +93,57 @@
   ansible.builtin.setup:
   when: _basis_rebooted is defined and _basis_rebooted is changed
 
-# basis-agent enslaves each cluster bridge (brc<vni>) to a per-trust-domain
-# VRF (bvrf-*). With the default tcp/udp_l3mdev_accept=0, sockets opened in
-# the default VRF cannot match traffic arriving on a VRF-bound interface,
-# so the host kernel RSTs its own outgoing TCP to cluster CIDRs (e.g.
-# `ssh root@10.100.x.y` from the hypervisor: SYN out, SYN-ACK back, RST).
-# ICMP is unaffected, which makes this look like a TCP-only failure.
-- name: Allow default-VRF sockets to talk to VRF-bound bridges
+# Static host-kernel prerequisites for basis. All sysctls basis depends
+# on live in one drop-in so operators have a single file to diff. Loaded
+# by systemd-sysctl.service before multi-user.target, so basis-agent
+# always sees them set at startup. Drift at runtime surfaces as a real
+# outage that the operator investigates, which is the desired signal.
+#
+# * ip_forward: cluster traffic crosses bridges + the uplink; the host
+#   acts as a router for cluster CIDRs.
+# * tcp/udp_l3mdev_accept: basis-agent enslaves each cluster bridge
+#   (brc<vni>) to a per-trust-domain VRF (bvrf-*). With the default 0,
+#   sockets in the default VRF can't match traffic arriving on a
+#   VRF-bound interface, so the host kernel RSTs its own outgoing TCP
+#   to cluster CIDRs (e.g. `ssh root@10.100.x.y` from the hypervisor:
+#   SYN out, SYN-ACK back, RST). ICMP is unaffected, which makes this
+#   look like a TCP-only failure.
+# * proxy_arp on the uplink: LAN-scoped cluster_vips (apiserver public
+#   VIP, LB Service block) are installed as `ip neigh ... proxy` entries
+#   on the uplink by basis-agent, but those entries only fire when
+#   proxy_arp is enabled on the interface. Without it, LAN clients ARP
+#   for the VIP and get no response — connectivity to the VIP fails the
+#   moment a remote ARP cache rolls.
+# * accept_local on the uplink: cross-cluster traffic (workload VM →
+#   mgmt cluster's LB IP) is MASQUERADE'd to the host's LAN IP at
+#   egress, the LAN gateway hairpins it back to the host because the
+#   host proxy-ARPs the VIP, and the returning packet has the host's
+#   own LAN IP as source. With accept_local=0 (default) the kernel
+#   drops it as martian; with accept_local=1 the kernel accepts it
+#   and forwards via the BGP-learned next-hop into the destination
+#   cluster's overlay.
+- name: Write basis sysctl drop-in
   ansible.builtin.copy:
-    dest: /etc/sysctl.d/60-basis-vrf.conf
+    dest: /etc/sysctl.d/60-basis.conf
     content: |
-      # Managed by basis-prereqs. Required for host-originated traffic
-      # to cluster CIDRs because basis-agent enslaves brc<vni> to a VRF.
+      # Managed by basis-prereqs. See deploy/ansible/roles/basis-prereqs/tasks/main.yml.
+      net.ipv4.ip_forward = 1
       net.ipv4.tcp_l3mdev_accept = 1
       net.ipv4.udp_l3mdev_accept = 1
+      net.ipv4.conf.{{ basis_bridge }}.proxy_arp = 1
+      # Tree-VRF lookups fall through to main on miss — basis-agent
+      # keeps each VRF's table to its own connected routes plus
+      # learned /32s, and main holds the LAN default and cross-cluster
+      # routes. strict_mode=1 would break that fall-through.
+      net.vrf.strict_mode = 0
     owner: root
     group: root
     mode: "0644"
-  register: _basis_vrf_sysctl
+  register: _basis_sysctl
 
-- name: Apply VRF sysctls now
-  ansible.builtin.command: sysctl -p /etc/sysctl.d/60-basis-vrf.conf
-  when: _basis_vrf_sysctl.changed
+- name: Apply basis sysctls now
+  ansible.builtin.command: sysctl -p /etc/sysctl.d/60-basis.conf
+  when: _basis_sysctl.changed
   changed_when: true
 # ------------------------------------------------------------------------
 

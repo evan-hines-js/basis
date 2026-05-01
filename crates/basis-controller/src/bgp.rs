@@ -22,9 +22,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use basis_common::gobgp::{
-    AfiSafi, ClusterIngress, GobgpClient, IngressPolicySpec, PeerSpec,
-};
+use basis_common::gobgp::{AfiSafi, ClusterIngress, GobgpClient, IngressPolicySpec, PeerSpec};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -77,7 +75,11 @@ impl Reflector {
     /// reconcile tick. `start_bgp` is a no-op when state matches.
     async fn ensure_running(&self) -> anyhow::Result<()> {
         self.client
-            .start_bgp(self.config.asn, self.config.router_id, &[AfiSafi::Ipv4Unicast])
+            .start_bgp(
+                self.config.asn,
+                self.config.router_id,
+                &[AfiSafi::Ipv4Unicast],
+            )
             .await
     }
 
@@ -189,24 +191,17 @@ const RECONCILER_INTERVAL: Duration = Duration::from_secs(10);
 /// Both reconcilers (peer + ACL) consume this same set so they can't
 /// disagree on who's allowed.
 async fn legitimate_sources(db: &Db) -> Result<BTreeSet<IpAddr>, crate::db::DbError> {
-    let mut out = BTreeSet::new();
-    for host in db.list_hosts().await? {
-        if host.vtep_address.is_empty() {
-            continue;
-        }
-        if let Ok(addr) = host.vtep_address.parse::<IpAddr>() {
-            out.insert(addr);
-        }
-    }
-    for vm in db.list_vms(None).await? {
-        if vm.ip_address.is_empty() {
-            continue;
-        }
-        if let Ok(addr) = vm.ip_address.parse::<IpAddr>() {
-            out.insert(addr);
-        }
-    }
-    Ok(out)
+    let hosts = db
+        .list_hosts()
+        .await?
+        .into_iter()
+        .filter_map(|h| h.vtep_address.parse::<IpAddr>().ok());
+    let vms = db
+        .list_vms(None)
+        .await?
+        .into_iter()
+        .filter_map(|v| v.ip_address.parse::<IpAddr>().ok());
+    Ok(hosts.chain(vms).collect())
 }
 
 /// Background task that mirrors host underlay addresses into the
@@ -305,10 +300,19 @@ async fn compute_ingress_policy(db: &Db) -> Result<IngressPolicySpec, crate::db:
 /// against gobgpd's live peer set and only issues Add/Delete RPCs
 /// for the difference.
 pub async fn peer_reconciler(reflector: Arc<Reflector>, db: Db, shutdown: CancellationToken) {
+    let self_addr = IpAddr::V4(reflector.config.router_id);
     reconcile_loop("BGP peer reconciler", shutdown, || async {
+        // The controller's own underlay IP is in `hosts.vtep_address`
+        // and so falls into `legitimate_sources`. Adding it as a peer
+        // makes gobgpd dial 127.0.0.1:179 → its own listener, accept,
+        // then close with Bad-Peer-AS (Code 2 Subcode 3) every couple
+        // seconds. The notification loop wedges gobgpd's management
+        // goroutine and, observed here, drags every *other* peer
+        // session into IDLE. Skip self.
         let peers: Vec<PeerSpec> = legitimate_sources(&db)
             .await?
             .into_iter()
+            .filter(|addr| addr != &self_addr)
             .map(|address| PeerSpec {
                 address,
                 asn: reflector.config.asn,

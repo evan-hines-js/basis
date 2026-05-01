@@ -279,10 +279,13 @@ impl UplinkBridge {
     }
 
     /// Create the bridge if missing, attach the physical NIC, bring
-    /// both up, and enable IPv4 forwarding so cluster packets can be
-    /// routed off-host. Per-cluster MASQUERADE rules are owned by
-    /// [`ClusterManager`] so they come and go with the cluster
-    /// itself. Idempotent.
+    /// both up. Host-kernel sysctls basis depends on (`ip_forward`,
+    /// `tcp/udp_l3mdev_accept`, uplink `proxy_arp`) are owned by
+    /// ansible's basis-prereqs role at
+    /// `/etc/sysctl.d/60-basis.conf` — single declarative source,
+    /// loaded by systemd-sysctl before basis-agent starts. Per-
+    /// cluster MASQUERADE rules are owned by [`ClusterManager`]
+    /// so they come and go with the cluster itself. Idempotent.
     pub async fn ensure(&self) -> Result<(), NetworkError> {
         let exists = Command::new("ip")
             .args(["link", "show", &self.bridge_name])
@@ -307,8 +310,7 @@ impl UplinkBridge {
                 "uplink bridge created"
             );
         }
-        run_cmd("ip", &["link", "set", &self.bridge_name, "up"]).await?;
-        run_cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await
+        run_cmd("ip", &["link", "set", &self.bridge_name, "up"]).await
     }
 }
 

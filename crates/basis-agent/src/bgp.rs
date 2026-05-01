@@ -73,7 +73,11 @@ impl Speaker {
     /// reflector reflects them to remote peers.
     async fn ensure_running(&self) -> anyhow::Result<()> {
         self.client
-            .start_bgp(self.config.asn, self.config.router_id, &[AfiSafi::Ipv4Unicast])
+            .start_bgp(
+                self.config.asn,
+                self.config.router_id,
+                &[AfiSafi::Ipv4Unicast],
+            )
             .await?;
         if self.config.router_id == self.config.reflector_address {
             return Ok(());
@@ -102,7 +106,10 @@ impl Speaker {
         self.client
             .reconcile_ipv4_paths(&ordered, self.config.router_id)
             .await?;
-        info!(prefixes = ordered.len(), "BGP advertised prefix set reconciled");
+        info!(
+            prefixes = ordered.len(),
+            "BGP advertised prefix set reconciled"
+        );
         Ok(())
     }
 }

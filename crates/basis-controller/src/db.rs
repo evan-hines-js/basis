@@ -1987,8 +1987,8 @@ pub struct ClusterRow {
     /// `0` = `APISERVER_PUBLIC` (apiserver VIP from `external_pool`,
     /// BGP-advertised cell-wide), `1` = `APISERVER_PRIVATE`
     /// (apiserver VIP = last usable in `cidr`, never advertised).
-    /// Stored as i64 to mirror the proto enum; helpers convert at
-    /// the boundary.
+    /// Stored as i64 to mirror the proto enum; predicate helpers
+    /// (`is_apiserver_public`) hide the magic at the boundary.
     pub apiserver_visibility: i64,
     /// Pool name the cluster's external IPs were carved from at
     /// CreateCluster. Always set — every cluster needs a pool for at

@@ -211,6 +211,11 @@ impl ClusterManager {
     ///
     /// `ip route replace` is idempotent and atomically overwrites
     /// any prior `dev <bridge>`-only install for the same prefix.
+    ///
+    /// Installs in `main` plus the next-hop's own VRF table. Sibling
+    /// VRFs reach the prefix via `vrf.strict_mode=0` fall-through to
+    /// main — keeping them out of each VRF's table preserves the
+    /// per-trust-domain isolation the VRFs exist to provide.
     pub async fn install_learned_route(
         &self,
         prefix: &str,
@@ -238,12 +243,11 @@ impl ClusterManager {
             return Ok(());
         };
         for table in tables_for(vrf_table) {
-            // Delete is best-effort per table — the route may have
-            // never been installed in one of them (e.g. main if the
-            // host briefly lacked the cluster's VRF when the path
-            // arrived). Errors are surfaced only on the last try
-            // so withdrawal completes for the table that did have
-            // the route.
+            // Best-effort per table — a route may exist in main but
+            // not in the VRF (or vice versa) if a cluster came up
+            // after the route was first installed. Don't propagate
+            // the error so withdrawal completes for tables that did
+            // have the route.
             let _ = delete_via_route(prefix, next_hop, &bridge, table).await;
         }
         Ok(())
@@ -255,8 +259,12 @@ impl ClusterManager {
     async fn locate_next_hop(&self, next_hop: IpAddr) -> Option<(String, Option<u32>)> {
         let live = self.live.lock().await;
         for (vni, lc) in live.iter() {
-            let Some(cidr) = lc.cidr.as_deref() else { continue };
-            let Ok(net) = cidr.parse::<ipnet::IpNet>() else { continue };
+            let Some(cidr) = lc.cidr.as_deref() else {
+                continue;
+            };
+            let Ok(net) = cidr.parse::<ipnet::IpNet>() else {
+                continue;
+            };
             if net.contains(&next_hop) {
                 return Some((bridge_name(*vni), lc.vrf.as_ref().map(|v| v.table_id)));
             }
@@ -423,15 +431,13 @@ impl ClusterManager {
 
             // Transit-only host (ghost ClusterState: no gateway_ip,
             // so the kernel never injects `<cidr> dev brc<vni>` into
-            // the VRF table). A LAN-VIP VM here replying to a source
-            // in this cluster's CIDR would otherwise hit only
-            // `default via <uplink-gw>` in the VRF and leak the
-            // SYN-ACK out the uplink. Adding `cidr` to want_combined
-            // makes the reconcile loop install
-            // `<cidr> dev brc<vni> table <vrf>` and keep it across
-            // reconciles. Hosts that DO carry a VM keep the kernel's
-            // `proto kernel` connected route untouched — `add_prefix_route`
-            // would replace it, but `list_kernel_prefix_routes` skips
+            // the VRF table). Adding `cidr` to want_combined makes the
+            // reconcile loop install `<cidr> dev brc<vni> table <vrf>`
+            // and keep it across reconciles, so reply-path lookups for
+            // VMs in this cluster's CIDR resolve via the bridge.
+            // Hosts that DO carry a VM keep the kernel's `proto kernel`
+            // connected route untouched — `add_prefix_route` would
+            // replace it, but `list_kernel_prefix_routes` skips
             // proto-kernel rows so the diff never sees it as missing.
             if table_id.is_some() && cluster.gateway_ip.is_empty() && !cluster.cidr.is_empty() {
                 want_combined.insert(cluster.cidr.clone());
@@ -641,35 +647,11 @@ impl ClusterManager {
             let v = vrf_for(&cluster.trust_domain);
             ensure_vrf(&v).await?;
             enslave_to_vrf(&bridge, &v.name).await?;
-            // Seed the VRF's table with a default via the uplink
-            // gateway. Without this, route lookups in the VRF for any
-            // address outside the cluster's own prefixes (Internet,
-            // LAN, anything not in cluster_vips) miss and the kernel
-            // drops the packet. The gateway is whatever main is
-            // already using for the host's egress, so no extra config
-            // is required from the operator.
-            if let Some(gw) = read_uplink_gateway(&self.uplink_bridge).await? {
-                run_cmd(
-                    "ip",
-                    &[
-                        "route",
-                        "replace",
-                        "default",
-                        "via",
-                        &gw,
-                        "dev",
-                        &self.uplink_bridge,
-                        "table",
-                        &v.table_id.to_string(),
-                    ],
-                )
-                .await?;
-            } else {
-                warn!(
-                    vrf = %v.name, uplink = %self.uplink_bridge,
-                    "no main-table default route via uplink; tree VRF will have no egress path",
-                );
-            }
+            // Egress from the VRF relies on l3mdev fall-through to
+            // main (`net.vrf.strict_mode=0`, set by basis-prereqs).
+            // Main holds the LAN default plus every BGP-learned /32,
+            // so reply-path lookups for sibling-cluster addresses find
+            // the right cross-cluster route there.
             Some(v)
         };
 
@@ -803,41 +785,6 @@ impl ClusterManager {
         }
         Ok(())
     }
-}
-
-/// Read the gateway of the main table's default route via `uplink`.
-/// Used to seed each tree-VRF's table with its own default so VMs in
-/// the tree can egress to the LAN/Internet — without it, packets from
-/// the VM hit a route-lookup miss in the VRF table and drop. The
-/// gateway is whatever the host already uses for its own egress, so
-/// no extra config is needed.
-async fn read_uplink_gateway(uplink: &str) -> Result<Option<String>, NetworkError> {
-    let out = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        let mut via: Option<&str> = None;
-        let mut dev: Option<&str> = None;
-        for i in 0..parts.len() {
-            if parts[i] == "via" && i + 1 < parts.len() {
-                via = Some(parts[i + 1]);
-            }
-            if parts[i] == "dev" && i + 1 < parts.len() {
-                dev = Some(parts[i + 1]);
-            }
-        }
-        if let (Some(v), Some(d)) = (via, dev) {
-            if d == uplink {
-                return Ok(Some(v.to_string()));
-            }
-        }
-    }
-    Ok(None)
 }
 
 /// Read the master device of `link` (e.g. the VRF a bridge is
@@ -988,7 +935,15 @@ async fn replace_via_route(
 ) -> Result<(), NetworkError> {
     let next_hop_str = next_hop.to_string();
     let table_str = table.map(|t| t.to_string());
-    let mut args: Vec<&str> = vec!["route", "replace", prefix, "via", &next_hop_str, "dev", bridge];
+    let mut args: Vec<&str> = vec![
+        "route",
+        "replace",
+        prefix,
+        "via",
+        &next_hop_str,
+        "dev",
+        bridge,
+    ];
     if let Some(t) = table_str.as_deref() {
         args.extend_from_slice(&["table", t]);
     }
@@ -1004,10 +959,6 @@ async fn replace_via_route(
 /// the same way. Tree-only pools never appear in BGP-learned routes
 /// for now — they don't escape the VRF anyway, and the extra main-
 /// table entry for an unused tree prefix is inert.
-fn tables_for(vrf: Option<u32>) -> impl Iterator<Item = Option<u32>> {
-    std::iter::once(None).chain(vrf.map(Some))
-}
-
 async fn delete_via_route(
     prefix: &str,
     next_hop: IpAddr,
@@ -1034,6 +985,13 @@ async fn add_proxy_arp(addr: &str, uplink: &str) -> Result<(), NetworkError> {
 async fn del_proxy_arp(addr: &str, uplink: &str) -> Result<(), NetworkError> {
     trace!(addr, uplink, "proxy-arp del");
     run_cmd("ip", &["neigh", "del", "proxy", addr, "dev", uplink]).await
+}
+
+/// Tables a learned route lands in: main plus the next-hop's own
+/// VRF (when the next-hop sits in one). Sibling VRFs reach the
+/// route via `vrf.strict_mode=0` fall-through to main.
+fn tables_for(vrf: Option<u32>) -> impl Iterator<Item = Option<u32>> {
+    std::iter::once(None).chain(vrf.map(Some))
 }
 
 /// Best-effort gratuitous-ARP burst announcing `addr` on `uplink`.
@@ -1104,6 +1062,19 @@ async fn list_kernel_cluster_vnis() -> Result<Vec<u32>, NetworkError> {
 /// `table` must match the table `add_prefix_route` writes to —
 /// otherwise the diff would re-install routes that already exist in
 /// the VRF table (or never delete ones we wrote there).
+/// Snapshot the cluster reconciler's own routes — `dev <bridge>`
+/// scope-link entries only. Skips:
+///   * `proto kernel` rows: the connected route from the bridge's
+///     own IP, owned by the netlink layer; replacing it would
+///     bounce the bridge.
+///   * `via ...` rows: BGP-RIB-watcher-installed next-hop routes
+///     for LB-IP /32s reflected by the cell RR. Those are owned by
+///     `bgp_routes::install_learned_route` (in this same crate);
+///     including them in the reconciler's diff makes it cull
+///     watcher-installed routes every tick, so kernel forwarding
+///     of LB-IP traffic flaps in step with the reconciler interval.
+///     Disjoint ownership by route shape — reconciler owns dev-link
+///     routes, watcher owns via-next-hop routes.
 async fn list_kernel_prefix_routes(
     bridge: &str,
     table: Option<u32>,
@@ -1119,7 +1090,7 @@ async fn list_kernel_prefix_routes(
     }
     let mut prefixes = BTreeSet::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if line.contains("proto kernel") {
+        if line.contains("proto kernel") || line.contains(" via ") {
             continue;
         }
         let Some(first) = line.split_whitespace().next() else {

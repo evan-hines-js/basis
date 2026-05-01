@@ -106,10 +106,7 @@ impl GobgpClient {
         router_id: Ipv4Addr,
         families: &[AfiSafi],
     ) -> anyhow::Result<()> {
-        if self
-            .has_running_bgp_with(asn, router_id, families)
-            .await?
-        {
+        if self.has_running_bgp_with(asn, router_id, families).await? {
             return Ok(());
         }
         let global = Global {
@@ -303,7 +300,10 @@ impl GobgpClient {
             }
             let prefix_set_name = format!("cluster-{}-prefixes", cluster.cluster_id);
             let neighbor_set_name = format!("cluster-{}-nodes", cluster.cluster_id);
-            defined_sets.push(prefix_defined_set(&prefix_set_name, &cluster.allowed_prefixes)?);
+            defined_sets.push(prefix_defined_set(
+                &prefix_set_name,
+                &cluster.allowed_prefixes,
+            )?);
             defined_sets.push(neighbor_defined_set(&neighbor_set_name, &cluster.nodes));
             statements.push(accept_statement(
                 &format!("cluster-{}-import", cluster.cluster_id),
@@ -317,11 +317,7 @@ impl GobgpClient {
         // (an empty defined-set would just match nothing).
         if !spec.hypervisors.is_empty() {
             defined_sets.push(neighbor_defined_set(HYPERVISOR_SET, &spec.hypervisors));
-            statements.push(accept_statement(
-                "hypervisor-import",
-                HYPERVISOR_SET,
-                None,
-            ));
+            statements.push(accept_statement("hypervisor-import", HYPERVISOR_SET, None));
         }
 
         let statement_count = statements.len();
@@ -416,7 +412,6 @@ impl GobgpClient {
             buffered: Vec::new(),
         })
     }
-
 }
 
 /// Snapshot the global IPv4-unicast prefix set currently advertised
@@ -690,11 +685,15 @@ impl AfiSafi {
 }
 
 /// Build a [`DefinedSet`] of type PREFIX from a list of CIDRs.
-/// Each prefix is added without min/max length bounds, so an
-/// exact-match check (`MatchSet::Type::Any` against this set
-/// matches any prefix that is exactly one of the entries). Returns
-/// an error on any unparseable CIDR — silently dropping malformed
-/// inputs would let an attacker advertise any prefix by
+/// Bounds are `[prefix_len, host_len]` (32 for IPv4, 128 for
+/// IPv6): each entry permits the declared CIDR plus any
+/// more-specific announcement inside it. Cilium / kube-vip
+/// advertise LB Service IPs as /32s inside the cluster's
+/// allocated /28 service block, so this range is exactly what
+/// the import filter must accept.
+///
+/// Returns an error on any unparseable CIDR — silently dropping
+/// malformed inputs would let an attacker advertise any prefix by
 /// substituting garbage in the upstream config.
 fn prefix_defined_set(name: &str, prefixes: &[String]) -> anyhow::Result<DefinedSet> {
     let mut out = Vec::with_capacity(prefixes.len());
@@ -702,10 +701,14 @@ fn prefix_defined_set(name: &str, prefixes: &[String]) -> anyhow::Result<Defined
         let net: ipnet::IpNet = raw
             .parse()
             .map_err(|e| anyhow::anyhow!("prefix '{raw}' in defined-set '{name}': {e}"))?;
+        let host_len = match net {
+            ipnet::IpNet::V4(_) => 32,
+            ipnet::IpNet::V6(_) => 128,
+        };
         out.push(Prefix {
             ip_prefix: net.to_string(),
             mask_length_min: net.prefix_len() as u32,
-            mask_length_max: net.prefix_len() as u32,
+            mask_length_max: host_len,
         });
     }
     Ok(DefinedSet {
@@ -853,23 +856,49 @@ mod tests {
     }
 
     /// PREFIX defined-set must round-trip to gobgp's wire shape:
-    /// `defined_type=PREFIX`, `prefixes` populated (not `list`),
-    /// each Prefix's mask-length min/max pinned to the prefix's
-    /// own length so an exact-match check (gobgp's MatchSet ANY)
-    /// matches only the literal CIDR.
+    /// `defined_type=PREFIX`, `prefixes` populated (not `list`).
+    /// Each entry matches the declared CIDR or any more-specific
+    /// prefix inside it (min = prefix_len, max = 32/128). LB Service
+    /// /32s inside an allocated /28 are the load-bearing case; a
+    /// regression to exact-match (min=max=prefix_len) silently drops
+    /// every Cilium-advertised LB IP at the import filter.
     #[test]
-    fn prefix_defined_set_emits_exact_match_bounds() {
-        let s = prefix_defined_set("test", &["10.0.0.0/24".to_string(), "10.0.0.5/32".to_string()])
-            .unwrap();
+    fn prefix_defined_set_allows_more_specific_within_cidr() {
+        let s = prefix_defined_set(
+            "test",
+            &[
+                "10.0.0.0/24".to_string(),
+                "10.0.0.208/28".to_string(),
+                "10.0.0.5/32".to_string(),
+            ],
+        )
+        .unwrap();
         assert_eq!(s.defined_type, DefinedType::Prefix as i32);
         assert_eq!(s.name, "test");
         assert!(s.list.is_empty());
-        assert_eq!(s.prefixes.len(), 2);
-        // Both bounds equal the prefix length → exact match.
-        let p24 = s.prefixes.iter().find(|p| p.ip_prefix == "10.0.0.0/24").unwrap();
+        assert_eq!(s.prefixes.len(), 3);
+        let p24 = s
+            .prefixes
+            .iter()
+            .find(|p| p.ip_prefix == "10.0.0.0/24")
+            .unwrap();
         assert_eq!(p24.mask_length_min, 24);
-        assert_eq!(p24.mask_length_max, 24);
-        let p32 = s.prefixes.iter().find(|p| p.ip_prefix == "10.0.0.5/32").unwrap();
+        assert_eq!(p24.mask_length_max, 32);
+        // The /28 case — a /32 inside this range is what Cilium
+        // advertises and must match.
+        let p28 = s
+            .prefixes
+            .iter()
+            .find(|p| p.ip_prefix == "10.0.0.208/28")
+            .unwrap();
+        assert_eq!(p28.mask_length_min, 28);
+        assert_eq!(p28.mask_length_max, 32);
+        // /32 entries are degenerate — min=max=32 either way.
+        let p32 = s
+            .prefixes
+            .iter()
+            .find(|p| p.ip_prefix == "10.0.0.5/32")
+            .unwrap();
         assert_eq!(p32.mask_length_min, 32);
         assert_eq!(p32.mask_length_max, 32);
     }
