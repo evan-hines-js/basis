@@ -115,10 +115,28 @@ pub struct Metrics {
     /// Per-VM rootfs allocation, in GiB. Charges against the host's
     /// rootfs thin pool budget — see `basis_host_rootfs_bytes_*`.
     pub vm_rootfs_gib: IntGaugeVec,
-    /// Per-VM data-disk allocation (sum of `extra_disk_gibs`), in
+    /// Per-VM data-disk allocation (sum of `storage_disks[].size_gib`), in
     /// GiB. Charges against the host's data VG budget — see
     /// `basis_host_data_bytes_*`.
     pub vm_data_gib: IntGaugeVec,
+
+    // --- Per-pool / per-device storage gauges -----------------------
+    /// Pool capacity, decomposed into the four layers operators need
+    /// to distinguish:
+    ///   `configured` — sum of every configured device's size, regardless of state.
+    ///   `ready`      — sum of physically-Ready devices.
+    ///   `schedulable_total` — Ready AND scheduling-Enabled.
+    ///   `schedulable_free`  — free bytes on the schedulable subset.
+    /// One metric family with a `layer` label rather than four
+    /// separate metrics so dashboards can stack/diff them.
+    pub pool_capacity_bytes: IntGaugeVec,
+    /// Per-device byte counts. `kind="total"` or `"free"`.
+    pub device_capacity_bytes: IntGaugeVec,
+    /// Per-device physical health, set to `1` for the matching
+    /// `physical` label and `0` for the others. Single metric family
+    /// (vs three counters) so a dashboard can render `physical` as a
+    /// stat per device without OR-ing across families.
+    pub device_physical_state: IntGaugeVec,
 }
 
 impl Metrics {
@@ -308,6 +326,35 @@ impl Metrics {
         )?;
         registry.register(Box::new(vm_data_gib.clone()))?;
 
+        let pool_capacity_bytes = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_pool_capacity_bytes",
+                "Per-pool capacity in bytes, decomposed by layer \
+                 (configured | ready | schedulable_total | schedulable_free)",
+            ),
+            &["pool", "backend", "layer"],
+        )?;
+        registry.register(Box::new(pool_capacity_bytes.clone()))?;
+
+        let device_capacity_bytes = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_device_capacity_bytes",
+                "Per-device byte counts, kind=total|free",
+            ),
+            &["pool", "device", "kind"],
+        )?;
+        registry.register(Box::new(device_capacity_bytes.clone()))?;
+
+        let device_physical_state = IntGaugeVec::new(
+            Opts::new(
+                "basis_agent_device_physical_state",
+                "Per-device physical health (Ready/Degraded/Missing), \
+                 set to 1 for the matching label and 0 otherwise",
+            ),
+            &["pool", "device", "physical"],
+        )?;
+        registry.register(Box::new(device_physical_state.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
             image_ensure_cached_seconds,
@@ -327,6 +374,9 @@ impl Metrics {
             vm_cpu_quota,
             vm_rootfs_gib,
             vm_data_gib,
+            pool_capacity_bytes,
+            device_capacity_bytes,
+            device_physical_state,
         }))
     }
 
@@ -387,6 +437,62 @@ async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRespon
 /// up in the agent's CPU profile.
 const VM_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Refresh per-pool / per-device gauges from a fresh
+/// [`crate::lvm::StorageCapacity`] snapshot. Called from the
+/// existing storage-capacity loop; a single capacity scan drives both
+/// the heartbeat-bound proto and the agent's local metrics, so the
+/// two views can never disagree.
+pub fn refresh_storage_gauges(metrics: &Metrics, capacity: &crate::lvm::StorageCapacity) {
+    metrics.pool_capacity_bytes.reset();
+    metrics.device_capacity_bytes.reset();
+    metrics.device_physical_state.reset();
+    let backend_str = |b: crate::config::PoolBackend| match b {
+        crate::config::PoolBackend::LvmLinear => "lvm-linear",
+        crate::config::PoolBackend::RawDisk => "raw-disk",
+        crate::config::PoolBackend::NvmeNamespace => "nvme-namespace",
+    };
+    let physical_str = |p: crate::lvm::DevicePhysicalHealth| match p {
+        crate::lvm::DevicePhysicalHealth::Ready => "Ready",
+        crate::lvm::DevicePhysicalHealth::Degraded => "Degraded",
+        crate::lvm::DevicePhysicalHealth::Missing => "Missing",
+    };
+    for pool in &capacity.pools {
+        let backend = backend_str(pool.backend);
+        let labels = [
+            ("configured", pool.configured_total_bytes as i64),
+            ("ready", pool.ready_total_bytes as i64),
+            ("schedulable_total", pool.schedulable_total_bytes as i64),
+            ("schedulable_free", pool.schedulable_free_bytes as i64),
+        ];
+        for (layer, v) in labels {
+            metrics
+                .pool_capacity_bytes
+                .with_label_values(&[&pool.pool, backend, layer])
+                .set(v);
+        }
+        for d in &pool.devices {
+            metrics
+                .device_capacity_bytes
+                .with_label_values(&[&pool.pool, &d.id, "total"])
+                .set((d.total_gib * (1 << 30)) as i64);
+            metrics
+                .device_capacity_bytes
+                .with_label_values(&[&pool.pool, &d.id, "free"])
+                .set((d.free_gib * (1 << 30)) as i64);
+            for state in [
+                crate::lvm::DevicePhysicalHealth::Ready,
+                crate::lvm::DevicePhysicalHealth::Degraded,
+                crate::lvm::DevicePhysicalHealth::Missing,
+            ] {
+                metrics
+                    .device_physical_state
+                    .with_label_values(&[&pool.pool, &d.id, physical_str(state)])
+                    .set(if d.physical == state { 1 } else { 0 });
+            }
+        }
+    }
+}
+
 /// Periodic poller that refreshes the per-VM gauges from the agent DB
 /// and systemd's per-unit accounting. Runs for the lifetime of the
 /// agent; cancellable via the shutdown token mostly so tests don't
@@ -440,12 +546,12 @@ async fn refresh_vm_gauges(
         metrics.vm_cpu_quota.with_label_values(&[vm_id]).set(vm.cpu);
 
         let data_gib = vm
-            .extra_disks()
-            .map(|disks| disks.iter().map(|g| *g as i64).sum::<i64>())
+            .parsed_storage_disks()
+            .map(|disks| disks.iter().map(|d| d.size_gib as i64).sum::<i64>())
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     vm_id, error = %e,
-                    "metrics: malformed local_vms.extra_disk_gibs; reporting 0",
+                    "metrics: malformed local_vms.storage_disks; reporting 0",
                 );
                 0
             });

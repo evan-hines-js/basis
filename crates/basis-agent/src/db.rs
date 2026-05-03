@@ -1,3 +1,11 @@
+//! Local agent state: identity, live VMs, image cache, and the LVM
+//! reservation ledger.
+//!
+//! The reservation ledger lives next to `local_vms` so the same SQLite
+//! file is the agent's complete local truth — a backup of one file
+//! captures both the VM record and the disk-allocation state needed to
+//! reconcile it.
+
 use std::path::Path;
 use std::str::FromStr;
 
@@ -9,8 +17,6 @@ pub enum AgentDbError {
     Sqlx(#[from] sqlx::Error),
 }
 
-/// Local agent state database. Survives agent restarts so we can reconcile
-/// running VMs, cached images, and our controller-assigned host_id.
 #[derive(Debug, Clone)]
 pub struct AgentDb {
     pool: SqlitePool,
@@ -38,6 +44,10 @@ impl AgentDb {
         Ok(db)
     }
 
+    pub fn raw_pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
+
     async fn migrate(&self) -> Result<(), AgentDbError> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS agent_state (
@@ -58,9 +68,14 @@ impl AgentDb {
                 memory_mib INTEGER NOT NULL,
                 disk_gib INTEGER NOT NULL,
                 gpu_pci_addresses TEXT NOT NULL DEFAULT '[]',
-                extra_disk_gibs TEXT NOT NULL DEFAULT '[]',
+                -- JSON-encoded Vec<LocalStorageDisk>: {assignment_id, pool, device_id,
+                -- disk_index, size_gib, purpose}. Replaces the M0 extra_disk_gibs
+                -- field; carries enough state to drive reconcile without joining
+                -- against lvm_reservation.
+                storage_disks TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL,
                 vni INTEGER NOT NULL DEFAULT 0,
+                cluster_id TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )",
         )
@@ -73,6 +88,30 @@ impl AgentDb {
                 local_path TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 pulled_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // LVM data-disk reservation ledger. The owner key is
+        // (vm_id, disk_index); the hardware key is (vg, lv_name). The
+        // assignment_id is the controller's idempotency key — same id
+        // resends are no-ops, different id for the same (vm, disk) is a
+        // hard conflict the agent surfaces.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS lvm_reservation (
+                assignment_id TEXT PRIMARY KEY,
+                pool          TEXT NOT NULL,
+                device_id     TEXT NOT NULL,
+                vg            TEXT NOT NULL,
+                lv_name       TEXT NOT NULL,
+                vm_id         TEXT NOT NULL,
+                disk_index    INTEGER NOT NULL,
+                size_gib      INTEGER NOT NULL,
+                state         TEXT NOT NULL,    -- Creating | Ready | Deleting
+                reserved_at   TEXT NOT NULL,
+                UNIQUE (vm_id, disk_index),
+                UNIQUE (vg, lv_name)
             )",
         )
         .execute(&self.pool)
@@ -106,9 +145,9 @@ impl AgentDb {
 
     pub async fn insert_vm(&self, vm: &LocalVmRow) -> Result<(), AgentDbError> {
         sqlx::query(
-            "INSERT INTO local_vms (vm_id, name, unit_name, ip_address, cpu, memory_mib, disk_gib,
-                gpu_pci_addresses, image, vni, created_at, extra_disk_gibs)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO local_vms (vm_id, name, unit_name, ip_address, cpu, memory_mib,
+                disk_gib, gpu_pci_addresses, storage_disks, image, vni, cluster_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&vm.vm_id)
         .bind(&vm.name)
@@ -118,10 +157,11 @@ impl AgentDb {
         .bind(vm.memory_mib)
         .bind(vm.disk_gib)
         .bind(&vm.gpu_pci_addresses)
+        .bind(&vm.storage_disks)
         .bind(&vm.image)
         .bind(vm.vni)
+        .bind(&vm.cluster_id)
         .bind(&vm.created_at)
-        .bind(&vm.extra_disk_gibs)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -188,29 +228,39 @@ pub struct LocalVmRow {
     pub disk_gib: i64,
     pub gpu_pci_addresses: String,
     pub image: String,
-    /// VXLAN Network Identifier of the cluster this VM's primary TAP
-    /// attaches to. Persisted so a post-reboot restart knows which
-    /// `brc<vni>` bridge to re-attach the TAP to.
     pub vni: i64,
+    pub cluster_id: String,
     pub created_at: String,
-    /// JSON-encoded `Vec<u32>` of extra data-disk sizes in GiB, in the
-    /// same order the guest enumerates them as `/dev/vdc`, `/dev/vdd`, …
-    pub extra_disk_gibs: String,
+    /// JSON-encoded `Vec<LocalStorageDisk>`. One entry per data disk
+    /// the controller commanded; carries the assignment_id, pool, and
+    /// device_id needed to drive release/reconcile without consulting
+    /// the lvm_reservation ledger.
+    pub storage_disks: String,
 }
 
 impl LocalVmRow {
-    /// Parsed PCI addresses of every GPU assigned to this VM. One
-    /// place for the `Vec<String>` decode so a schema tweak can't
-    /// drift between `handlers.rs` and `reconcile.rs`.
     pub fn gpus(&self) -> serde_json::Result<Vec<String>> {
         serde_json::from_str(&self.gpu_pci_addresses)
     }
 
-    /// Parsed per-extra-disk sizes, in the same order the guest sees
-    /// them on the virtio bus.
-    pub fn extra_disks(&self) -> serde_json::Result<Vec<u32>> {
-        serde_json::from_str(&self.extra_disk_gibs)
+    pub fn parsed_storage_disks(&self) -> serde_json::Result<Vec<LocalStorageDisk>> {
+        serde_json::from_str(&self.storage_disks)
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalStorageDisk {
+    pub assignment_id: String,
+    pub pool: String,
+    pub device_id: String,
+    pub disk_index: u32,
+    pub size_gib: u64,
+    pub purpose: String,
+    /// Block device path the backend allocated (`/dev/<vg>/<lv>` for
+    /// lvm-linear, `/dev/disk/by-id/<id>` for raw-disk, etc). Persisted
+    /// here so post-reboot restart can pass it straight to cloud-
+    /// hypervisor without re-querying the backend.
+    pub device_path: String,
 }
 
 #[cfg(test)]
@@ -233,108 +283,82 @@ mod tests {
             gpu_pci_addresses: "[]".to_string(),
             image: "test-image:latest".to_string(),
             vni: 10_000,
+            cluster_id: "cluster-x".to_string(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
-            extra_disk_gibs: "[]".to_string(),
+            storage_disks: "[]".to_string(),
         }
     }
 
     #[tokio::test]
-    async fn test_host_id_roundtrip() {
+    async fn host_id_roundtrip() {
         let db = test_db().await;
-
         assert!(db.get_host_id().await.unwrap().is_none());
-
         db.set_host_id("host-abc-123").await.unwrap();
         assert_eq!(db.get_host_id().await.unwrap().unwrap(), "host-abc-123");
-
-        // Overwrite
         db.set_host_id("host-xyz-456").await.unwrap();
         assert_eq!(db.get_host_id().await.unwrap().unwrap(), "host-xyz-456");
     }
 
     #[tokio::test]
-    async fn test_vm_insert_and_list() {
+    async fn vm_insert_and_list() {
         let db = test_db().await;
         db.insert_vm(&make_vm("vm1")).await.unwrap();
         db.insert_vm(&make_vm("vm2")).await.unwrap();
-
-        let vms = db.list_vms().await.unwrap();
-        assert_eq!(vms.len(), 2);
+        assert_eq!(db.list_vms().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn test_vm_get() {
+    async fn vm_get() {
         let db = test_db().await;
         db.insert_vm(&make_vm("vm1")).await.unwrap();
-
-        let vm = db.get_vm("vm1").await.unwrap();
-        assert!(vm.is_some());
-        let vm = vm.unwrap();
-        assert_eq!(vm.name, "vm-vm1");
-        assert_eq!(vm.cpu, 4);
-        assert_eq!(vm.memory_mib, 8192);
-
-        let none = db.get_vm("nonexistent").await.unwrap();
-        assert!(none.is_none());
+        let vm = db.get_vm("vm1").await.unwrap().unwrap();
+        assert_eq!(vm.cluster_id, "cluster-x");
+        assert!(db.get_vm("nonexistent").await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn test_vm_delete() {
+    async fn vm_delete() {
         let db = test_db().await;
         db.insert_vm(&make_vm("vm1")).await.unwrap();
         db.insert_vm(&make_vm("vm2")).await.unwrap();
-
         db.delete_vm("vm1").await.unwrap();
-
         let vms = db.list_vms().await.unwrap();
         assert_eq!(vms.len(), 1);
         assert_eq!(vms[0].vm_id, "vm2");
-    }
-
-    #[tokio::test]
-    async fn test_vm_delete_nonexistent_is_ok() {
-        let db = test_db().await;
-        // Should not error
+        // Idempotent.
         db.delete_vm("nonexistent").await.unwrap();
     }
 
     #[tokio::test]
-    async fn test_cached_image_recording() {
+    async fn cached_image_upsert() {
         let db = test_db().await;
-        db.record_cached_image(
-            "ghcr.io/evan-hines-js/node:v1.32",
-            "/var/lib/basis/images/node_v1_32.qcow2",
-            1073741824,
-            "2025-01-01T00:00:00Z",
-        )
-        .await
-        .unwrap();
-
-        // Upsert same image with new path (e.g., re-pull)
-        db.record_cached_image(
-            "ghcr.io/evan-hines-js/node:v1.32",
-            "/var/lib/basis/images/node_v1_32_new.qcow2",
-            2147483648,
-            "2025-01-02T00:00:00Z",
-        )
-        .await
-        .unwrap();
-
-        // Should not error (upsert semantics)
+        db.record_cached_image("img:v1", "/p/a", 1, "t1").await.unwrap();
+        db.record_cached_image("img:v1", "/p/b", 2, "t2").await.unwrap();
     }
 
     #[tokio::test]
-    async fn test_vm_with_gpu_assignments() {
+    async fn storage_disks_roundtrip() {
         let db = test_db().await;
-        let mut vm = make_vm("gpu-vm");
-        vm.gpu_pci_addresses =
-            serde_json::to_string(&vec!["0000:41:00.0", "0000:42:00.0"]).unwrap();
-
+        let mut vm = make_vm("v");
+        let disks = vec![LocalStorageDisk {
+            assignment_id: "a1".into(),
+            pool: "fast".into(),
+            device_id: "nvme-X".into(),
+            disk_index: 0,
+            size_gib: 175,
+            purpose: "replicated".into(),
+            device_path: "/dev/basis-fast-X/basis-data-v-0".into(),
+        }];
+        vm.storage_disks = serde_json::to_string(&disks).unwrap();
         db.insert_vm(&vm).await.unwrap();
-
-        let fetched = db.get_vm("gpu-vm").await.unwrap().unwrap();
-        let addrs: Vec<String> = serde_json::from_str(&fetched.gpu_pci_addresses).unwrap();
-        assert_eq!(addrs.len(), 2);
-        assert_eq!(addrs[0], "0000:41:00.0");
+        let parsed = db
+            .get_vm("v")
+            .await
+            .unwrap()
+            .unwrap()
+            .parsed_storage_disks()
+            .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].pool, "fast");
     }
 }

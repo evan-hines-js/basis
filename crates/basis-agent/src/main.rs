@@ -10,7 +10,7 @@ use basis_agent::gpu;
 use basis_agent::handlers;
 use basis_agent::host_info::HostResources;
 use basis_agent::image::ImageManager;
-use basis_agent::lvm::{self, Storage, StorageCapacity};
+use basis_agent::lvm::{Storage, StorageCapacity};
 use basis_agent::metrics::{self, Metrics};
 use basis_agent::network::{probe_uplink, ClusterManager, NetworkManager, UplinkBridge};
 use basis_agent::reconcile;
@@ -208,7 +208,13 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
     );
     let net_mgr = NetworkManager::new(uplink, clusters);
 
-    let storage = Arc::new(Storage::new(spec.storage.clone()));
+    // Open the agent DB before constructing Storage — the LVM
+    // backend's reservation table lives on this same SQLite file, so
+    // Storage::from_host_spec needs the connection pool at build time.
+    let agent_db = AgentDb::open(&spec.data_dir.join("agent.db")).await?;
+    info!("agent database ready");
+
+    let storage = Arc::new(Storage::from_host_spec(&spec, agent_db.raw_pool()));
 
     // Preflight everything in parallel. `try_join!` short-circuits on
     // the first failure.
@@ -236,9 +242,6 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
                 .context("validating host uplink (bridge + NIC + MTU)")
         },
     )?;
-
-    let agent_db = AgentDb::open(&spec.data_dir.join("agent.db")).await?;
-    info!("agent database ready");
 
     net_mgr.ensure_uplink_bridge().await?;
 
@@ -282,7 +285,7 @@ async fn initialize_runtime(host: Host) -> anyhow::Result<AgentRuntime> {
         cpu = host_resources.total_cpu,
         memory_mib = host_resources.total_memory_mib,
         rootfs_total_gib = initial_capacity.rootfs.total / (1 << 30),
-        data_total_gib = initial_capacity.data.total / (1 << 30),
+        data_pool_count = initial_capacity.pools.len(),
         gpus = gpus.len(),
         vtep = %probe.vtep_address,
         "discovered host resources"
@@ -489,17 +492,44 @@ async fn send_register(
 /// register, heartbeat, and any future capacity carriers.
 fn storage_capacity_to_proto(c: &StorageCapacity) -> basis_proto::StorageCapacity {
     basis_proto::StorageCapacity {
-        rootfs: Some(pool_bytes_to_proto(&c.rootfs)),
-        data: Some(pool_bytes_to_proto(&c.data)),
+        rootfs: Some(basis_proto::RootfsCapacity {
+            total_bytes: c.rootfs.total,
+            free_bytes: c.rootfs.free,
+            metadata_total_bytes: c.rootfs.metadata_total,
+            metadata_free_bytes: c.rootfs.metadata_free,
+        }),
+        pools: c.pools.iter().map(pool_capacity_to_proto).collect(),
     }
 }
 
-fn pool_bytes_to_proto(p: &lvm::PoolBytes) -> basis_proto::PoolBytes {
-    basis_proto::PoolBytes {
-        total_bytes: p.total,
-        free_bytes: p.free,
-        metadata_total_bytes: p.metadata_total,
-        metadata_free_bytes: p.metadata_free,
+fn pool_capacity_to_proto(p: &basis_agent::lvm::PoolCapacity) -> basis_proto::PoolCapacity {
+    basis_proto::PoolCapacity {
+        pool: p.pool.clone(),
+        backend: match p.backend {
+            basis_agent::config::PoolBackend::LvmLinear => "lvm-linear".into(),
+            basis_agent::config::PoolBackend::RawDisk => "raw-disk".into(),
+            basis_agent::config::PoolBackend::NvmeNamespace => "nvme-namespace".into(),
+        },
+        labels: p
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        configured_total_bytes: p.configured_total_bytes,
+        ready_total_bytes: p.ready_total_bytes,
+        schedulable_total_bytes: p.schedulable_total_bytes,
+        schedulable_free_bytes: p.schedulable_free_bytes,
+        devices: p
+            .devices
+            .iter()
+            .map(|d| basis_proto::DeviceCapacity {
+                device_id: d.id.clone(),
+                total_bytes: d.total_gib * (1 << 30),
+                free_bytes: d.free_gib * (1 << 30),
+                physical: d.physical.as_proto() as i32,
+                physical_reason: d.physical_reason.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -709,15 +739,32 @@ fn spawn_storage_capacity_loop(
             interval.tick().await;
             match tokio::time::timeout(STORAGE_CAPACITY_TIMEOUT, storage.capacity()).await {
                 Ok(Ok(c)) => {
+                    let data_free_gib: u64 = c
+                        .pools
+                        .iter()
+                        .map(|p| p.schedulable_free_bytes / (1 << 30))
+                        .sum();
+                    let data_total_gib: u64 = c
+                        .pools
+                        .iter()
+                        .map(|p| p.schedulable_total_bytes / (1 << 30))
+                        .sum();
                     info!(
                         rootfs_data_free_gib = c.rootfs.free / (1 << 30),
                         rootfs_data_total_gib = c.rootfs.total / (1 << 30),
                         rootfs_metadata_free_mib = c.rootfs.metadata_free / (1 << 20),
                         rootfs_metadata_total_mib = c.rootfs.metadata_total / (1 << 20),
-                        data_free_gib = c.data.free / (1 << 30),
-                        data_total_gib = c.data.total / (1 << 30),
+                        data_pool_count = c.pools.len(),
+                        data_free_gib,
+                        data_total_gib,
                         "storage capacity"
                     );
+                    // Same snapshot drives both the heartbeat-bound
+                    // shared state and the Prometheus gauges, so the
+                    // two views can never disagree.
+                    if let Some(m) = basis_agent::metrics::global() {
+                        basis_agent::metrics::refresh_storage_gauges(m, &c);
+                    }
                     *shared.write().await = c;
                 }
                 Ok(Err(e)) => warn!(error = %e, "reading storage capacity"),
@@ -853,6 +900,7 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
             &rt.agent_db,
             rt.storage.as_ref(),
             rt.metrics.as_ref(),
+            &sender,
         )
         .await;
 
@@ -861,8 +909,8 @@ fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<Agen
             Err(e) => {
                 let transient = e.chain().any(|c| {
                     matches!(
-                        c.downcast_ref::<lvm::LvmError>(),
-                        Some(lvm::LvmError::Busy { .. })
+                        c.downcast_ref::<basis_agent::lvm::LvmError>(),
+                        Some(basis_agent::lvm::LvmError::Busy { .. })
                     )
                 });
                 if transient {

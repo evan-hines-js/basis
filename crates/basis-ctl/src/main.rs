@@ -63,6 +63,42 @@ enum Command {
         #[arg(long)]
         cluster: Option<String>,
     },
+    /// Storage pool subcommands.
+    #[command(subcommand)]
+    Pool(PoolCmd),
+}
+
+#[derive(Subcommand)]
+enum PoolCmd {
+    /// One-line-per-pool summary across every host (or one host).
+    List {
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Full per-device breakdown for one pool.
+    Show {
+        /// `<host>/<pool>` selector.
+        target: String,
+    },
+    /// Global health view; degraded/unhealthy pools and devices.
+    Health,
+    /// Mark a device disabled: the controller's scheduler stops
+    /// placing new disks on it. Live reservations are NOT touched —
+    /// rebalancing data off an OSD is the storage system's job
+    /// (Ceph/Rook/Longhorn/etc), not basis's. This flag exists so
+    /// operators can fence a drive ahead of physical replacement
+    /// without basis racing the eviction.
+    Disable {
+        /// `<host>/<pool>/<device>` selector.
+        target: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Re-enable a previously disabled device. Placement resumes once
+    /// the device is also physically `Ready`.
+    Enable {
+        target: String,
+    },
 }
 
 #[tokio::main]
@@ -77,7 +113,164 @@ async fn main() -> Result<()> {
         Command::Apply { file } => apply(&client, &file).await,
         Command::Delete { file } => delete(&client, &file).await,
         Command::GetMachines { cluster } => get_machines(&client, cluster).await,
+        Command::Pool(p) => match p {
+            PoolCmd::List { host } => pool_list(&client, host).await,
+            PoolCmd::Show { target } => pool_show(&client, &target).await,
+            PoolCmd::Health => pool_health(&client).await,
+            PoolCmd::Disable { target, reason } => pool_disable(&client, &target, reason).await,
+            PoolCmd::Enable { target } => pool_enable(&client, &target).await,
+        },
     }
+}
+
+fn parse_host_pool(s: &str) -> Result<(String, String)> {
+    let (host, pool) = s
+        .split_once('/')
+        .with_context(|| format!("expected <host>/<pool>, got {s:?}"))?;
+    Ok((host.to_string(), pool.to_string()))
+}
+
+fn parse_host_pool_device(s: &str) -> Result<(String, String, String)> {
+    let parts: Vec<&str> = s.splitn(3, '/').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("expected <host>/<pool>/<device>, got {s:?}");
+    }
+    Ok((parts[0].into(), parts[1].into(), parts[2].into()))
+}
+
+async fn pool_list(client: &BasisClient, host: Option<String>) -> Result<()> {
+    let pools = client.list_pools(host.unwrap_or_default()).await?;
+    println!(
+        "{:24} {:16} {:14} {:>10} {:>10}  {}",
+        "HOST", "POOL", "BACKEND", "FREE_GIB", "TOTAL_GIB", "LABELS"
+    );
+    for p in pools {
+        let labels = p
+            .labels
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{:24} {:16} {:14} {:>10} {:>10}  {}",
+            p.host_id,
+            p.pool,
+            p.backend,
+            p.schedulable_free_bytes / (1 << 30),
+            p.schedulable_total_bytes / (1 << 30),
+            labels
+        );
+    }
+    Ok(())
+}
+
+async fn pool_show(client: &BasisClient, target: &str) -> Result<()> {
+    let (host, pool) = parse_host_pool(target)?;
+    let pools = client.list_pools(host.clone()).await?;
+    let p = pools
+        .into_iter()
+        .find(|p| p.pool == pool)
+        .with_context(|| format!("pool {pool:?} not found on host {host:?}"))?;
+    println!("Host:           {}", p.host_id);
+    println!("Pool:           {}", p.pool);
+    println!("Backend:        {}", p.backend);
+    println!(
+        "Capacity (GiB): configured={} ready={} schedulable_total={} schedulable_free={}",
+        p.configured_total_bytes / (1 << 30),
+        p.ready_total_bytes / (1 << 30),
+        p.schedulable_total_bytes / (1 << 30),
+        p.schedulable_free_bytes / (1 << 30),
+    );
+    println!("Labels:");
+    for (k, v) in &p.labels {
+        println!("  {k}: {v}");
+    }
+    println!("Devices:");
+    for d in &p.devices {
+        let physical = match basis_proto::DevicePhysicalHealth::try_from(d.physical) {
+            Ok(basis_proto::DevicePhysicalHealth::DeviceHealthReady) => "Ready",
+            Ok(basis_proto::DevicePhysicalHealth::DeviceHealthDegraded) => "Degraded",
+            Ok(basis_proto::DevicePhysicalHealth::DeviceHealthMissing) => "Missing",
+            _ => "?",
+        };
+        println!(
+            "  {}  free={}GiB total={}GiB physical={}{}{}  scheduling={}{}",
+            d.device_id,
+            d.free_bytes / (1 << 30),
+            d.total_bytes / (1 << 30),
+            physical,
+            if d.physical_reason.is_empty() { "" } else { " (" },
+            if d.physical_reason.is_empty() {
+                String::new()
+            } else {
+                format!("{})", d.physical_reason)
+            },
+            d.scheduling_state,
+            if d.scheduling_reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", d.scheduling_reason)
+            },
+        );
+        for r in &d.reservations {
+            println!("      cluster={} count={}", r.cluster_id, r.count);
+        }
+    }
+    Ok(())
+}
+
+async fn pool_health(client: &BasisClient) -> Result<()> {
+    let pools = client.list_pools(String::new()).await?;
+    for p in pools {
+        let pool_state = match basis_proto::PoolHealthState::try_from(p.pool_health) {
+            Ok(basis_proto::PoolHealthState::PoolHealthReady) => "Ready",
+            Ok(basis_proto::PoolHealthState::PoolHealthDegraded) => "Degraded",
+            Ok(basis_proto::PoolHealthState::PoolHealthUnhealthy) => "Unhealthy",
+            _ => "?",
+        };
+        if pool_state == "Ready" {
+            continue;
+        }
+        println!("{}/{}: {}", p.host_id, p.pool, pool_state);
+        for d in &p.devices {
+            let physical = match basis_proto::DevicePhysicalHealth::try_from(d.physical) {
+                Ok(basis_proto::DevicePhysicalHealth::DeviceHealthReady) => "Ready",
+                Ok(basis_proto::DevicePhysicalHealth::DeviceHealthDegraded) => "Degraded",
+                Ok(basis_proto::DevicePhysicalHealth::DeviceHealthMissing) => "Missing",
+                _ => "?",
+            };
+            if physical == "Ready" && d.scheduling_state == "enabled" {
+                continue;
+            }
+            println!(
+                "  device={}  physical={} ({})  scheduling={}",
+                d.device_id, physical, d.physical_reason, d.scheduling_state,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn pool_disable(
+    client: &BasisClient,
+    target: &str,
+    reason: Option<String>,
+) -> Result<()> {
+    let (host, pool, device) = parse_host_pool_device(target)?;
+    client
+        .set_device_scheduling_state(host, pool, device, "disabled".into(), reason.unwrap_or_default())
+        .await?;
+    println!("ok");
+    Ok(())
+}
+
+async fn pool_enable(client: &BasisClient, target: &str) -> Result<()> {
+    let (host, pool, device) = parse_host_pool_device(target)?;
+    client
+        .set_device_scheduling_state(host, pool, device, "enabled".into(), String::new())
+        .await?;
+    println!("ok");
+    Ok(())
 }
 
 fn connect(cli: &Cli) -> Result<BasisClient> {

@@ -83,19 +83,49 @@ pub struct MachineSpec {
     pub gpus: u32,
     #[serde(default, rename = "minGpuGroupSize")]
     pub min_gpu_group_size: Option<u32>,
-    /// Extra raw data disks (GiB each) to attach alongside the rootfs,
-    /// in allocation order. Handed to the guest unformatted; an
-    /// in-cluster CSI driver claims them.
-    #[serde(default, rename = "extraDiskGibs")]
-    pub extra_disk_gibs: Vec<u32>,
-    /// Optional placement constraints (label-based requires/prefers).
-    /// Empty = pick any host that fits.
+    /// Per-disk storage requests. Each disk picks a pool by label
+    /// selector; `purpose: rookOsd` activates hierarchical
+    /// same-cluster anti-affinity. `purpose: genericData` skips it.
+    #[serde(default, rename = "storageDisks")]
+    pub storage_disks: Vec<StorageDiskSpec>,
+    /// Optional **host** placement (against host labels). Empty =
+    /// pick any host that fits. Per-disk pool placement lives on each
+    /// `storageDisks[].selector`.
     #[serde(default)]
-    pub placement: PlacementSpec,
+    pub placement: LabelSelectorSpec,
 }
 
+/// One requested data disk, in YAML form.
+#[derive(Debug, Deserialize)]
+pub struct StorageDiskSpec {
+    #[serde(rename = "minSizeGib")]
+    pub min_size_gib: u64,
+    #[serde(default)]
+    pub selector: LabelSelectorSpec,
+    pub purpose: DiskPurposeSpec,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskPurposeSpec {
+    Replicated,
+    GenericData,
+}
+
+impl DiskPurposeSpec {
+    fn as_proto(self) -> basis_proto::DiskPurpose {
+        match self {
+            Self::Replicated => basis_proto::DiskPurpose::Replicated,
+            Self::GenericData => basis_proto::DiskPurpose::GenericData,
+        }
+    }
+}
+
+/// Label selector — used for both host placement (against host
+/// labels) and pool placement (against pool labels). One YAML shape,
+/// one converter.
 #[derive(Debug, Default, Deserialize)]
-pub struct PlacementSpec {
+pub struct LabelSelectorSpec {
     #[serde(default)]
     pub requires: Vec<PlacementRequirement>,
     #[serde(default)]
@@ -116,16 +146,20 @@ pub struct PlacementPreference {
     pub weight: u32,
 }
 
-impl PlacementSpec {
+impl LabelSelectorSpec {
     fn is_empty(&self) -> bool {
         self.requires.is_empty() && self.prefers.is_empty()
     }
 
-    fn to_proto(&self) -> Option<basis_proto::PlacementSpec> {
+    fn to_proto_optional(&self) -> Option<basis_proto::LabelSelector> {
         if self.is_empty() {
             return None;
         }
-        Some(basis_proto::PlacementSpec {
+        Some(self.to_proto())
+    }
+
+    fn to_proto(&self) -> basis_proto::LabelSelector {
+        basis_proto::LabelSelector {
             requires: self
                 .requires
                 .iter()
@@ -143,7 +177,7 @@ impl PlacementSpec {
                     weight: p.weight,
                 })
                 .collect(),
-        })
+        }
     }
 }
 
@@ -177,8 +211,16 @@ impl MachineSpec {
             bootstrap_data,
             gpus: self.gpus,
             min_gpu_group_size: self.min_gpu_group_size,
-            extra_disk_gibs: self.extra_disk_gibs.clone(),
-            placement: self.placement.to_proto(),
+            storage_disks: self
+                .storage_disks
+                .iter()
+                .map(|d| basis_proto::StorageDisk {
+                    min_size_gib: d.min_size_gib,
+                    selector: d.selector.to_proto_optional(),
+                    purpose: d.purpose.as_proto() as i32,
+                })
+                .collect(),
+            placement: self.placement.to_proto_optional(),
         })
     }
 }

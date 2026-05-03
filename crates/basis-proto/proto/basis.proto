@@ -5,8 +5,9 @@ package basis.v1;
 //
 // Two-level model: a caller first creates a Cluster (which allocates a
 // VNI + carves a CIDR + reserves a VIP), then creates Machines inside
-// that cluster. All placement decisions (host, GPUs, IP) belong to the
-// controller — callers describe intent, not placement.
+// that cluster. All placement decisions (host, GPUs, IP, storage pool,
+// device) belong to the controller — callers describe intent, not
+// placement.
 //
 // Network model: each cluster gets its own VXLAN VNI and CIDR. There is
 // no inter-cluster reachability at the underlay — cross-cluster traffic
@@ -24,6 +25,21 @@ service Basis {
   rpc DeleteMachine(DeleteMachineRequest) returns (DeleteMachineResponse);
   rpc GetMachine(GetMachineRequest) returns (Machine);
   rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse);
+
+  // Storage pool / device telemetry + per-device fencing. Read paths
+  // surface per-pool capacity in the four layers (configured / ready /
+  // schedulable_total / schedulable_free) plus per-device health and
+  // scheduling state.
+  //
+  // SetDeviceSchedulingState is the operator's "stop placing on this
+  // device" gate; it sets a flag so the scheduler refuses new
+  // placements. It does NOT touch existing reservations — rebalancing
+  // data off a held disk is the storage system's job (Ceph/Rook/
+  // Longhorn/etc), not basis's. The flag exists so a planned drive
+  // retirement doesn't race the storage system's own eviction.
+  rpc ListPools(ListPoolsRequest) returns (ListPoolsResponse);
+  rpc SetDeviceSchedulingState(SetDeviceSchedulingStateRequest)
+      returns (SetDeviceSchedulingStateResponse);
 }
 
 // Agent-facing service — agents connect outbound and receive commands
@@ -57,57 +73,22 @@ message CreateClusterRequest {
   // cell's lattice-operator API proxy).
   ApiserverVisibility apiserver_visibility = 4;
   // Trust-domain label that scopes the eager-bootstrap fan-out for
-  // tree-scoped pool VIPs. A tree cluster's bridge is fanned out to
-  // host H iff H already carries a cluster with the same
-  // trust_domain — so cross-trust-domain reachability dies at the
-  // source's host kernel from a missing route. Empty string ("") is
-  // its own group: joins other empty-trust_domain clusters but not
-  // any named one. Operators wanting strict isolation between
-  // tenants assign a non-empty trust_domain per tenant. Has no
-  // effect on Lan-scoped pools (their VIPs are LAN-routable by
-  // definition).
+  // tree-scoped pool VIPs.
   string trust_domain = 5;
 }
 
 enum ApiserverVisibility {
-  // Apiserver VIP from `external_ip_pool`, BGP-advertised cell-wide.
-  // Required for the root mgmt cluster.
   APISERVER_PUBLIC = 0;
-  // Apiserver VIP from the cluster's CIDR (last usable), private to
-  // the cluster. Reachable only from within the cluster's bridge.
   APISERVER_PRIVATE = 1;
 }
 
 message CreateClusterResponse {
   string cluster_id = 1;
-  // Control-plane endpoint — the cluster's apiserver VIP. Where it
-  // lives depends on `apiserver_visibility` chosen at create time:
-  // `APISERVER_PUBLIC` puts it in `external_ip_pool` (BGP-advertised
-  // cell-wide); `APISERVER_PRIVATE` puts it at the last usable of
-  // `cidr` (private to the cluster, accessed via the parent cell's
-  // lattice-operator API proxy over the agent's reverse-tunneled
-  // gRPC stream).
   string control_plane_endpoint = 2;
-  // VXLAN Network Identifier of this cluster's overlay. 24-bit;
-  // unique within the cell.
   uint32 vni = 3;
-  // CIDR of the cluster's overlay (e.g. `10.42.0.0/24`). The bottom
-  // `bridgeReserve` addresses hold per-host gateway IPs (assigned by
-  // the controller on first VM scheduled to a host); the rest are VM
-  // IPs (less the apiserver VIP slot when private).
   string cidr = 4;
-  // CIDR of the cluster's LoadBalancer Service block, allocated from
-  // the named pool. Empty when the cluster requested 0 service IPs.
   string service_block_cidr = 5;
-  // Cell BGP route reflector address — the iBGP peer every node in
-  // this cluster talks to. Cilium on the cluster's k8s nodes opens
-  // its BGP session against this address (see
-  // `crates/lattice-cilium` BGP variant). Same RR every basis-agent
-  // peers with on its host; consumers must not assume the cluster's
-  // RR is distinct from the cell RR.
   string bgp_reflector_address = 6;
-  // Cell ASN — single ASN cell-wide, every speaker uses it (sessions
-  // are iBGP). Communities tag per-cluster identity, not ASNs.
   uint32 bgp_asn = 7;
 }
 
@@ -127,8 +108,6 @@ message Cluster {
   string control_plane_endpoint = 3;
   uint32 vni = 4;
   string cidr = 5;
-  // Same shape as `CreateClusterResponse.service_block_cidr`. Empty
-  // when the cluster has no LoadBalancer Service block.
   string service_block_cidr = 6;
   ApiserverVisibility apiserver_visibility = 7;
   string trust_domain = 8;
@@ -155,32 +134,28 @@ message CreateMachineRequest {
   GPUConstraints gpu_constraints = 9;
   // Additional raw block devices attached alongside the rootfs. Each
   // becomes a plain virtio-blk device (`/dev/vdc`, `/dev/vdd`, …) —
-  // handed to the guest unformatted. basis terminates at raw block;
-  // an in-cluster CSI driver (Rook, Longhorn, Mayastor, OpenEBS
-  // LocalPV, …) claims and manages them.
-  repeated ExtraDisk extra_disks = 10;
-  // Optional placement spec. Both `requires` and `prefers` default to
-  // empty — empty means "no constraint" and the scheduler picks
-  // wherever capacity fits, same as today.
-  PlacementSpec placement = 11;
+  // handed to the guest unformatted. Storage pool / device chosen by
+  // the controller based on `selector` and `purpose`.
+  repeated StorageDisk storage_disks = 10;
+  // Optional host placement spec (operates on host labels, not pool
+  // labels). Both `requires` and `prefers` default to empty — empty
+  // means "no constraint" and the scheduler picks wherever capacity
+  // fits.
+  LabelSelector placement = 11;
 }
 
-// Operator-supplied placement constraints, layered on top of the
-// scheduler's built-in capacity / GPU / anti-affinity logic.
-//
-// Both lists default to empty, which means "no constraint": empty
-// `requires` matches every host, empty `prefers` adds zero score.
-// This keeps placement 100% optional — labelling is incremental.
-message PlacementSpec {
-  // Hard filter. A host satisfies a single requirement when its
-  // labels contain `key` with a value in `values`. The host must
-  // satisfy *every* entry in this list. CreateMachine fails with
-  // `FailedPrecondition` when no host satisfies all entries —
-  // distinguishable from the "out of capacity" failure.
+// Unified label selector used for both host placement (against
+// `RegisterHostRequest.labels`) and storage pool placement (against
+// `host.yaml`'s `pool.labels`). One type, one matcher, one set of
+// validation rules. Both lists default to empty (no constraint).
+message LabelSelector {
+  // Hard filter. The target satisfies a single requirement when its
+  // labels contain `key` with a value in `values`. Every entry must be
+  // satisfied. CreateMachine fails with `FailedPrecondition` when
+  // nothing satisfies all entries — distinguishable from out-of-capacity.
   repeated PlacementRequirement requires = 1;
-  // Soft tiebreaker. Each match contributes `weight` to the host's
-  // score; the scheduler prefers higher scores. Sits between the
-  // anti-affinity tiebreak and the per-host `rank` knob.
+  // Soft tiebreaker. Each match contributes `weight` to the candidate's
+  // score; higher score wins among hard-filter survivors.
   repeated PlacementPreference prefers = 2;
 }
 
@@ -195,8 +170,77 @@ message PlacementPreference {
   uint32 weight = 3;
 }
 
-message ExtraDisk {
-  uint32 size_gib = 1;
+// Workload role of a data disk. Drives scheduling semantics, not just
+// telemetry.
+//   REPLICATED: this disk is one replica of a per-Lattice-cluster
+//               replicated-storage scheme (Rook/Ceph OSD, Longhorn
+//               replica, Mayastor pool, OpenEBS LocalPV-with-Replicas,
+//               SeaweedFS volume server, etc). Hierarchical
+//               same-cluster anti-affinity: spread across hosts first,
+//               then across devices on the same host; never co-locate
+//               two replicas of the same Lattice cluster on the same
+//               physical device. Basis stays workload-agnostic — it
+//               doesn't know which CSI driver claims the disk in-
+//               guest, only that the disk participates in a
+//               replication scheme that requires failure-domain
+//               independence.
+//   GENERIC_DATA: respects labels + capacity + a soft same-VM device
+//                 spread, but no cluster anti-affinity. Use for
+//                 single-replica workloads (etcd snapshots, container
+//                 logs, app state) where co-location with peers is
+//                 fine.
+// `UNSPECIFIED` is invalid after CRD admission/defaulting and the
+// scheduler rejects it; the CAPI provider's defaulting webhook owns
+// inference from MachineDeployment role.
+enum DiskPurpose {
+  DISK_PURPOSE_UNSPECIFIED = 0;
+  DISK_PURPOSE_REPLICATED = 1;
+  DISK_PURPOSE_GENERIC_DATA = 2;
+}
+
+// One requested data disk. The controller resolves `selector` against
+// host pool labels and picks a (host, pool, device) tuple at scheduling
+// time; the agent receives the resolved `CommandedDisk` with no
+// selector logic to re-run.
+message StorageDisk {
+  // Minimum requested capacity. Backends MAY satisfy with more (raw-
+  // disk hands the guest the whole device; nvme-namespace rounds up to
+  // controller granularity). The actual allocated size is reported
+  // back in `DiskAssignment.actual_size_gib`.
+  uint64 min_size_gib = 1;
+  // Pool selector. Empty `requires` matches every pool; empty `prefers`
+  // adds zero score.
+  LabelSelector selector = 2;
+  // Workload role; see `DiskPurpose`.
+  DiskPurpose purpose = 3;
+}
+
+// Resolved per-disk placement, from controller to agent. `assignment_id`
+// is the idempotency key — if the agent already has a Ready reservation
+// with this id, allocate is a no-op returning the existing path; if a
+// row with the same `(vm_id, disk_index)` exists with a different
+// `assignment_id`, hard conflict.
+message CommandedDisk {
+  string assignment_id = 1;
+  uint64 min_size_gib = 2;
+  string pool = 3;
+  string device_id = 4;
+  uint32 disk_index = 5;
+  string cluster_id = 6;
+  DiskPurpose purpose = 7;
+}
+
+// Agent-reported back to the controller after a successful allocate.
+// The controller renders accurate per-disk status (raw-disk handed
+// the guest 3725 GiB even though the request was for 175).
+message DiskAssignment {
+  string assignment_id = 1;
+  string vm_id = 2;
+  uint32 disk_index = 3;
+  string pool = 4;
+  string device_id = 5;
+  uint64 actual_size_gib = 6;
+  string device_path = 7;
 }
 
 message CreateMachineResponse {
@@ -237,7 +281,10 @@ message Machine {
   uint32 disk_gib = 10;
   repeated MachineGPU gpus = 11;
   string error_message = 12;
-  repeated ExtraDisk extra_disks = 13;
+  // Live disk assignments populated as the agent acks each disk's
+  // allocate. Surfaced to operators (`basisctl get machine`) and to
+  // CAPI for status.
+  repeated DiskAssignment storage_disks = 13;
 }
 
 message MachineGPU {
@@ -253,9 +300,6 @@ enum MachineState {
   STOPPING = 3;
   STOPPED = 4;
   FAILED = 5;
-  // Controller has decided this VM should not exist. The vms row is
-  // kept in this state until the agent acks the matching vm_tombstone;
-  // on ack the row is deleted and IP/GPU allocations are released.
   PENDING_TEARDOWN = 6;
 }
 
@@ -277,12 +321,18 @@ message AgentMessage {
     RegisterHostRequest register = 1;
     HeartbeatRequest heartbeat = 2;
     ReportVMStateRequest vm_state = 3;
-    // Acknowledge tombstones the controller asked us to apply. The
-    // controller drops the corresponding pending_teardown rows on
-    // receipt; until ack arrives, every reconcile re-emits the same
-    // tombstones — so loss in flight is self-healing on the next push.
     TombstoneAck tombstone_ack = 4;
+    // Reported once per disk after a successful allocate. The
+    // controller flips the matching pool_disk_assignment row to
+    // `committed` and stores actual_size_gib + device_path. Idempotent
+    // — the agent re-reports on stream reconnect after restart so the
+    // controller resyncs without a separate poll.
+    DiskAssignmentReport disk_assignment = 5;
   }
+}
+
+message DiskAssignmentReport {
+  DiskAssignment assignment = 1;
 }
 
 message ControllerCommand {
@@ -290,149 +340,48 @@ message ControllerCommand {
   oneof command {
     CreateVMCommand create_vm = 2;
     RegisterHostResponse register_ack = 4;
-    // Additive intent: every cluster the host SHOULD carry +
-    // explicit tombstones for resources it should tear down. Absence
-    // is NOT an intent signal: a cluster missing from `clusters` and
-    // also missing from `cluster_tombstones` is left alone (the
-    // controller has lost track of it; conservative wins). Fired on
-    // every relevant state change AND periodically so missed pushes
-    // converge.
-    //
-    // VM teardown also rides this message — `vm_tombstones` is the
-    // single way the controller asks an agent to release a VM. There
-    // is no separate DeleteVm command. Tombstones are re-emitted on
-    // every reconcile until the agent sends a matching `TombstoneAck`,
-    // so an offline agent self-converges on reconnect.
     ReconcileHostCommand reconcile_host = 5;
   }
 }
 
-// Resources the controller is telling the agent to maintain or release.
-// Two lists in symmetry: `clusters[]` says "ensure these exist with
-// this state"; `cluster_tombstones[]` and `vm_tombstones[]` say "tear
-// these down." Anything else on the host is preserved untouched —
-// implicit-tear-down-by-absence is forbidden.
 message ReconcileHostCommand {
   repeated ClusterState clusters = 1;
-  // Clusters this host should release: bridge + VXLAN + masquerade +
-  // per-cluster proxy-ARP entries removed. Idempotent re-emission
-  // until acked. Includes `cidr` so the agent can remove the
-  // MASQUERADE rule without consulting its in-memory cache (which
-  // resets on agent restart).
   repeated ClusterTombstone cluster_tombstones = 2;
-  // VMs this host should release. Single source of VM removal —
-  // there is no implicit "delete VMs not in some expected set."
   repeated string vm_tombstones = 3;
 }
 
 message ClusterTombstone {
   uint32 vni = 1;
   string cluster_id = 2;
-  // Cluster CIDR for the MASQUERADE-rule removal. The agent's
-  // teardown does not depend on local in-memory state for this; the
-  // controller is the source of truth.
   string cidr = 3;
 }
 
 message TombstoneAck {
-  // VNIs of clusters whose teardown completed. Controller drops the
-  // matching host_clusters(host_id, cluster_id) rows on receipt.
   repeated uint32 cluster_vnis = 1;
-  // VMs whose teardown completed. Controller drops the matching vms
-  // rows on receipt (their state was PENDING_TEARDOWN).
   repeated string vm_ids = 2;
 }
 
 message RegisterHostResponse {
   string host_id = 1;
-  // Initial state the agent should reconcile against. Equivalent to
-  // the first `ReconcileHostCommand` the agent would receive on the
-  // next tick — sent inline so the agent can converge before
-  // accepting CreateVm commands.
   ReconcileHostCommand initial_state = 2;
-  // Cell BGP parameters. Every host runs `gobgpd` and peers iBGP
-  // with the cell route reflector (running as the controller's
-  // local gobgpd) at the cell ASN. The agent uses these to seed
-  // its own local gobgpd's BGP instance.
   uint32 bgp_asn = 3;
-  // Underlay IP of the controller's BGP listener (tcp/179). Sourced
-  // from `BasisControllerSpec.bgp.routerId` in the controller config.
   string bgp_reflector_address = 4;
 }
 
-// One cluster's dataplane state the agent materialises locally.
-// `gateway_ip` is per-host (carved from the cluster's `bridge_range`
-// by the controller and unique among all hosts carrying the cluster);
-// every VM the host owns in this cluster uses it as default gateway.
-// Different hosts get different addresses so cross-host replies
-// routing back through the gateway always land on the originating
-// hypervisor — anycast on a shared IP would require EVPN-style ARP
-// suppression we don't have yet.
 message ClusterState {
-  // Cluster ID — opaque, used in logs.
   string cluster_id = 1;
-  // VXLAN Network Identifier of this cluster's overlay. 24-bit.
   uint32 vni = 2;
-  // The cluster's full CIDR (e.g. "10.42.0.0/24"). Used to scope the
-  // per-cluster MASQUERADE rule so cluster packets egress the uplink
-  // with the host's LAN IP.
   string cidr = 3;
-  // This host's per-cluster bridge IP, carved from the cluster's
-  // `bridge_range`. Assigned to the local `brc<vni>` so the kernel
-  // acquires a route to the cluster CIDR via that bridge — without
-  // this, the host can't reach VMs on its own cluster.
   string gateway_ip = 4;
   uint32 prefix_len = 5;
-  // VTEP addresses of every hypervisor currently carrying a VM of
-  // this cluster. Learning is disabled on the VXLAN device, so this
-  // list is the FDB's BUM destination set.
   repeated string vtep_addresses = 6;
-  // Trust-domain label of the tree this cluster belongs to. The
-  // agent maps this to a per-tree Linux VRF: every `brc<vni>` for
-  // a tree is enslaved to the tree's VRF, and the tree's prefix
-  // routes are installed in that VRF's routing table. Cross-tree
-  // traffic dies in the kernel because each tree's table only
-  // holds its own routes.
   string trust_domain = 9;
-  // LAN-routable cluster VIPs (apiserver VIP when `APISERVER_PUBLIC`
-  // + LB Service block from a `Lan`-scoped pool). Every host
-  // carrying the cluster receives the full set; the controller-
-  // elected `owner_host_id` on each entry tells the agent which
-  // single host should answer ARP for the VIP on the uplink.
-  // Non-owners install the bridge route and BGP-advertise the
-  // prefix but skip proxy-ARP — eliminating the multi-host ARP
-  // race that otherwise corrupted LAN ingress during worker
-  // placement churn. Owner re-election + GARP handles failover.
   repeated ClusterVip cluster_vips = 7;
-  // Tree-scoped cluster VIPs (apiserver VIP and/or LB Service block
-  // from a `Tree`-scoped pool). Agent installs the bridge route only
-  // — no proxy-ARP on the uplink, no BGP advertisement. The LAN
-  // cannot reach these; cross-cluster reachability inside the cell
-  // flows through each host's per-cluster bridge (eagerly
-  // bootstrapped on hosts whose carried clusters share the cluster's
-  // `trust_domain`, via `ClusterState` entries with empty
-  // `gateway_ip`/`cidr`). Cross-trust-domain traffic stops at the
-  // source's host kernel from a missing route — the dataplane is
-  // the trust boundary. No owner field — these aren't on the LAN.
   repeated string internal_cluster_vips = 8;
 }
 
-// One LAN-routable cluster VIP plus the host that owns its L2
-// announcement. The controller picks `owner_host_id` deterministically
-// from the cluster's current carrier set; non-owner carriers still
-// install the in-VRF bridge route and BGP-advertise the prefix, but
-// only the owner proxy-ARPs the VIP onto the uplink. On owner change
-// (new placement, host failure), the previous owner withdraws its
-// proxy-ARP entry and the new owner installs + GARPs — sub-second
-// failover with no ARP-cache thrash on LAN clients.
 message ClusterVip {
-  // CIDR string, e.g. "10.0.0.209/32" (apiserver VIP) or
-  // "10.0.0.208/28" (LB Service block).
   string cidr = 1;
-  // host_id of the agent that should answer ARP for this VIP. Empty
-  // string means "no owner elected yet" — agents skip proxy-ARP for
-  // such entries; routes + BGP still install. Empty is rare (covers
-  // the brief window between cluster create and first placement).
   string owner_host_id = 2;
 }
 
@@ -443,39 +392,16 @@ message RegisterHostRequest {
   uint32 total_cpu = 2;
   uint64 total_memory_mib = 3;
   // Per-pool capacity snapshot at register time. Refreshed on every
-  // heartbeat — see `HeartbeatRequest.storage_capacity`. The scheduler
-  // reads from the heartbeat-fresh value, not from this snapshot.
+  // heartbeat. The scheduler reads from heartbeat-fresh values, not
+  // from this snapshot.
   StorageCapacity storage_capacity = 4;
   repeated GPUDevice gpus = 5;
-  // IP address the agent will use as the source for outgoing VXLAN
-  // frames. Almost always the uplink interface's address. Reported
-  // once at registration; the controller stores it on `hosts` and
-  // includes it in `ClusterState.vtep_addresses` broadcasts.
   string vtep_address = 6;
-  // Operator-assigned placement preference. Lower wins. The
-  // scheduler uses this as a tiebreaker after capacity + GPU
-  // topology + anti-affinity, so two equally-good hosts go to the
-  // lower-rank one. Default 0 = "no preference"; bump deprioritized
-  // hosts (e.g. consumer-disk boxes that shouldn't carry etcd) to a
-  // higher number. Reported once at registration and stored on
-  // `hosts`; change requires a basis-agent restart.
   uint32 rank = 7;
-  // Operator-assigned labels (e.g. {"tier": "fast", "gpu": "h100"}).
-  // Used by `PlacementSpec.requires` (hard filter) and
-  // `PlacementSpec.prefers` (soft score). Default empty means "no
-  // labels"; a host with no labels satisfies only an empty `requires`.
-  // Reported once at registration; change requires a basis-agent
-  // restart.
+  // Operator-assigned host labels (e.g. {"tier": "fast", "gpu": "h100"}).
+  // Used by `LabelSelector` against host placement. Reported once at
+  // registration; change requires basis-agent restart.
   map<string, string> labels = 8;
-  // Snapshot of every VM and per-cluster bridge the agent has live
-  // locally. The controller diffs this against its own DB and
-  // synthesises one-shot tombstones (in the inline `initial_state`)
-  // for anything the agent reports but the controller doesn't track
-  // — covering the disaster-recovery case where the controller's DB
-  // was wiped while agents continued running. Synthesised tombstones
-  // aren't persisted (no DB row to drop on ack); the agent's
-  // teardown is idempotent so a re-emit on the next register is
-  // harmless if the first ack was lost.
   HostInventory current_inventory = 9;
 }
 
@@ -486,41 +412,147 @@ message HostInventory {
 
 message InventoryCluster {
   uint32 vni = 1;
-  // Cluster CIDR as the agent observes it on the live `brc<vni>`
-  // address. Sent so the controller can include it in any synthesised
-  // `ClusterTombstone` — exact MASQUERADE-rule removal works without
-  // the controller having to guess.
   string cidr = 2;
 }
 
-// Liveness ping plus a fresh per-pool storage capacity snapshot.
-// The controller learns *which* host this came from from the
-// authenticated bidi stream's identity, not from any field in this
-// message — a malicious agent could otherwise keep another host
-// marked healthy.
 message HeartbeatRequest {
   StorageCapacity storage_capacity = 1;
 }
 
-// Per-pool capacity numbers, in bytes. Two pools by design: a thin
-// pool for VM rootfs and a plain VG for raw data disks consumed by
-// in-cluster CSI drivers.
-// Reported on register and on every heartbeat so the scheduler's
-// per-pool budgets stay live, not registration-stale.
+// Per-pool capacity, reported on every heartbeat so the scheduler's
+// per-pool budgets stay live, not registration-stale. Two parts:
+// rootfs (one thin pool per host) and the per-data-pool list.
 message StorageCapacity {
-  PoolBytes rootfs = 1;
-  PoolBytes data = 2;
+  RootfsCapacity rootfs = 1;
+  // One entry per `pool` declared in the agent's `host.yaml` storage
+  // pools list. Empty means the host has no data pools (legal — a
+  // worker host with no replicated storage role).
+  repeated PoolCapacity pools = 2;
 }
 
-// Capacity numbers for one pool. `metadata_*` apply only to the
-// rootfs thin pool (lvm2 thin metadata extents); the data VG has no
-// metadata extent and reports zero.
-message PoolBytes {
+// rootfs thin-pool capacity, including thin-metadata.
+message RootfsCapacity {
   uint64 total_bytes = 1;
   uint64 free_bytes = 2;
   uint64 metadata_total_bytes = 3;
   uint64 metadata_free_bytes = 4;
 }
+
+// One data pool's capacity, decomposed into the four layers operators
+// need to distinguish.
+message PoolCapacity {
+  string pool = 1;
+  // Backend type — `lvm-linear`, `raw-disk`, `nvme-namespace`. M1 only
+  // emits `lvm-linear`.
+  string backend = 2;
+  // Operator-written labels (tier, medium, etc).
+  map<string, string> labels = 3;
+  // Sum of every configured device's size, regardless of state.
+  uint64 configured_total_bytes = 4;
+  // Sum of devices physically Ready (excludes Degraded/Missing).
+  uint64 ready_total_bytes = 5;
+  // Sum of devices that are physically Ready AND scheduling-Enabled.
+  // The actual placement budget; what the scheduler compares against.
+  uint64 schedulable_total_bytes = 6;
+  // Free capacity on the schedulable subset.
+  uint64 schedulable_free_bytes = 7;
+  // Per-device breakdown for telemetry and per-device drilldown.
+  repeated DeviceCapacity devices = 8;
+}
+
+// One device within a pool.
+message DeviceCapacity {
+  // Stable `/dev/disk/by-id/...` identifier (or controller id for
+  // nvme-namespace pools).
+  string device_id = 1;
+  uint64 total_bytes = 2;
+  uint64 free_bytes = 3;
+  // Physical health, reported by the agent's hardware scan.
+  DevicePhysicalHealth physical = 4;
+  // Free-form reason when `physical != READY` (e.g. SMART threshold,
+  // drive missing). Empty when Ready.
+  string physical_reason = 5;
+}
+
+enum DevicePhysicalHealth {
+  DEVICE_HEALTH_UNSPECIFIED = 0;
+  DEVICE_HEALTH_READY = 1;
+  DEVICE_HEALTH_DEGRADED = 2;
+  DEVICE_HEALTH_MISSING = 3;
+}
+
+// --- Pool / drain RPCs ---
+
+message ListPoolsRequest {
+  // Optional host filter. Empty = every host the controller knows
+  // about; non-empty = only that host's pools.
+  string host_id = 1;
+}
+
+message ListPoolsResponse {
+  repeated PoolStatus pools = 1;
+}
+
+// One row per `(host_id, pool)` with everything `basisctl pool show`
+// + the global `pool list` and `pool health` views need. Per-disk
+// reservations are joined in by `cluster_id` so operators can audit
+// the same-cluster anti-affinity decisions.
+message PoolStatus {
+  string host_id = 1;
+  string pool = 2;
+  string backend = 3;
+  map<string, string> labels = 4;
+  uint64 configured_total_bytes = 5;
+  uint64 ready_total_bytes = 6;
+  uint64 schedulable_total_bytes = 7;
+  uint64 schedulable_free_bytes = 8;
+  // Pool-level rollup; mutually exclusive states.
+  PoolHealthState pool_health = 9;
+  repeated DeviceStatus devices = 10;
+}
+
+enum PoolHealthState {
+  POOL_HEALTH_UNSPECIFIED = 0;
+  POOL_HEALTH_READY = 1;
+  POOL_HEALTH_DEGRADED = 2;
+  POOL_HEALTH_UNHEALTHY = 3;
+}
+
+message DeviceStatus {
+  string device_id = 1;
+  uint64 total_bytes = 2;
+  uint64 free_bytes = 3;
+  DevicePhysicalHealth physical = 4;
+  // Free-form when `physical != READY` — SMART threshold, missing,
+  // etc. Empty when Ready.
+  string physical_reason = 5;
+  // Operator-driven knob: `enabled` (default) or `disabled`. The
+  // disabled state fences placement only — existing reservations
+  // are unaffected. See `SetDeviceSchedulingState` for rationale.
+  string scheduling_state = 6;
+  string scheduling_reason = 7;
+  // Per-cluster reservation count for failure-domain audit. The
+  // `(cluster, count)` pairs let `basisctl pool show` print "OSD
+  // count by cluster" without an extra round-trip.
+  repeated ClusterReservationCount reservations = 8;
+}
+
+message ClusterReservationCount {
+  string cluster_id = 1;
+  uint32 count = 2;
+}
+
+message SetDeviceSchedulingStateRequest {
+  string host_id = 1;
+  string pool = 2;
+  string device_id = 3;
+  // `enabled` clears any disabled marker; `disabled` sets one.
+  string state = 4;
+  // Free-form; surfaced in PoolStatus + telemetry.
+  string reason = 5;
+}
+
+message SetDeviceSchedulingStateResponse {}
 
 message ReportVMStateRequest {
   string vm_id = 1;
@@ -539,8 +571,6 @@ message CreateVMCommand {
   uint32 disk_gib = 5;
   string image = 6;
   bytes bootstrap_data = 7;
-  // Primary IP (on the cluster's VXLAN); gateway is the cluster's
-  // anycast gateway and prefix is the cluster's.
   string ip_address = 8;
   string gateway = 9;
   uint32 prefix_len = 10;
@@ -548,12 +578,12 @@ message CreateVMCommand {
   GPUConstraints gpu_constraints = 12;
   repeated string dns_servers = 13;
   repeated string gpu_pci_addresses = 14;
-  repeated ExtraDisk extra_disks = 15;
-  // VXLAN Network Identifier of the cluster this VM joins at L2. The
-  // agent derives the bridge name (`brc<vni>`) from this and attaches
-  // the VM's primary TAP to it. The bridge itself is kept alive by
-  // `ReconcileHostCommand` — which precedes this command on the same
-  // mpsc stream whenever a new cluster shows up on the host.
+  // Resolved data disks. Pool + device + assignment_id are picked by
+  // the controller; agent only allocates.
+  repeated CommandedDisk storage_disks = 15;
   uint32 vni = 16;
+  // Lattice cluster id this VM belongs to. Mirrored from the VM's
+  // cluster — the agent uses it for the same-cluster REPLICATED
+  // collision guardrail (defense-in-depth invariant 7).
+  string cluster_id = 17;
 }
-

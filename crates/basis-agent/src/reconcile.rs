@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt};
 use tracing::{error, info, warn};
 
-use basis_proto::{CreateVmCommand, ExtraDisk};
+use basis_proto::CreateVmCommand;
 
 use crate::config::HostSpec;
 use crate::db::{AgentDb, LocalVmRow};
@@ -167,8 +167,8 @@ impl<'a> GarbageCollectable for LvCollector<'a> {
             .collect())
     }
     async fn reclaim(&self, vm_id: &str) -> anyhow::Result<()> {
-        self.storage.remove_vm_lv(vm_id).await?;
-        self.storage.remove_vm_data_disks(vm_id).await?;
+        self.storage.remove_vm_rootfs(vm_id).await?;
+        self.storage.release_vm_disks(vm_id).await?;
         Ok(())
     }
 }
@@ -371,15 +371,15 @@ async fn restart_vm(
         });
     }
 
-    let extra_disk_gibs = vm_record.extra_disks().map_err(|e| {
+    let stored_disks = vm_record.parsed_storage_disks().map_err(|e| {
         RestartError::Other(anyhow::anyhow!(
-            "VM {} has malformed local_vms.extra_disk_gibs: {e}",
+            "VM {} has malformed local_vms.storage_disks: {e}",
             vm_record.vm_id,
         ))
     })?;
-    let mut data_disk_paths = Vec::with_capacity(extra_disk_gibs.len());
-    for index in 0..extra_disk_gibs.len() {
-        let path = storage.data_disk_lv_path(&vm_record.vm_id, index as u32);
+    let mut data_disk_paths = Vec::with_capacity(stored_disks.len());
+    for disk in &stored_disks {
+        let path = std::path::PathBuf::from(&disk.device_path);
         if !path.exists() {
             return Err(RestartError::DiskMissing {
                 lv_path: path,
@@ -450,6 +450,26 @@ async fn restart_vm(
             ))
         })
     };
+    // Reconstruct the wire CommandedDisks from the persisted local
+    // disks. This isn't sent over the wire — `restart_cmd` is fed back
+    // into `vm_mgr.create_vm` which only reads metadata fields. The
+    // disks' assignment_id/pool/device_id round-trip purely so the
+    // boot args render correctly.
+    let storage_disks = stored_disks
+        .iter()
+        .map(|d| basis_proto::CommandedDisk {
+            assignment_id: d.assignment_id.clone(),
+            min_size_gib: d.size_gib,
+            pool: d.pool.clone(),
+            device_id: d.device_id.clone(),
+            disk_index: d.disk_index,
+            cluster_id: vm_record.cluster_id.clone(),
+            purpose: match d.purpose.as_str() {
+                "replicated" => basis_proto::DiskPurpose::Replicated as i32,
+                _ => basis_proto::DiskPurpose::GenericData as i32,
+            },
+        })
+        .collect();
     let restart_cmd = CreateVmCommand {
         vm_id: vm_record.vm_id.clone(),
         name: vm_record.name.clone(),
@@ -465,11 +485,9 @@ async fn restart_vm(
         gpu_constraints: None,
         dns_servers: Vec::new(),
         gpu_pci_addresses: gpu_addrs,
-        extra_disks: extra_disk_gibs
-            .iter()
-            .map(|&size_gib| ExtraDisk { size_gib })
-            .collect(),
+        storage_disks,
         vni,
+        cluster_id: vm_record.cluster_id.clone(),
     };
 
     vm_mgr
@@ -480,7 +498,7 @@ async fn restart_vm(
                 initrd: &cached.initrd,
                 rootfs: &rootfs_path,
                 cloud_init: &cloud_init_path,
-                extra_disks: &data_disk_paths,
+                data_disks: &data_disk_paths,
             },
             &primary_tap,
             &vfio_devices,

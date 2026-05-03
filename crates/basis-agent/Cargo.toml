@@ -38,6 +38,7 @@ sha2.workspace = true
 prometheus.workspace = true
 axum.workspace = true
 ipnet.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

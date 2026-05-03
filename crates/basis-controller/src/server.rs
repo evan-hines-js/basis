@@ -953,13 +953,14 @@ impl BasisApiService {
         Ok(())
     }
 
-    /// Run one scheduling pass. Reads `(hosts, usage)` off the reader
-    /// pool; the writer re-validates at commit time in `insert_vm`, so
-    /// a stale snapshot here is always caught — never over-places.
+    /// Run one scheduling pass. Reads `(hosts, usage, storage_views,
+    /// replicated_count_by_host)` off the reader pool; the writer re-validates
+    /// at commit time in `insert_vm`, so a stale snapshot here is
+    /// always caught — never over-places.
     async fn pick_host(
         &self,
         req: &CreateMachineRequest,
-    ) -> Result<(String, Vec<GpuInfo>), Status> {
+    ) -> Result<scheduler::ScheduleDecision, Status> {
         let hosts = self
             .shared
             .db
@@ -973,24 +974,102 @@ impl BasisApiService {
             .await
             .map_err(db_status)?;
 
+        // Per-host storage views + per-host OSD-count-by-cluster.
+        // Both reads scoped per host; cheap because the scheduler only
+        // considers healthy hosts and a typical fleet has dozens.
+        let mut storage_by_host = std::collections::HashMap::new();
+        let mut replicated_count_by_host = std::collections::HashMap::new();
+        for host in &hosts {
+            let pools = self
+                .shared
+                .db
+                .list_host_pools(&host.id)
+                .await
+                .map_err(db_status)?;
+            let mut devices_by_pool: std::collections::HashMap<String, Vec<_>> =
+                std::collections::HashMap::new();
+            for p in &pools {
+                let devs = self
+                    .shared
+                    .db
+                    .list_pool_devices(&host.id, &p.pool)
+                    .await
+                    .map_err(db_status)?;
+                devices_by_pool.insert(p.pool.clone(), devs);
+            }
+            let drains_map = self
+                .shared
+                .db
+                .host_drain_markers(&host.id)
+                .await
+                .map_err(db_status)?;
+            let drained_devices: std::collections::HashSet<(String, String)> = drains_map
+                .iter()
+                .filter(|(_, r)| r.state == "disabled")
+                .map(|((p, d), _)| (p.clone(), d.clone()))
+                .collect();
+            // Same-cluster OSD occupancy per (pool, device). One
+            // query, all OSD assignments on this host, scoped by
+            // request's cluster_id.
+            let replicated_rows = self
+                .shared
+                .db
+                .list_host_replicated_assignments(&host.id)
+                .await
+                .map_err(db_status)?;
+            let mut replicated_clusters_per_device: std::collections::HashMap<
+                (String, String),
+                std::collections::HashSet<String>,
+            > = std::collections::HashMap::new();
+            for r in &replicated_rows {
+                replicated_clusters_per_device
+                    .entry((r.pool.clone(), r.device_id.clone()))
+                    .or_default()
+                    .insert(r.cluster_id.clone());
+            }
+            // OSD count for this request's cluster.
+            let cluster_replicated_count = replicated_rows
+                .iter()
+                .filter(|r| r.cluster_id == req.cluster_id)
+                .count() as i64;
+            replicated_count_by_host.insert(host.id.clone(), cluster_replicated_count);
+            storage_by_host.insert(
+                host.id.clone(),
+                scheduler::HostStorageView::from_rows(
+                    pools,
+                    devices_by_pool,
+                    &drained_devices,
+                    &replicated_clusters_per_device,
+                ),
+            );
+        }
+
         let sched_req = ScheduleRequest::from(req);
         let ratio = self.shared.db.cpu_overcommit_ratio();
-        match scheduler::schedule(&hosts, &usage, &sched_req, ratio) {
-            Ok((host_id, gpus)) => {
+        match scheduler::schedule(
+            &hosts,
+            &usage,
+            &storage_by_host,
+            &replicated_count_by_host,
+            &sched_req,
+            ratio,
+        ) {
+            Ok(decision) => {
                 self.shared
                     .metrics
                     .scheduler_decisions_total
                     .with_label_values(&["placed"])
                     .inc();
                 info!(
-                    host_id = %host_id,
-                    gpus = gpus.len(),
+                    host_id = %decision.host_id,
+                    gpus = decision.gpus.len(),
+                    disks = decision.disks.len(),
                     cpu = req.cpu,
                     memory_mib = req.memory_mib,
                     disk_gib = req.disk_gib,
                     "scheduler placed VM"
                 );
-                Ok((host_id, gpus))
+                Ok(decision)
             }
             Err(SchedulerError::NoCapacity(msg)) => {
                 self.shared
@@ -1053,13 +1132,16 @@ impl BasisApiService {
         // disappearance, not on stale-snapshot stampedes).
         let _placement_guard = self.shared.placement_lock.lock().await;
 
-        let (host_id, gpus) = self.pick_host(req).await.map_err(|s| {
+        let decision = self.pick_host(req).await.map_err(|s| {
             if s.code() == tonic::Code::ResourceExhausted {
                 PlaceError::NoCapacity(s)
+            } else if s.code() == tonic::Code::FailedPrecondition {
+                PlaceError::Internal(s)
             } else {
                 PlaceError::Internal(s)
             }
         })?;
+        let host_id = decision.host_id.clone();
 
         let ip_address = self
             .shared
@@ -1068,7 +1150,31 @@ impl BasisApiService {
             .await
             .map_err(|e| PlaceError::Internal(db_status(e)))?;
 
-        let extra_disk_gibs: Vec<u32> = req.extra_disks.iter().map(|d| d.size_gib).collect();
+        // Persist the per-disk JSON with the scheduler's resolved
+        // `(pool, device_id, assignment_id)` already populated. The
+        // agent's later `DiskAssignmentReport` will fill in
+        // `actual_size_gib` + `device_path`. One source of per-disk
+        // truth on the VmRow.
+        let stored_disks: Vec<crate::db::StoredDisk> = decision
+            .disks
+            .iter()
+            .map(|p| crate::db::StoredDisk {
+                disk_index: p.disk_index,
+                min_size_gib: p.min_size_gib,
+                purpose: match p.purpose {
+                    basis_proto::DiskPurpose::Replicated => "replicated".into(),
+                    basis_proto::DiskPurpose::GenericData => "generic-data".into(),
+                    basis_proto::DiskPurpose::Unspecified => "unspecified".into(),
+                },
+                pool: Some(p.pool.clone()),
+                device_id: Some(p.device_id.clone()),
+                assignment_id: Some(format!("{vm_id}-{}", p.disk_index)),
+                actual_size_gib: None,
+                device_path: None,
+            })
+            .collect();
+        let storage_disks_json = serde_json::to_string(&stored_disks)
+            .expect("serializing Vec<StoredDisk> to JSON is infallible");
         let vm = VmRow {
             id: vm_id.to_string(),
             name: req.name.clone(),
@@ -1079,22 +1185,28 @@ impl BasisApiService {
             cpu: req.cpu as i64,
             memory_mib: req.memory_mib as i64,
             disk_gib: req.disk_gib as i64,
-            extra_disk_gibs: serde_json::to_string(&extra_disk_gibs)
-                .expect("serializing Vec<u32> to JSON is infallible"),
+            storage_disks: storage_disks_json,
             image: req.image.clone(),
             error_message: String::new(),
             created_at: now.to_string(),
             updated_at: now.to_string(),
         };
-        let gpu_assignments: Vec<GpuAssignment> = gpus
+        let gpu_assignments: Vec<GpuAssignment> = decision
+            .gpus
             .iter()
             .map(|g| GpuAssignment::from_scheduler_pick(vm_id, &host_id, g))
             .collect();
 
-        match self.shared.db.insert_vm(&vm, &gpu_assignments).await {
+        match self
+            .shared
+            .db
+            .insert_vm(&vm, &gpu_assignments, &decision.disks)
+            .await
+        {
             Ok(()) => Ok(Placement {
                 vm,
                 gpu_assignments,
+                disk_placements: decision.disks,
             }),
             Err(e) => {
                 self.release_vm_ips(vm_id).await;
@@ -1120,6 +1232,7 @@ impl BasisApiService {
 struct Placement {
     vm: VmRow,
     gpu_assignments: Vec<GpuAssignment>,
+    disk_placements: Vec<scheduler::DiskPlacement>,
 }
 
 /// Classification of a failed placement attempt so the retry loop can
@@ -1506,6 +1619,30 @@ impl basis_server::Basis for BasisApiService {
         // corresponding return; anything that drops without setting
         // is counted as `"cancelled"`.
         let mut outcome = CreateOutcome::new(&self.shared.metrics, started);
+
+        // `DISK_PURPOSE_UNSPECIFIED` is invalid post-defaulting; the
+        // CAPI provider's defaulting webhook is responsible for
+        // resolving it. Surfacing it here as `InvalidArgument` means
+        // a misconfigured webhook fails fast at admission rather than
+        // silently turning a REPLICATED disk into GENERIC_DATA and
+        // disabling the same-cluster anti-affinity that protects
+        // replica durability.
+        for (idx, d) in req.storage_disks.iter().enumerate() {
+            let purpose = basis_proto::DiskPurpose::try_from(d.purpose).map_err(|_| {
+                Status::invalid_argument(format!(
+                    "storage_disks[{idx}].purpose = {}: not a valid DiskPurpose enum value",
+                    d.purpose
+                ))
+            })?;
+            if matches!(purpose, basis_proto::DiskPurpose::Unspecified) {
+                outcome.set("invalid_purpose");
+                return Err(Status::invalid_argument(format!(
+                    "storage_disks[{idx}].purpose is DISK_PURPOSE_UNSPECIFIED — \
+                     the CAPI defaulting webhook must resolve this to REPLICATED or \
+                     GENERIC_DATA before the request reaches the controller"
+                )));
+            }
+        }
         info!(
             cluster_id = %req.cluster_id,
             name = %req.name,
@@ -1687,14 +1824,63 @@ impl basis_server::Basis for BasisApiService {
                         .iter()
                         .map(|g| g.pci_address.clone())
                         .collect(),
-                    extra_disks: req.extra_disks,
+                    // Resolved per-disk placements from the scheduler.
+                    // The `(pool, device_id)` tuples and
+                    // `assignment_id`s are committed to
+                    // `pool_disk_assignment` in the same DB transaction
+                    // as `vms`; the agent reuses the same
+                    // `assignment_id`s for its idempotency check.
+                    storage_disks: placement
+                        .disk_placements
+                        .iter()
+                        .map(|p| basis_proto::CommandedDisk {
+                            assignment_id: format!("{}-{}", vm_id, p.disk_index),
+                            min_size_gib: p.min_size_gib,
+                            pool: p.pool.clone(),
+                            device_id: p.device_id.clone(),
+                            disk_index: p.disk_index,
+                            cluster_id: req.cluster_id.clone(),
+                            purpose: p.purpose as i32,
+                        })
+                        .collect(),
+                    cluster_id: req.cluster_id.clone(),
                     vni: cluster.vni as u32,
                 },
             ))),
         };
 
-        info!(vm_id = %vm_id, host_id = %host_id, vni = cluster.vni, "CreateMachine: dispatching CreateVm to agent");
+        // Outbox-first dispatch. The command is durable in
+        // `pending_command` before any network send, so a controller
+        // crash mid-dispatch is recoverable: on restart the dispatcher
+        // re-reads pending rows and re-emits them. The agent's
+        // idempotency check (by `assignment_id` for disks; by `vm_id`
+        // for the VM itself) recognizes retries and replies with the
+        // existing state instead of double-creating.
+        info!(vm_id = %vm_id, host_id = %host_id, vni = cluster.vni, "CreateMachine: enqueuing CreateVm to outbox");
+        let payload = {
+            use prost::Message;
+            let mut buf = Vec::with_capacity(cmd.encoded_len());
+            cmd.encode(&mut buf).expect("encoding ControllerCommand to vec is infallible");
+            buf
+        };
+        let outbox_id = match self
+            .shared
+            .db
+            .enqueue_pending_command(&host_id, &vm_id, &payload)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                self.shared.pending_ops.remove(&vm_id);
+                self.shared
+                    .cleanup_failed_vm(&vm_id, &cluster.id, &host_id)
+                    .await;
+                return Err(db_status(e));
+            }
+        };
         if agent.command_tx.send(cmd).await.is_err() {
+            // Outbox row stays `pending`; the dispatcher (or the next
+            // register) will reissue when the agent reconnects.
             self.shared.pending_ops.remove(&vm_id);
             self.shared
                 .cleanup_failed_vm(&vm_id, &cluster.id, &host_id)
@@ -1703,9 +1889,16 @@ impl basis_server::Basis for BasisApiService {
             warn!(
                 vm_id = %vm_id,
                 host_id = %host_id,
-                "CreateMachine: agent stream closed before command delivered"
+                outbox_id,
+                "CreateMachine: agent stream closed before command delivered; outbox row remains pending for retry"
             );
             return Err(Status::unavailable("agent stream closed"));
+        }
+        if let Err(e) = self.shared.db.mark_command_sent(outbox_id).await {
+            warn!(
+                outbox_id, vm_id = %vm_id, error = %e,
+                "failed to flip outbox row to 'sent'; non-fatal — agent ack will clean it up"
+            );
         }
         drop(agent);
 
@@ -1856,6 +2049,136 @@ impl basis_server::Basis for BasisApiService {
             .collect::<Result<_, Status>>()?;
         Ok(Response::new(ListMachinesResponse { machines }))
     }
+
+    async fn list_pools(
+        &self,
+        request: Request<basis_proto::ListPoolsRequest>,
+    ) -> Result<Response<basis_proto::ListPoolsResponse>, Status> {
+        require_capi_caller(&request)?;
+        let req = request.into_inner();
+        let pool_rows = if req.host_id.is_empty() {
+            self.shared.db.list_all_host_pools().await.map_err(db_status)?
+        } else {
+            self.shared
+                .db
+                .list_host_pools(&req.host_id)
+                .await
+                .map_err(db_status)?
+        };
+
+        let mut out = Vec::with_capacity(pool_rows.len());
+        for pool in pool_rows {
+            let devices = self
+                .shared
+                .db
+                .list_pool_devices(&pool.host_id, &pool.pool)
+                .await
+                .map_err(db_status)?;
+            let drains = self
+                .shared
+                .db
+                .host_drain_markers(&pool.host_id)
+                .await
+                .map_err(db_status)?;
+
+            let mut device_statuses = Vec::with_capacity(devices.len());
+            let (mut ready, mut unhealthy) = (0u32, 0u32);
+            for d in &devices {
+                let physical = match d.physical.as_str() {
+                    "Ready" => basis_proto::DevicePhysicalHealth::DeviceHealthReady,
+                    "Degraded" => basis_proto::DevicePhysicalHealth::DeviceHealthDegraded,
+                    "Missing" => basis_proto::DevicePhysicalHealth::DeviceHealthMissing,
+                    _ => basis_proto::DevicePhysicalHealth::DeviceHealthUnspecified,
+                };
+                if matches!(physical, basis_proto::DevicePhysicalHealth::DeviceHealthReady) {
+                    ready += 1;
+                } else {
+                    unhealthy += 1;
+                }
+                let drain = drains.get(&(pool.pool.clone(), d.device_id.clone()));
+                let counts = self
+                    .shared
+                    .db
+                    .cluster_counts_on_device(&pool.host_id, &pool.pool, &d.device_id)
+                    .await
+                    .map_err(db_status)?;
+                device_statuses.push(basis_proto::DeviceStatus {
+                    device_id: d.device_id.clone(),
+                    total_bytes: d.total_bytes as u64,
+                    free_bytes: d.free_bytes as u64,
+                    physical: physical as i32,
+                    physical_reason: d.physical_reason.clone(),
+                    scheduling_state: drain
+                        .map(|d| d.state.clone())
+                        .unwrap_or_else(|| "enabled".to_string()),
+                    scheduling_reason: drain
+                        .and_then(|d| d.reason.clone())
+                        .unwrap_or_default(),
+                    reservations: counts
+                        .into_iter()
+                        .map(|(c, n)| basis_proto::ClusterReservationCount {
+                            cluster_id: c,
+                            count: n as u32,
+                        })
+                        .collect(),
+                });
+            }
+            let pool_health = if devices.is_empty() {
+                basis_proto::PoolHealthState::PoolHealthUnhealthy
+            } else if ready == devices.len() as u32 {
+                basis_proto::PoolHealthState::PoolHealthReady
+            } else if ready == 0 && unhealthy > 0 {
+                basis_proto::PoolHealthState::PoolHealthUnhealthy
+            } else {
+                basis_proto::PoolHealthState::PoolHealthDegraded
+            };
+            let labels = pool.parsed_labels().unwrap_or_default().into_iter().collect();
+            out.push(basis_proto::PoolStatus {
+                host_id: pool.host_id,
+                pool: pool.pool,
+                backend: pool.backend,
+                labels,
+                configured_total_bytes: pool.configured_total_bytes as u64,
+                ready_total_bytes: pool.ready_total_bytes as u64,
+                schedulable_total_bytes: pool.schedulable_total_bytes as u64,
+                schedulable_free_bytes: pool.schedulable_free_bytes as u64,
+                pool_health: pool_health as i32,
+                devices: device_statuses,
+            });
+        }
+        Ok(Response::new(basis_proto::ListPoolsResponse { pools: out }))
+    }
+
+    async fn set_device_scheduling_state(
+        &self,
+        request: Request<basis_proto::SetDeviceSchedulingStateRequest>,
+    ) -> Result<Response<basis_proto::SetDeviceSchedulingStateResponse>, Status> {
+        require_capi_caller(&request)?;
+        let req = request.into_inner();
+        if req.host_id.is_empty() || req.pool.is_empty() || req.device_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "host_id, pool, device_id are required",
+            ));
+        }
+        self.shared
+            .db
+            .set_device_scheduling_state(
+                &req.host_id,
+                &req.pool,
+                &req.device_id,
+                &req.state,
+                if req.reason.is_empty() {
+                    None
+                } else {
+                    Some(req.reason.as_str())
+                },
+            )
+            .await
+            .map_err(db_status)?;
+        Ok(Response::new(
+            basis_proto::SetDeviceSchedulingStateResponse {},
+        ))
+    }
 }
 
 // --- Agent-facing service ---
@@ -1973,6 +2296,43 @@ impl basis_agent_server::BasisAgent for BasisAgentService {
             .agent_connected
             .with_label_values(&[&register.hostname])
             .set(1);
+
+        // Outbox replay. Any `pending` (or `sent`-but-unacked) command
+        // for this host gets reissued. The agent's idempotency check
+        // (by `assignment_id` for disks, by `vm_id` for the VM
+        // record) recognizes the retry. Order matters — pending rows
+        // are FIFO so a queued CreateVm precedes any ReconcileHost.
+        // Same-stream send — dispatcher can't outlive the session.
+        let pending = self
+            .shared
+            .db
+            .list_pending_commands(&host_id)
+            .await
+            .unwrap_or_default();
+        for (id, payload) in pending {
+            use prost::Message;
+            let cmd = match ControllerCommand::decode(payload.as_slice()) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        outbox_id = id, host_id = %host_id, error = %e,
+                        "dropping malformed outbox row; cannot decode payload"
+                    );
+                    continue;
+                }
+            };
+            if command_tx.send(cmd).await.is_err() {
+                // Stream died mid-replay; row stays pending for the
+                // next reconnect.
+                break;
+            }
+            if let Err(e) = self.shared.db.mark_command_sent(id).await {
+                warn!(
+                    outbox_id = id, host_id = %host_id, error = %e,
+                    "outbox replay: failed to flip row to 'sent'; non-fatal"
+                );
+            }
+        }
 
         // Periodic authoritative push. Same command shape as the
         // initial reconcile; single code path converges all drift.
@@ -2133,9 +2493,14 @@ async fn handle_agent_message(
                 .as_ref()
                 .map(crate::db::StorageCapacityBytes::from_proto)
                 .unwrap_or_default();
+            let pools: Vec<basis_proto::PoolCapacity> = hb
+                .storage_capacity
+                .as_ref()
+                .map(|c| c.pools.clone())
+                .unwrap_or_default();
             shared
                 .db
-                .record_heartbeat(host_id, &now_rfc3339(), &capacity)
+                .record_heartbeat(host_id, &now_rfc3339(), &capacity, &pools)
                 .await?;
         }
         Some(agent_message::Payload::VmState(report)) => {
@@ -2219,6 +2584,24 @@ async fn handle_agent_message(
                     };
                     let _ = pending.tx.send(result);
                 }
+                // Drop the outbox row(s) for this VM — terminal
+                // state (Running or Failed) means the agent has
+                // committed to a final outcome and a re-dispatch
+                // would either no-op (idempotent) or report the same
+                // failure. We tear down on both success and failure
+                // because failure flows through `cleanup_failed_vm`,
+                // which deletes the VM row entirely; a stale outbox
+                // row pointing at a deleted vm_id is dead state.
+                if let Err(e) = shared
+                    .db
+                    .ack_pending_commands_for_vm(&report.vm_id)
+                    .await
+                {
+                    warn!(
+                        vm_id = %report.vm_id, error = %e,
+                        "failed to drop outbox rows after terminal VM state; non-fatal"
+                    );
+                }
             }
         }
         Some(agent_message::Payload::TombstoneAck(ack)) => {
@@ -2241,6 +2624,29 @@ async fn handle_agent_message(
         }
         Some(agent_message::Payload::Register(_)) => {
             warn!(host_id, "unexpected register message on established stream");
+        }
+        Some(agent_message::Payload::DiskAssignment(report)) => {
+            // The agent's `DiskBackend::allocate` succeeded. Persist
+            // the (assignment_id, actual_size_gib, device_path) onto
+            // the matching `pool_disk_assignment` row + the parent
+            // VmRow's `storage_disks` JSON entry so operators can see
+            // exactly where each disk landed via `basisctl get
+            // machine`. Idempotent: the agent re-reports on stream
+            // reconnect after restart so the controller resyncs
+            // without a separate poll.
+            let Some(assignment) = report.assignment else {
+                warn!(host_id, "DiskAssignmentReport with no assignment field; ignoring");
+                return Ok(());
+            };
+            if let Err(e) = shared.db.commit_disk_assignment(host_id, &assignment).await {
+                warn!(
+                    host_id,
+                    vm_id = %assignment.vm_id,
+                    assignment_id = %assignment.assignment_id,
+                    error = %e,
+                    "failed to commit DiskAssignment; agent will re-report on next reconnect",
+                );
+            }
         }
         None => {}
     }
@@ -2301,17 +2707,18 @@ fn vm_to_machine(vm: &VmRow, gpus: &[GpuAssignment]) -> Result<Machine, Status> 
         })
     };
 
-    let extra_disks = vm
-        .extra_disks()
+    // Surface live disk assignments so `basisctl get machine` shows
+    // operators where each data disk landed (host, pool, device,
+    // actual size). The VmRow carries this as JSON populated by
+    // agent-reported `DiskAssignment` messages.
+    let storage_disks = vm
+        .parsed_disk_assignments()
         .map_err(|e| {
             Status::data_loss(format!(
-                "vms.extra_disk_gibs on vm '{}' failed to parse: {e}",
+                "vms.storage_disks on vm '{}' failed to parse: {e}",
                 vm.id,
             ))
-        })?
-        .into_iter()
-        .map(|size_gib| ExtraDisk { size_gib })
-        .collect();
+        })?;
 
     Ok(Machine {
         id: vm.id.clone(),
@@ -2333,7 +2740,7 @@ fn vm_to_machine(vm: &VmRow, gpus: &[GpuAssignment]) -> Result<Machine, Status> 
             })
             .collect(),
         error_message: vm.error_message.clone(),
-        extra_disks,
+        storage_disks,
     })
 }
 
@@ -2479,7 +2886,7 @@ mod tests {
             cpu: 4,
             memory_mib: 4096,
             disk_gib: 50,
-            extra_disk_gibs: "[]".to_string(),
+            storage_disks: "[]".to_string(),
             image: "ubuntu:22.04".to_string(),
             error_message: String::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2502,16 +2909,16 @@ mod tests {
         assert!(err.message().contains("cpu"), "message: {}", err.message());
     }
 
-    /// Same contract for the JSON-encoded extra_disk_gibs column:
+    /// Same contract for the JSON-encoded storage_disks column:
     /// malformed JSON must not panic vm_to_machine.
     #[test]
-    fn vm_to_machine_returns_data_loss_on_malformed_extra_disks() {
+    fn vm_to_machine_returns_data_loss_on_malformed_storage_disks() {
         let mut vm = vm_row_ok();
-        vm.extra_disk_gibs = "not-json".to_string();
+        vm.storage_disks = "not-json".to_string();
         let err = vm_to_machine(&vm, &[]).expect_err("bad json must fail");
         assert_eq!(err.code(), tonic::Code::DataLoss, "code: {err:?}");
         assert!(
-            err.message().contains("extra_disk_gibs"),
+            err.message().contains("storage_disks"),
             "message: {}",
             err.message(),
         );

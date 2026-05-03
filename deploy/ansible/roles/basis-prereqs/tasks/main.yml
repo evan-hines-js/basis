@@ -255,129 +255,127 @@
   changed_when: true
 # ------------------------------------------------------------------------
 
-# basis-data VG: plain VG (linear LVs) for VM extra disks. Provisioned
-# from `basis_lvm_data_devices` which accepts real block devices
-# (production) or {file, size} dicts (e2e on shared infra — backed by
-# a file + losetup + a systemd unit that re-binds on reboot). Same
-# var, same role; only the value differs between environments.
+# Per-pool data VGs: one VG per device per pool (operator declares
+# `basis_storage_pools[].devices[]`). The agent enforces "one VG per
+# device" at startup; basis-prereqs makes that physically true by
+# pvcreating + vgcreating each device into its own VG named in the
+# pool config. Loopback-backed devices are supported for E2E (declare
+# `loopback: { file, size }` instead of resolving from `id`).
 
-- name: basis-data — fail loud when basis_lvm_data_devices is empty
-  ansible.builtin.assert:
-    that: basis_lvm_data_devices | length > 0
-    fail_msg: >-
-      basis_lvm_data_devices is empty. Set it to a list of block devices
-      (production) or {file, size} entries (e2e). The agent refuses to
-      start without a basis-data VG; no silent fallback to the rootfs
-      pool exists. See docs/storage-pools.md.
-
-- name: basis-data — derive file-backed entries
+- name: storage — flatten devices across all pools for batched provisioning
   ansible.builtin.set_fact:
-    basis_data_file_entries: >-
-      {{ basis_lvm_data_devices | selectattr('file', 'defined') | list }}
+    basis_pool_devices: >-
+      {{ basis_storage_pools
+         | map(attribute='devices')
+         | sum(start=[]) }}
 
-- name: basis-data — ensure backing files exist for file-backed entries
+- name: storage — derive loopback-backed devices
+  ansible.builtin.set_fact:
+    basis_loopback_devices: >-
+      {{ basis_pool_devices | selectattr('loopback', 'defined') | list }}
+
+- name: storage — ensure loopback backing files exist
   ansible.builtin.command:
-    cmd: "truncate -s {{ item.size }} {{ item.file }}"
-    creates: "{{ item.file }}"
-  loop: "{{ basis_data_file_entries }}"
+    cmd: "truncate -s {{ item.loopback.size }} {{ item.loopback.file }}"
+    creates: "{{ item.loopback.file }}"
+  loop: "{{ basis_loopback_devices }}"
   loop_control:
-    label: "{{ item.file }}"
+    label: "{{ item.loopback.file }}"
 
-# Single systemd unit that binds every configured file at boot. Unit is
-# only installed when at least one file-backed entry exists; pure-
-# block-device inventories never see it. Re-rendered when the file
-# list changes; daemon-reload + restart so subsequent ansible runs
-# pick up additions / removals.
-- name: basis-data — install loopback systemd unit
+# Single systemd unit that binds every loopback file at boot. Re-
+# rendered when the file list changes; absent unit removed when the
+# host transitions back to pure-block-device inventory.
+- name: storage — install loopback systemd unit
   ansible.builtin.copy:
-    dest: /etc/systemd/system/basis-data-loopback.service
+    dest: /etc/systemd/system/basis-storage-loopback.service
     mode: "0644"
     content: |
       [Unit]
-      Description=Bind basis-data loopback devices
+      Description=Bind basis storage-pool loopback devices
       DefaultDependencies=no
       After=local-fs.target
       Before=lvm2-monitor.service
       [Service]
       Type=oneshot
       RemainAfterExit=yes
-      {% for entry in basis_data_file_entries %}
-      ExecStart=/bin/sh -c '/sbin/losetup -j {{ entry.file }} -O NAME --noheadings | grep -q . || /sbin/losetup --find {{ entry.file }}'
-      ExecStop=/bin/sh -c 'dev=$(/sbin/losetup -j {{ entry.file }} -O NAME --noheadings | head -1); [ -n "$dev" ] && /sbin/losetup --detach "$dev" || true'
+      {% for d in basis_loopback_devices %}
+      ExecStart=/bin/sh -c '/sbin/losetup -j {{ d.loopback.file }} -O NAME --noheadings | grep -q . || /sbin/losetup --find {{ d.loopback.file }}'
+      ExecStop=/bin/sh -c 'dev=$(/sbin/losetup -j {{ d.loopback.file }} -O NAME --noheadings | head -1); [ -n "$dev" ] && /sbin/losetup --detach "$dev" || true'
       {% endfor %}
       [Install]
       WantedBy=local-fs.target
-  when: basis_data_file_entries | length > 0
-  register: loopback_unit
+  when: basis_loopback_devices | length > 0
+  register: storage_loopback_unit
 
-- name: basis-data — daemon-reload after unit change
+- name: storage — daemon-reload after unit change
   ansible.builtin.systemd:
     daemon_reload: true
-  when: loopback_unit.changed | default(false)
+  when: storage_loopback_unit.changed | default(false)
 
-- name: basis-data — enable + start loopback unit
+- name: storage — enable + start loopback unit
   ansible.builtin.systemd:
-    name: basis-data-loopback.service
+    name: basis-storage-loopback.service
     enabled: true
     state: started
-  when: basis_data_file_entries | length > 0
+  when: basis_loopback_devices | length > 0
 
-# Remove the loopback unit when a host transitions from file-backed
-# to pure-block-device inventory. Without this, the stale unit stays
-# enabled and re-binds the now-orphan basis-data.img on every boot.
-- name: basis-data — stop + disable loopback unit when no file entries
+- name: storage — stop + disable loopback unit when no loopback devices
   ansible.builtin.systemd:
-    name: basis-data-loopback.service
+    name: basis-storage-loopback.service
     enabled: false
     state: stopped
   failed_when: false
-  when: basis_data_file_entries | length == 0
+  when: basis_loopback_devices | length == 0
 
-- name: basis-data — remove stale loopback unit + reload
+- name: storage — remove stale loopback unit + reload
   ansible.builtin.file:
-    path: /etc/systemd/system/basis-data-loopback.service
+    path: /etc/systemd/system/basis-storage-loopback.service
     state: absent
-  register: loopback_unit_removed
-  when: basis_data_file_entries | length == 0
+  register: storage_loopback_unit_removed
+  when: basis_loopback_devices | length == 0
 
-- name: basis-data — daemon-reload after unit removal
+- name: storage — daemon-reload after unit removal
   ansible.builtin.systemd:
     daemon_reload: true
-  when: loopback_unit_removed.changed | default(false)
+  when: storage_loopback_unit_removed.changed | default(false)
 
-# After the unit has run, every configured file has a loop binding.
-# Resolve every entry (file-backed or block-device) to the actual
-# device path that pvcreate/vgcreate will consume.
-- name: basis-data — resolve every entry to a block-device path
+# Resolve each device to the actual block-device path pvcreate will
+# consume: a real `device:` path for block devices, or the bound
+# loop device for loopback-backed entries. The agent reads `id` from
+# host.yaml to find the by-id symlink; provisioning happens on the
+# resolved device path.
+- name: storage — resolve every device to a block-device path
   ansible.builtin.shell: |
     set -euo pipefail
-    {% for entry in basis_lvm_data_devices %}
-    {% if entry is mapping %}
-    losetup -j {{ entry.file }} -O NAME --noheadings | head -1 | awk '{$1=$1};1'
+    {% for d in basis_pool_devices %}
+    {% if d.loopback is defined %}
+    losetup -j {{ d.loopback.file }} -O NAME --noheadings | head -1 | awk '{$1=$1};1'
     {% else %}
-    echo {{ entry }}
+    echo {{ d.device | default('/dev/disk/by-id/' ~ d.id) }}
     {% endif %}
     {% endfor %}
-  register: basis_data_pvs
+  register: basis_pool_resolved
   changed_when: false
 
-- name: basis-data — fail if any entry resolved to empty (loop not bound)
+- name: storage — fail if any device resolved to empty (loop not bound)
   ansible.builtin.assert:
     that:
-      - basis_data_pvs.stdout_lines | length == basis_lvm_data_devices | length
-      - basis_data_pvs.stdout_lines | reject('match', '^\\s*$') | list | length
-        == basis_lvm_data_devices | length
+      - basis_pool_resolved.stdout_lines | length == basis_pool_devices | length
+      - basis_pool_resolved.stdout_lines | reject('match', '^\\s*$') | list | length
+        == basis_pool_devices | length
     fail_msg: >-
-      One or more basis_lvm_data_devices entries did not resolve to a
-      block device. For file-backed entries, this means the loopback
-      systemd unit did not bind the file. Check
-      `journalctl -u basis-data-loopback.service`.
+      One or more storage devices did not resolve to a block device.
+      For loopback-backed entries this means the systemd unit did not
+      bind the file. Check `journalctl -u basis-storage-loopback.service`.
 
-- name: basis-data — create volume group {{ basis_lvm_data_vg }}
+- name: storage — pvcreate + vgcreate one VG per device
   community.general.lvg:
-    vg: "{{ basis_lvm_data_vg }}"
-    pvs: "{{ basis_data_pvs.stdout_lines | join(',') }}"
+    vg: "{{ item.0.vg }}"
+    pvs: "{{ item.1 }}"
     state: present
+  loop: "{{ basis_pool_devices | zip(basis_pool_resolved.stdout_lines) | list }}"
+  loop_control:
+    label: "{{ item.0.id }} → {{ item.0.vg }}"
 # ------------------------------------------------------------------------
 
 - name: Check installed cloud-hypervisor version

@@ -13,6 +13,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 
 tonic.workspace = true
+prost.workspace = true
 
 rustls.workspace = true
 

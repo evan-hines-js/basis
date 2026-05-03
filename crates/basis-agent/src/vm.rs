@@ -69,9 +69,9 @@ pub struct BootArtifacts<'a> {
     /// `rootfs` and `cloud_init`. Order is load-bearing: the N'th entry
     /// becomes `/dev/vd{c,d,e,...}` in the guest (rootfs is `/dev/vda`,
     /// cloud-init ISO is `/dev/vdb`). Callers produce this from
-    /// `CreateVmCommand.extra_disks` preserving the caller's order so a
-    /// post-reboot restart reattaches the same disk at the same index.
-    pub extra_disks: &'a [PathBuf],
+    /// `CreateVmCommand.storage_disks` preserving the caller's order so
+    /// a post-reboot restart reattaches the same disk at the same index.
+    pub data_disks: &'a [PathBuf],
 }
 
 /// Owner of "VMs running on this host" state.
@@ -193,7 +193,7 @@ impl VmManager {
         .chain(std::iter::once(DiskSpec::CloudInit {
             path: boot.cloud_init.into(),
         }))
-        .chain(boot.extra_disks.iter().map(|p| DiskSpec::Data {
+        .chain(boot.data_disks.iter().map(|p| DiskSpec::Data {
             path: p.clone(),
             vcpus: cmd.cpu,
         }));
@@ -224,7 +224,7 @@ impl VmManager {
             memory_mib = cmd.memory_mib,
             primary_tap = %primary_tap,
             primary_mac = %primary_mac,
-            extra_disks = boot.extra_disks.len(),
+            data_disks = boot.data_disks.len(),
             vfio = vfio_devices.len(),
             ch_args = ?ch_args,
             "cloud-hypervisor invocation",

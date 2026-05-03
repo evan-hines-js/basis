@@ -63,6 +63,16 @@ pub enum ResourceError {
         got: String,
         expected: &'static str,
     },
+
+    /// Resource-specific validation failure surfaced after parse. The
+    /// `kind` lets callers identify which resource type rejected the
+    /// document; `source` carries the validator's message.
+    #[error("validating {kind}: {source}")]
+    Other {
+        kind: String,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 /// Read a YAML file, deserialize to `Resource<Spec>`, verify the envelope.

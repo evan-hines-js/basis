@@ -5,12 +5,12 @@
 # previously held `ent-zfspool`, now a single LVM-thin pool. The OS
 # lives on sda (pve-root); sdf/sdg are not part of the pool.
 #
-# Data VG (basis-data): backed by `/dev/pve/basis-data`, a thick LV
-# carved out of the OS disk's `pve` VG after destroying the unused
-# `pve-data` thinpool that PVE auto-provisions but we never used.
-# Gives ~320 GiB of data capacity, sized to fit a 250 GiB-class
-# worker dataDisk plus headroom. Sparse loopback was a temporary
-# fixture that capped data placement at 120 GiB.
+# Data pools: one `fast` pool backed by `/dev/pve/basis-data`, a
+# thick LV carved out of the OS disk's `pve` VG after destroying the
+# unused `pve-data` thinpool. Gives ~320 GiB of data capacity, sized
+# to fit a 250 GiB-class worker dataDisk plus headroom. Sparse
+# loopback was a temporary fixture that capped data placement at
+# 120 GiB.
 #
 # First-apply prep (run once on the host):
 #   zpool destroy ent-zfspool
@@ -23,8 +23,17 @@ basis_lvm_devices:
   - /dev/sdd
   - /dev/sde
 
-basis_lvm_data_devices:
-  - /dev/pve/basis-data
+basis_storage_pools:
+  - name: fast
+    backend: lvm-linear
+    labels:
+      tier: fast
+      medium: sas
+    devices:
+      - id: pve-basis-data
+        device: /dev/pve/basis-data
+        vg: basis-fast-pve
+        sizeGib: 320
 
 # Network config (cluster_supernet, pools, default_external_service_ips)
 # lives in group_vars/all.yml — it's a cell-wide concern, not per-host.

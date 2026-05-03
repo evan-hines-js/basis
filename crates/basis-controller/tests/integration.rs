@@ -211,18 +211,22 @@ async fn register_agent(
             total_cpu: 16,
             total_memory_mib: 65536,
             storage_capacity: Some(basis_proto::StorageCapacity {
-                rootfs: Some(basis_proto::PoolBytes {
+                rootfs: Some(basis_proto::RootfsCapacity {
                     total_bytes: 200 * (1 << 30),
                     free_bytes: 200 * (1 << 30),
                     metadata_total_bytes: 0,
                     metadata_free_bytes: 0,
                 }),
-                data: Some(basis_proto::PoolBytes {
-                    total_bytes: 800 * (1 << 30),
-                    free_bytes: 800 * (1 << 30),
-                    metadata_total_bytes: 0,
-                    metadata_free_bytes: 0,
-                }),
+                pools: vec![basis_proto::PoolCapacity {
+                    pool: "data".to_string(),
+                    backend: "lvm-linear".to_string(),
+                    labels: std::collections::HashMap::new(),
+                    configured_total_bytes: 800 * (1 << 30),
+                    ready_total_bytes: 800 * (1 << 30),
+                    schedulable_total_bytes: 800 * (1 << 30),
+                    schedulable_free_bytes: 800 * (1 << 30),
+                    devices: Vec::new(),
+                }],
             }),
             gpus: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
@@ -262,7 +266,7 @@ fn basic_machine_req(name: &str, cluster_id: &str) -> CreateMachineRequest {
         bootstrap_data: b"#!/bin/bash\necho hello".to_vec(),
         gpus: 0,
         gpu_constraints: None,
-        extra_disks: Vec::new(),
+        storage_disks: Vec::new(),
         placement: None,
     }
 }
@@ -795,18 +799,22 @@ async fn test_agent_cn_must_match_registered_hostname() {
             total_cpu: 16,
             total_memory_mib: 65536,
             storage_capacity: Some(basis_proto::StorageCapacity {
-                rootfs: Some(basis_proto::PoolBytes {
+                rootfs: Some(basis_proto::RootfsCapacity {
                     total_bytes: 200 * (1 << 30),
                     free_bytes: 200 * (1 << 30),
                     metadata_total_bytes: 0,
                     metadata_free_bytes: 0,
                 }),
-                data: Some(basis_proto::PoolBytes {
-                    total_bytes: 800 * (1 << 30),
-                    free_bytes: 800 * (1 << 30),
-                    metadata_total_bytes: 0,
-                    metadata_free_bytes: 0,
-                }),
+                pools: vec![basis_proto::PoolCapacity {
+                    pool: "data".to_string(),
+                    backend: "lvm-linear".to_string(),
+                    labels: std::collections::HashMap::new(),
+                    configured_total_bytes: 800 * (1 << 30),
+                    ready_total_bytes: 800 * (1 << 30),
+                    schedulable_total_bytes: 800 * (1 << 30),
+                    schedulable_free_bytes: 800 * (1 << 30),
+                    devices: Vec::new(),
+                }],
             }),
             gpus: Vec::new(),
             vtep_address: "10.100.0.1".to_string(),
@@ -1303,10 +1311,13 @@ async fn test_register_freezes_db_orphans_by_default() {
 ///
 /// The host below carries a VM in `alpha` (tenant-a), so `alpha`
 /// shows up with a populated `gateway_ip`/`cidr`. `beta` (tenant-b)
-/// is fanned out as a ghost (empty `gateway_ip`/`cidr`) and carries
-/// `trust_domain = "tenant-b"`. LAN-pool clusters carry an empty
-/// `trust_domain` — the agent leaves their bridges in the main
-/// routing table.
+/// is fanned out as a ghost: `gateway_ip` is empty (no VM of beta
+/// runs here, no MASQUERADE), but `cidr` is populated — the agent
+/// needs it to install the VRF transit-scope link route so a
+/// LAN-VIP VM replying to a source inside beta's CIDR has a route
+/// in the VRF table instead of leaking out the uplink. See the
+/// "Eager bootstrap of tree-scoped clusters" comment in
+/// `build_reconcile_command` for the full rationale.
 #[tokio::test]
 async fn test_eager_bootstrap_carries_trust_domain_per_cluster() {
     let (running, _db) = RunningController::start(
@@ -1359,10 +1370,23 @@ async fn test_eager_bootstrap_carries_trust_domain_per_cluster() {
     );
     assert!(
         beta.gateway_ip.is_empty(),
-        "beta is a ghost — no per-host gateway_ip"
+        "beta is a ghost — no per-host gateway_ip (no VM here, no MASQUERADE)"
     );
-    assert!(
-        beta.cidr.is_empty(),
-        "beta is a ghost — no cidr (no masquerade)"
+    assert_eq!(
+        beta.cidr,
+        beta_cidr_expected(&running, &beta_id).await,
+        "beta is a ghost — gateway_ip empty but cidr is populated so the agent \
+         can install the VRF transit-scope link route"
     );
+}
+
+async fn beta_cidr_expected(running: &RunningController, beta_id: &str) -> String {
+    let mut capi = running.capi_client().await;
+    capi.get_cluster(basis_proto::GetClusterRequest {
+        cluster_id: beta_id.to_string(),
+    })
+    .await
+    .unwrap()
+    .into_inner()
+    .cidr
 }

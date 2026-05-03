@@ -1,0 +1,290 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Per-pool, per-device storage state across the basis fleet. Backed by metrics emitted by basis-controller (basis_pool_*, basis_device_*, basis_pool_reservations, basis_pending_commands) and basis-agent (basis_agent_pool_*, basis_agent_device_*).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": [],
+      "title": "Pool capacity",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Schedulable free capacity per pool. The number the scheduler actually compares min_size_gib against. Drops to zero when the pool is full or every device is unhealthy/disabled.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "orange", "value": 10737418240 },
+              { "color": "green", "value": 107374182400 }
+            ]
+          },
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "id": 1,
+      "options": {
+        "displayMode": "gradient",
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_pool_capacity_bytes{host=~\"$host\", layer=\"schedulable_free\"}",
+          "instant": true,
+          "legendFormat": "{{host}}/{{pool}} ({{backend}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Schedulable free per pool",
+      "type": "bargauge"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Capacity decomposed into the four layers operators care about: configured (operator wrote N devices in host.yaml), ready (physically Ready), schedulable_total (Ready AND not disabled), schedulable_free (the actual placement budget). Gaps between layers tell you which axis ate capacity (drive missing vs operator-disabled).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineInterpolation": "stepBefore", "fillOpacity": 10 },
+          "min": 0,
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "id": 2,
+      "options": {
+        "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "sum by (layer) (basis_pool_capacity_bytes{host=~\"$host\"})",
+          "legendFormat": "{{layer}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Fleet capacity layers",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 101,
+      "panels": [],
+      "title": "Per-device health",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Every device that is NOT physically Ready right now. Empty table = healthy fleet. Each row identifies host + pool + device + the failure mode.",
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "displayMode": "auto" } }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "id": 3,
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_device_physical_state{physical!=\"Ready\", host=~\"$host\"} == 1",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Devices not Ready",
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "Value": true, "instance": true, "job": true } } }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Devices the operator has disabled via `basisctl pool disable`. These devices keep their existing reservations alive but won't accept new placements — useful pre-flight for drive replacement. Empty table = nothing fenced.",
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "displayMode": "auto" } }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "id": 4,
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_device_scheduling_state{state=\"disabled\", host=~\"$host\"} == 1",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Devices disabled (operator-fenced)",
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "Value": true, "instance": true, "job": true } } }
+      ],
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "id": 102,
+      "panels": [],
+      "title": "Same-cluster anti-affinity audit",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "REPLICATED reservations grouped by (cluster, host, device). Each cluster_id should appear with `count=1` per device — anything ≥2 is a same-cluster collision and a scheduler bug. Empty rows = no replicated workloads on this host.",
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "displayMode": "color-text" } }
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 19 },
+      "id": 5,
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false, "reducer": ["sum"] }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "basis_pool_reservations{purpose=\"replicated\", state!=\"releasing\", host=~\"$host\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Replicated disks per (cluster, host, device)",
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true, "purpose": true } } },
+        { "id": "sortBy", "options": { "fields": {}, "sort": [{ "field": "Value", "desc": true }] } }
+      ],
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 },
+      "id": 103,
+      "panels": [],
+      "title": "Outbox + scheduler",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "pending_command rows by host and state. `pending` rising while the agent is connected = stuck dispatcher. `sent` not draining = agent crashed mid-handoff. Both should normally be 0; the outbox is empty in steady state.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 30, "lineInterpolation": "stepBefore" },
+          "min": 0,
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["last", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "sum by (host, state) (basis_pending_commands)",
+          "legendFormat": "{{host}}/{{state}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Outbox depth (pending_command)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Scheduler decision rate by outcome. `placed` = success, `no_capacity` = nothing fits, `unsatisfied_requirements` = label selector matched no host/pool. A rising `no_capacity` rate means the fleet is full; a rising `unsatisfied_requirements` rate means the request is mislabeled or the operator hasn't tagged the matching pool.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 30 },
+          "unit": "ops"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "id": 7,
+      "options": {
+        "legend": { "calcs": ["last", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "sum by (result) (rate(basis_scheduler_decisions_total[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Scheduler decisions",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["basis", "storage"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "All", "value": ".*" },
+        "datasource": { "type": "prometheus", "uid": "Prometheus" },
+        "definition": "label_values(basis_pool_capacity_bytes, host)",
+        "hide": 0,
+        "includeAll": true,
+        "multi": true,
+        "name": "host",
+        "options": [],
+        "query": { "query": "label_values(basis_pool_capacity_bytes, host)", "refId": "host" },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Basis Storage",
+  "uid": "basis-storage",
+  "version": 1,
+  "weekStart": ""
+}

@@ -80,6 +80,32 @@ pub struct Metrics {
     pub scheduler_decisions_total: IntCounterVec,
     pub vm_create_result_total: IntCounterVec,
 
+    // --- Storage gauges (event-driven, refreshed on heartbeat ingest) ---
+    /// Pool capacity, decomposed by layer (`configured` / `ready` /
+    /// `schedulable_total` / `schedulable_free`). Labelled by host +
+    /// pool + backend so dashboards can either roll up across the
+    /// fleet or drill down to one host's pools.
+    pub pool_capacity_bytes: IntGaugeVec,
+    /// Per-device byte counts (`kind=total|free`).
+    pub device_capacity_bytes: IntGaugeVec,
+    /// Per-device physical health: 1 for the matching `physical`
+    /// label, 0 otherwise.
+    pub device_physical_state: IntGaugeVec,
+    /// Per-device scheduling state: 1 for the matching `state` label
+    /// (`enabled` | `disabled`), 0 otherwise.
+    pub device_scheduling_state: IntGaugeVec,
+    /// Live `pool_disk_assignment` reservations grouped by
+    /// `(host, pool, device, cluster, purpose, state)`. Drives the
+    /// "OSD distribution per cluster" / "is the same-cluster
+    /// anti-affinity actually working" panels.
+    pub pool_reservations: IntGaugeVec,
+    /// Outbox depth — number of `pending_command` rows that haven't
+    /// been sent yet. Labelled by host + state so a stuck dispatcher
+    /// (rows piling up in `pending` while the agent is connected) is
+    /// distinguishable from agent-disconnected (rows in `sent` but
+    /// not `acked`).
+    pub pending_commands: IntGaugeVec,
+
     // --- Histograms (event-driven) ---
     /// End-to-end CreateMachine latency observed at the gRPC boundary:
     /// from the moment the controller receives the request to the moment
@@ -286,6 +312,63 @@ impl Metrics {
         )?;
         registry.register(Box::new(vm_time_to_running_seconds.clone()))?;
 
+        let pool_capacity_bytes = IntGaugeVec::new(
+            Opts::new(
+                "basis_pool_capacity_bytes",
+                "Per-pool capacity, decomposed by layer \
+                 (configured | ready | schedulable_total | schedulable_free)",
+            ),
+            &["host", "pool", "backend", "layer"],
+        )?;
+        registry.register(Box::new(pool_capacity_bytes.clone()))?;
+
+        let device_capacity_bytes = IntGaugeVec::new(
+            Opts::new(
+                "basis_device_capacity_bytes",
+                "Per-device byte counts, kind=total|free",
+            ),
+            &["host", "pool", "device", "kind"],
+        )?;
+        registry.register(Box::new(device_capacity_bytes.clone()))?;
+
+        let device_physical_state = IntGaugeVec::new(
+            Opts::new(
+                "basis_device_physical_state",
+                "Per-device physical health, set to 1 for matching label",
+            ),
+            &["host", "pool", "device", "physical"],
+        )?;
+        registry.register(Box::new(device_physical_state.clone()))?;
+
+        let device_scheduling_state = IntGaugeVec::new(
+            Opts::new(
+                "basis_device_scheduling_state",
+                "Per-device operator-driven scheduling state \
+                 (enabled | disabled), set to 1 for matching label",
+            ),
+            &["host", "pool", "device", "state"],
+        )?;
+        registry.register(Box::new(device_scheduling_state.clone()))?;
+
+        let pool_reservations = IntGaugeVec::new(
+            Opts::new(
+                "basis_pool_reservations",
+                "Live `pool_disk_assignment` rows grouped by host, \
+                 pool, device, cluster, purpose, and state",
+            ),
+            &["host", "pool", "device", "cluster", "purpose", "state"],
+        )?;
+        registry.register(Box::new(pool_reservations.clone()))?;
+
+        let pending_commands = IntGaugeVec::new(
+            Opts::new(
+                "basis_pending_commands",
+                "Outbox depth: pending_command rows by host and state",
+            ),
+            &["host", "state"],
+        )?;
+        registry.register(Box::new(pending_commands.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
             clusters,
@@ -309,6 +392,12 @@ impl Metrics {
             vm_create_result_total,
             vm_create_duration_seconds,
             vm_time_to_running_seconds,
+            pool_capacity_bytes,
+            device_capacity_bytes,
+            device_physical_state,
+            device_scheduling_state,
+            pool_reservations,
+            pending_commands,
         }))
     }
 
@@ -493,6 +582,92 @@ async fn refresh(metrics: &Metrics, db: &Db) -> Result<(), crate::db::DbError> {
         metrics.vms.with_label_values(&[state, cluster]).set(count);
     }
 
+    // --- Storage gauges. Refreshed from the same DB rows the
+    // scheduler reads, so dashboard numbers and scheduler decisions
+    // stay coherent. ---
+    metrics.pool_capacity_bytes.reset();
+    metrics.device_capacity_bytes.reset();
+    metrics.device_physical_state.reset();
+    metrics.device_scheduling_state.reset();
+    metrics.pool_reservations.reset();
+    metrics.pending_commands.reset();
+
+    for host in &hosts {
+        let h = host.hostname.as_str();
+        let pools = db.list_host_pools(&host.id).await?;
+        let drains = db.host_drain_markers(&host.id).await?;
+        for pool in pools {
+            let backend = pool.backend.as_str();
+            for (layer, v) in [
+                ("configured", pool.configured_total_bytes),
+                ("ready", pool.ready_total_bytes),
+                ("schedulable_total", pool.schedulable_total_bytes),
+                ("schedulable_free", pool.schedulable_free_bytes),
+            ] {
+                metrics
+                    .pool_capacity_bytes
+                    .with_label_values(&[h, &pool.pool, backend, layer])
+                    .set(v);
+            }
+            let devices = db.list_pool_devices(&host.id, &pool.pool).await?;
+            for d in &devices {
+                metrics
+                    .device_capacity_bytes
+                    .with_label_values(&[h, &pool.pool, &d.device_id, "total"])
+                    .set(d.total_bytes);
+                metrics
+                    .device_capacity_bytes
+                    .with_label_values(&[h, &pool.pool, &d.device_id, "free"])
+                    .set(d.free_bytes);
+                for state in ["Ready", "Degraded", "Missing", "Unspecified"] {
+                    metrics
+                        .device_physical_state
+                        .with_label_values(&[h, &pool.pool, &d.device_id, state])
+                        .set(if d.physical == state { 1 } else { 0 });
+                }
+                let scheduling = drains
+                    .get(&(pool.pool.clone(), d.device_id.clone()))
+                    .map(|r| r.state.as_str())
+                    .unwrap_or("enabled");
+                for state in ["enabled", "disabled"] {
+                    metrics
+                        .device_scheduling_state
+                        .with_label_values(&[h, &pool.pool, &d.device_id, state])
+                        .set(if scheduling == state { 1 } else { 0 });
+                }
+            }
+        }
+    }
+
+    for r in db.pool_reservation_counts().await? {
+        let host_name = host_id_to_name
+            .get(r.host_id.as_str())
+            .copied()
+            .unwrap_or("unknown");
+        metrics
+            .pool_reservations
+            .with_label_values(&[
+                host_name,
+                &r.pool,
+                &r.device_id,
+                &r.cluster_id,
+                &r.purpose,
+                &r.state,
+            ])
+            .set(r.count);
+    }
+
+    for r in db.pending_command_counts().await? {
+        let host_name = host_id_to_name
+            .get(r.host_id.as_str())
+            .copied()
+            .unwrap_or("unknown");
+        metrics
+            .pending_commands
+            .with_label_values(&[host_name, &r.state])
+            .set(r.count);
+    }
+
     Ok(())
 }
 
@@ -594,7 +769,7 @@ mod tests {
             cpu: 4,
             memory_mib: 8192,
             disk_gib: 100,
-            extra_disk_gibs: "[]".to_string(),
+            storage_disks: "[]".to_string(),
             image: "ubuntu:22.04".to_string(),
             error_message: String::new(),
             created_at: basis_common::time::now_rfc3339(),
@@ -657,10 +832,10 @@ mod tests {
             .await
             .unwrap();
         seed_cluster(&db, "c1").await;
-        db.insert_vm(&make_vm("v1", "h1", "c1", 2), &[])
+        db.insert_vm(&make_vm("v1", "h1", "c1", 2), &[], &[])
             .await
             .unwrap(); // RUNNING
-        db.insert_vm(&make_vm("v2", "h1", "c1", 1), &[])
+        db.insert_vm(&make_vm("v2", "h1", "c1", 1), &[], &[])
             .await
             .unwrap(); // CREATING
 
@@ -700,7 +875,7 @@ mod tests {
         for n in 0..3 {
             let mut vm = make_vm(&format!("v{n}"), "h1", "c1", 2);
             vm.cpu = 16;
-            db.insert_vm(&vm, &[]).await.unwrap();
+            db.insert_vm(&vm, &[], &[]).await.unwrap();
         }
 
         let metrics = Metrics::new(4.0).unwrap();
@@ -727,7 +902,7 @@ mod tests {
             .await
             .unwrap();
         seed_cluster(&db, "c1").await;
-        db.insert_vm(&make_vm("v1", "h1", "c1", 2), &[])
+        db.insert_vm(&make_vm("v1", "h1", "c1", 2), &[], &[])
             .await
             .unwrap();
 

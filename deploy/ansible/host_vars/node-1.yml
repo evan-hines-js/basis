@@ -7,7 +7,8 @@
 # PVE's `data` VG but the storage.cfg pins that VG to a different
 # node — idle here, claimed by basis.
 #
-# Data VG (basis-data): two PVs giving ~381 GiB total —
+# Data pools: one `bulk` pool with two devices (each gets its own
+# VG per the one-VG-per-device rule):
 #   * /dev/pve/basis-data — 120 GiB thick LV in the OS disk's `pve` VG,
 #     carved out of the freed extents after destroying the unused
 #     `pve-data` thinpool that PVE auto-provisioned but we never used.
@@ -27,9 +28,23 @@
 basis_lvm_devices:
   - /dev/sdf
 
-basis_lvm_data_devices:
-  - /dev/pve/basis-data
-  - /dev/sdb4
+basis_storage_pools:
+  - name: bulk
+    backend: lvm-linear
+    labels:
+      tier: bulk
+      medium: sata
+    devices:
+      # 120 GiB LV inside pve VG; addressed by its DM path since
+      # there's no by-id symlink for an LV.
+      - id: pve-basis-data
+        device: /dev/pve/basis-data
+        vg: basis-bulk-pve
+        sizeGib: 120
+      - id: sdb4
+        device: /dev/sdb4
+        vg: basis-bulk-sdb4
+        sizeGib: 261
 
 # Consumer SATA SSD (BX500) — fine for low-write-volume workers but
 # tail latency under sustained writes is much worse than the Intel

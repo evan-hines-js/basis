@@ -18,8 +18,9 @@ use std::time::Duration;
 use basis_common::tls::{TlsIdentity, CONTROLLER_IDENTITY};
 use basis_proto::{
     basis_client::BasisClient as InnerClient, CreateClusterRequest, CreateMachineRequest,
-    DeleteClusterRequest, DeleteMachineRequest, ExtraDisk, GetClusterRequest, GetMachineRequest,
-    GpuConstraints, ListClustersRequest, ListMachinesRequest, Machine,
+    DeleteClusterRequest, DeleteMachineRequest, GetClusterRequest, GetMachineRequest,
+    GpuConstraints, ListClustersRequest, ListMachinesRequest, ListPoolsRequest, Machine,
+    PoolStatus, SetDeviceSchedulingStateRequest, StorageDisk,
 };
 use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint};
@@ -136,14 +137,19 @@ pub struct MachineRequest {
     pub bootstrap_data: Vec<u8>,
     pub gpus: u32,
     pub min_gpu_group_size: Option<u32>,
-    /// Extra raw block devices to attach alongside the rootfs, each a
-    /// size in GiB. Order is stable and becomes the guest virtio-blk
-    /// enumeration order after rootfs + cloud-init.
-    pub extra_disk_gibs: Vec<u32>,
-    /// Optional placement constraints (label-based requires/prefers).
-    /// `None` means no constraint — the scheduler picks any host that
-    /// fits, identical to today's pre-placement behavior.
-    pub placement: Option<basis_proto::PlacementSpec>,
+    /// Per-disk storage requests. Each disk carries:
+    ///   - `min_size_gib`: minimum requested capacity.
+    ///   - `selector`: label-based pool match (`requires`/`prefers`).
+    ///     None == match any pool with capacity.
+    ///   - `purpose`: workload role (`REPLICATED` activates hierarchical
+    ///     same-cluster anti-affinity; `GENERIC_DATA` doesn't).
+    /// Order is stable and becomes the guest virtio-blk enumeration
+    /// order after rootfs + cloud-init.
+    pub storage_disks: Vec<StorageDisk>,
+    /// Optional **host** placement (against host labels). `None` means
+    /// no constraint — the scheduler picks any host that fits.
+    /// Per-disk pool placement lives on each `StorageDisk.selector`.
+    pub placement: Option<basis_proto::LabelSelector>,
 }
 
 /// Inputs to `create_cluster`.
@@ -348,11 +354,7 @@ impl BasisClient {
             gpu_constraints: req
                 .min_gpu_group_size
                 .map(|min_group_size| GpuConstraints { min_group_size }),
-            extra_disks: req
-                .extra_disk_gibs
-                .into_iter()
-                .map(|size_gib| ExtraDisk { size_gib })
-                .collect(),
+            storage_disks: req.storage_disks,
             placement: req.placement,
         };
         let resp = self
@@ -419,5 +421,44 @@ impl BasisClient {
             })
             .await?;
         Ok(resp.machines)
+    }
+
+    /// Pool + per-device telemetry. Empty `host_id` returns every
+    /// pool across every host the controller knows about.
+    pub async fn list_pools(&self, host_id: String) -> Result<Vec<PoolStatus>, ClientError> {
+        let request = ListPoolsRequest { host_id };
+        let resp = self
+            .call(|mut c| {
+                let request = request.clone();
+                async move { c.list_pools(request).await }
+            })
+            .await?;
+        Ok(resp.pools)
+    }
+
+    /// Set or clear a drain marker on `(host, pool, device)`. `state`
+    /// is `enabled` (clear) or `draining` (set).
+    pub async fn set_device_scheduling_state(
+        &self,
+        host_id: String,
+        pool: String,
+        device_id: String,
+        state: String,
+        reason: String,
+    ) -> Result<(), ClientError> {
+        let request = SetDeviceSchedulingStateRequest {
+            host_id,
+            pool,
+            device_id,
+            state,
+            reason,
+        };
+        let _ = self
+            .call(|mut c| {
+                let request = request.clone();
+                async move { c.set_device_scheduling_state(request).await }
+            })
+            .await?;
+        Ok(())
     }
 }

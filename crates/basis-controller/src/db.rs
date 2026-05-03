@@ -238,10 +238,12 @@ impl Db {
         .await?;
 
         // `disk_gib` is the rootfs LV size (rootfs thin pool). Data
-        // disks are tracked by the JSON `extra_disk_gibs` column —
-        // single source of truth, no denormalised per-row sum. The
-        // scheduler's capacity gate sums them per-host on the fly via
-        // `json_each(extra_disk_gibs)`.
+        // disks are tracked by the JSON `storage_disks` column — one
+        // entry per disk carrying the request (min_size_gib, purpose),
+        // the scheduler's resolution (pool, device_id, assignment_id),
+        // and the agent's eventual ack (actual_size_gib, device_path).
+        // Single source of truth per VM. The scheduler's capacity gate
+        // joins against `pool_disk_assignment` for live placements.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS vms (
                 id TEXT PRIMARY KEY,
@@ -253,11 +255,113 @@ impl Db {
                 cpu INTEGER NOT NULL,
                 memory_mib INTEGER NOT NULL,
                 disk_gib INTEGER NOT NULL,
-                extra_disk_gibs TEXT NOT NULL DEFAULT '[]',
+                storage_disks TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL,
                 error_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.writer)
+        .await?;
+
+        // Per-host pool capacity, refreshed on every heartbeat. The
+        // scheduler reads from these rows for `(host, pool, device)`
+        // selection without rejoining the agent stream's body.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS host_pools (
+                host_id                  TEXT NOT NULL REFERENCES hosts(id),
+                pool                     TEXT NOT NULL,
+                backend                  TEXT NOT NULL,
+                labels                   TEXT NOT NULL DEFAULT '{}',
+                configured_total_bytes   INTEGER NOT NULL DEFAULT 0,
+                ready_total_bytes        INTEGER NOT NULL DEFAULT 0,
+                schedulable_total_bytes  INTEGER NOT NULL DEFAULT 0,
+                schedulable_free_bytes   INTEGER NOT NULL DEFAULT 0,
+                updated_at               TEXT NOT NULL,
+                PRIMARY KEY (host_id, pool)
+            )",
+        )
+        .execute(&self.writer)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS host_pool_devices (
+                host_id          TEXT NOT NULL,
+                pool             TEXT NOT NULL,
+                device_id        TEXT NOT NULL,
+                total_bytes      INTEGER NOT NULL DEFAULT 0,
+                free_bytes       INTEGER NOT NULL DEFAULT 0,
+                physical         TEXT NOT NULL DEFAULT 'Unspecified',
+                physical_reason  TEXT NOT NULL DEFAULT '',
+                updated_at       TEXT NOT NULL,
+                PRIMARY KEY (host_id, pool, device_id),
+                FOREIGN KEY (host_id, pool) REFERENCES host_pools(host_id, pool)
+            )",
+        )
+        .execute(&self.writer)
+        .await?;
+
+        // Live disk assignments. The scheduler's same-cluster
+        // failure-domain anti-affinity reads this with
+        // `(cluster_id, host_id, device_id)` for `purpose=replicated`.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pool_disk_assignment (
+                assignment_id    TEXT PRIMARY KEY,
+                host_id          TEXT NOT NULL,
+                pool             TEXT NOT NULL,
+                device_id        TEXT NOT NULL,
+                vm_id            TEXT NOT NULL,
+                disk_index       INTEGER NOT NULL,
+                cluster_id       TEXT NOT NULL,
+                purpose          TEXT NOT NULL,
+                min_size_gib     INTEGER NOT NULL,
+                actual_size_gib  INTEGER,
+                state            TEXT NOT NULL,
+                UNIQUE (vm_id, disk_index)
+            )",
+        )
+        .execute(&self.writer)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pool_assignment_failure_domain \
+             ON pool_disk_assignment (cluster_id, host_id, device_id) \
+             WHERE purpose = 'replicated'",
+        )
+        .execute(&self.writer)
+        .await?;
+
+        // Operator-driven drain markers. Absence of a row → enabled.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS device_scheduling_state (
+                host_id     TEXT NOT NULL,
+                pool        TEXT NOT NULL,
+                device_id   TEXT NOT NULL,
+                state       TEXT NOT NULL,
+                reason      TEXT,
+                updated_at  TEXT NOT NULL,
+                PRIMARY KEY (host_id, pool, device_id)
+            )",
+        )
+        .execute(&self.writer)
+        .await?;
+
+        // Outbox: durable record of every controller→agent command,
+        // committed in the same DB transaction that creates the VM
+        // row. The dispatcher drains pending rows onto the agent
+        // stream; agent acks flip rows to `sent`/`acked`. Survives
+        // controller restart so a crash mid-dispatch reissues the
+        // same `assignment_id` and the agent's idempotency key
+        // recognises the retry.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_command (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_id         TEXT NOT NULL,
+                vm_id           TEXT NOT NULL,
+                payload         BLOB NOT NULL,    -- prost-encoded ControllerCommand
+                state           TEXT NOT NULL,    -- pending | sent | acked
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
             )",
         )
         .execute(&self.writer)
@@ -1118,12 +1222,19 @@ impl Db {
     /// flips `healthy=1` and stamps `last_heartbeat` — heartbeats
     /// always carry capacity now, so collapsing the two updates avoids
     /// a separate UPDATE round-trip per tick.
+    ///
+    /// Per-pool detail (`StorageCapacity.pools[]`) is upserted into
+    /// `host_pools` and `host_pool_devices` in the same transaction so
+    /// the scheduler's `(host, pool, device)` selection has a
+    /// consistent view.
     pub async fn record_heartbeat(
         &self,
         host_id: &str,
         now: &str,
         capacity: &StorageCapacityBytes,
+        pools: &[basis_proto::PoolCapacity],
     ) -> Result<(), DbError> {
+        let mut tx = self.writer.begin().await?;
         let result = sqlx::query(
             "UPDATE hosts SET
                 last_heartbeat = ?,
@@ -1144,11 +1255,66 @@ impl Db {
         .bind(capacity.data_total_bytes)
         .bind(capacity.data_free_bytes)
         .bind(host_id)
-        .execute(&self.writer)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("host '{host_id}'")));
         }
+
+        // Wipe-and-replace per-pool rows for this host. Heartbeat
+        // carries the authoritative current set; a pool that
+        // disappears from the host's config (operator removed it)
+        // should disappear here too. Per-host scoping keeps writes
+        // bounded.
+        sqlx::query("DELETE FROM host_pool_devices WHERE host_id = ?")
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM host_pools WHERE host_id = ?")
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for pool in pools {
+            let labels_json = serde_json::to_string(&pool.labels)
+                .expect("serializing HashMap<String, String> to JSON is infallible");
+            sqlx::query(
+                "INSERT INTO host_pools (host_id, pool, backend, labels, \
+                 configured_total_bytes, ready_total_bytes, \
+                 schedulable_total_bytes, schedulable_free_bytes, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(host_id)
+            .bind(&pool.pool)
+            .bind(&pool.backend)
+            .bind(labels_json)
+            .bind(pool.configured_total_bytes as i64)
+            .bind(pool.ready_total_bytes as i64)
+            .bind(pool.schedulable_total_bytes as i64)
+            .bind(pool.schedulable_free_bytes as i64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            for dev in &pool.devices {
+                sqlx::query(
+                    "INSERT INTO host_pool_devices (host_id, pool, device_id, \
+                     total_bytes, free_bytes, physical, physical_reason, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(host_id)
+                .bind(&pool.pool)
+                .bind(&dev.device_id)
+                .bind(dev.total_bytes as i64)
+                .bind(dev.free_bytes as i64)
+                .bind(physical_health_str(dev.physical))
+                .bind(&dev.physical_reason)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1213,15 +1379,30 @@ impl Db {
     /// being gone or unhealthy, which is a different retry policy
     /// (pick another host) from a capacity race (re-snapshot and retry
     /// the same scheduler pass, which may land here again).
-    pub async fn insert_vm(&self, vm: &VmRow, gpus: &[GpuAssignment]) -> Result<(), DbError> {
+    /// Insert a VM record, its GPU reservations, and its
+    /// `pool_disk_assignment` rows in one transaction. The capacity
+    /// gate, GPU uniqueness, and per-disk reservation insert all
+    /// commit together: a stale snapshot in the scheduler can lose
+    /// the race here, but never half-commit. The outbox row for the
+    /// `CreateVmCommand` itself is enqueued in the same transaction
+    /// by the caller via [`Self::enqueue_pending_command`] (kept
+    /// separate so the outbox stays composable; tests for capacity
+    /// races don't need a synthetic command payload).
+    pub async fn insert_vm(
+        &self,
+        vm: &VmRow,
+        gpus: &[GpuAssignment],
+        disks: &[crate::scheduler::DiskPlacement],
+    ) -> Result<(), DbError> {
         let mut tx = self.writer.begin().await?;
 
         // Sum the new VM's data-disk footprint up front so the gate
         // doesn't have to json_each the bound JSON literal — the
-        // host-side data total still uses json_each over `vms` to
-        // capture every existing VM's extras.
-        let data_gib_request: i64 = vm.extra_disks_sum_gib().map_err(|e| {
-            DbError::Malformed(format!("vm '{}': extra_disk_gibs unparseable: {e}", vm.id))
+        // host-side data total uses json_each over the storage_disks
+        // entries' `min_size_gib` to capture every existing VM's
+        // requested data footprint.
+        let data_gib_request: i64 = vm.storage_disks_sum_gib().map_err(|e| {
+            DbError::Malformed(format!("vm '{}': storage_disks unparseable: {e}", vm.id))
         })?;
         let rootfs_bytes_request: i64 = vm.disk_gib.saturating_mul(GIB);
         let data_bytes_request: i64 = data_gib_request.saturating_mul(GIB);
@@ -1230,7 +1411,7 @@ impl Db {
             "INSERT INTO vms (
                 id, name, cluster_id, host_id, ip_address, state,
                 cpu, memory_mib, disk_gib,
-                extra_disk_gibs, image, error_message,
+                storage_disks, image, error_message,
                 created_at, updated_at)
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              WHERE EXISTS (
@@ -1246,8 +1427,9 @@ impl Db {
                        - COALESCE((SELECT SUM(disk_gib) FROM vms
                                    WHERE host_id = h.id), 0) * ? >= ?
                    AND h.data_total_bytes
-                       - COALESCE((SELECT SUM(je.value) FROM vms v,
-                                          json_each(v.extra_disk_gibs) je
+                       - COALESCE((SELECT SUM(CAST(json_extract(je.value, '$.min_size_gib') AS INTEGER))
+                                          FROM vms v,
+                                          json_each(v.storage_disks) je
                                    WHERE v.host_id = h.id), 0) * ? >= ?
              )",
         )
@@ -1260,7 +1442,7 @@ impl Db {
         .bind(vm.cpu)
         .bind(vm.memory_mib)
         .bind(vm.disk_gib)
-        .bind(&vm.extra_disk_gibs)
+        .bind(&vm.storage_disks)
         .bind(&vm.image)
         .bind(&vm.error_message)
         .bind(&vm.created_at)
@@ -1317,6 +1499,38 @@ impl Db {
             .bind(&g.model)
             .bind(&g.iommu_group)
             .bind(g.nvlink_group)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+                    DbError::CapacityRaced(vm.host_id.clone())
+                }
+                other => DbError::Sqlx(other),
+            })?;
+        }
+
+        for d in disks {
+            let assignment_id = format!("{}-{}", vm.id, d.disk_index);
+            let purpose = match d.purpose {
+                basis_proto::DiskPurpose::Replicated => "replicated",
+                basis_proto::DiskPurpose::GenericData => "generic-data",
+                basis_proto::DiskPurpose::Unspecified => "unspecified",
+            };
+            sqlx::query(
+                "INSERT INTO pool_disk_assignment \
+                 (assignment_id, host_id, pool, device_id, vm_id, disk_index, \
+                  cluster_id, purpose, min_size_gib, actual_size_gib, state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending')",
+            )
+            .bind(&assignment_id)
+            .bind(&vm.host_id)
+            .bind(&d.pool)
+            .bind(&d.device_id)
+            .bind(&vm.id)
+            .bind(d.disk_index as i64)
+            .bind(&vm.cluster_id)
+            .bind(purpose)
+            .bind(d.min_size_gib as i64)
             .execute(&mut *tx)
             .await
             .map_err(|e| match e {
@@ -1398,19 +1612,18 @@ impl Db {
         let mut out: HashMap<String, HostUsage> = HashMap::new();
 
         // Consumed cpu / mem / rootfs / data per host. The data column
-        // sums each VM's `extra_disk_gibs` JSON via `json_each` —
-        // single source of truth for per-disk sizes lives there.
-        // `LEFT JOIN` so a VM with no extras still contributes its
-        // rootfs to the rollup. COALESCE covers hosts with zero VMs
-        // by leaving them absent; the caller fills in
+        // sums each VM's `storage_disks` JSON via `json_each` and
+        // pulls `min_size_gib` from each entry — single source of
+        // truth for per-disk sizes lives there. COALESCE covers hosts
+        // with zero VMs by leaving them absent; the caller fills in
         // `HostUsage::default()` when a host isn't in the map.
         let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
             "SELECT v.host_id,
                     COALESCE(SUM(v.cpu), 0),
                     COALESCE(SUM(v.memory_mib), 0),
                     COALESCE(SUM(v.disk_gib), 0),
-                    COALESCE((SELECT SUM(je.value)
-                              FROM vms v2, json_each(v2.extra_disk_gibs) je
+                    COALESCE((SELECT SUM(CAST(json_extract(je.value, '$.min_size_gib') AS INTEGER))
+                              FROM vms v2, json_each(v2.storage_disks) je
                               WHERE v2.host_id = v.host_id), 0)
              FROM vms v
              GROUP BY v.host_id",
@@ -1751,18 +1964,24 @@ pub struct StorageCapacityBytes {
 }
 
 impl StorageCapacityBytes {
-    /// Build from the agent-side proto. Single boundary conversion;
-    /// callers don't need to know the field shape on either side.
+    /// Build from the agent-side proto. The data side is the **sum**
+    /// across every reported pool's schedulable totals — preserving the
+    /// existing scheduler interface that compares against a single
+    /// `data_total_bytes` while the per-pool detail is also persisted
+    /// for the new (host, pool, device) selection path. Single boundary
+    /// conversion; callers don't need to know the field shape on
+    /// either side.
     pub fn from_proto(c: &basis_proto::StorageCapacity) -> Self {
         let rootfs = c.rootfs.as_ref();
-        let data = c.data.as_ref();
+        let data_total: u64 = c.pools.iter().map(|p| p.schedulable_total_bytes).sum();
+        let data_free: u64 = c.pools.iter().map(|p| p.schedulable_free_bytes).sum();
         Self {
             rootfs_total_bytes: rootfs.map(|p| p.total_bytes as i64).unwrap_or(0),
             rootfs_free_bytes: rootfs.map(|p| p.free_bytes as i64).unwrap_or(0),
             rootfs_metadata_total_bytes: rootfs.map(|p| p.metadata_total_bytes as i64).unwrap_or(0),
             rootfs_metadata_free_bytes: rootfs.map(|p| p.metadata_free_bytes as i64).unwrap_or(0),
-            data_total_bytes: data.map(|p| p.total_bytes as i64).unwrap_or(0),
-            data_free_bytes: data.map(|p| p.free_bytes as i64).unwrap_or(0),
+            data_total_bytes: data_total as i64,
+            data_free_bytes: data_free as i64,
         }
     }
 }
@@ -1770,6 +1989,495 @@ impl StorageCapacityBytes {
 /// One gibibyte in bytes. Used wherever the agent reports bytes but
 /// the scheduler / VM accounting works in GiB.
 pub const GIB: i64 = 1 << 30;
+
+/// String form of `DevicePhysicalHealth` as stored in
+/// `host_pool_devices.physical`. Single conversion site so the column
+/// vocabulary doesn't drift between writer and reader queries.
+fn physical_health_str(p: i32) -> &'static str {
+    match basis_proto::DevicePhysicalHealth::try_from(p) {
+        Ok(basis_proto::DevicePhysicalHealth::DeviceHealthReady) => "Ready",
+        Ok(basis_proto::DevicePhysicalHealth::DeviceHealthDegraded) => "Degraded",
+        Ok(basis_proto::DevicePhysicalHealth::DeviceHealthMissing) => "Missing",
+        _ => "Unspecified",
+    }
+}
+
+/// One row of `host_pools` — the per-pool view the scheduler reads
+/// when matching disk selectors.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HostPoolRow {
+    pub host_id: String,
+    pub pool: String,
+    pub backend: String,
+    pub labels: String, // JSON map<string,string>
+    pub configured_total_bytes: i64,
+    pub ready_total_bytes: i64,
+    pub schedulable_total_bytes: i64,
+    pub schedulable_free_bytes: i64,
+}
+
+impl HostPoolRow {
+    pub fn parsed_labels(&self) -> serde_json::Result<std::collections::BTreeMap<String, String>> {
+        serde_json::from_str(&self.labels)
+    }
+}
+
+/// One row of `host_pool_devices` — per-device occupancy used by the
+/// scheduler's failure-domain anti-affinity.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HostPoolDeviceRow {
+    pub host_id: String,
+    pub pool: String,
+    pub device_id: String,
+    pub total_bytes: i64,
+    pub free_bytes: i64,
+    pub physical: String,
+    pub physical_reason: String,
+}
+
+impl HostPoolDeviceRow {
+    pub fn is_ready(&self) -> bool {
+        self.physical == "Ready"
+    }
+}
+
+/// Operator-driven scheduling state for one device. Absence of a row
+/// is `enabled` (default).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DeviceSchedulingStateRow {
+    pub host_id: String,
+    pub pool: String,
+    pub device_id: String,
+    pub state: String,
+    pub reason: Option<String>,
+}
+
+/// One REPLICATED assignment row, projected to the columns the
+/// scheduler's failure-domain check reads. Returning the full row
+/// would carry size/state/etc the scheduler doesn't use.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HostReplicatedAssignmentRow {
+    pub pool: String,
+    pub device_id: String,
+    pub cluster_id: String,
+}
+
+/// One grouped row from `pool_disk_assignment` — every label tuple
+/// the metrics path emits. Querying through this struct keeps the SQL
+/// grouping shape in `db.rs`; the metrics path stays free of `sqlx`
+/// detail.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PoolReservationCount {
+    pub host_id: String,
+    pub pool: String,
+    pub device_id: String,
+    pub cluster_id: String,
+    pub purpose: String,
+    pub state: String,
+    pub count: i64,
+}
+
+/// One grouped row from `pending_command` — outbox depth by host and
+/// state.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PendingCommandCount {
+    pub host_id: String,
+    pub state: String,
+    pub count: i64,
+}
+
+impl Db {
+    /// Every data pool live on a host, with its label set + capacity.
+    pub async fn list_host_pools(&self, host_id: &str) -> Result<Vec<HostPoolRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, HostPoolRow>("SELECT * FROM host_pools WHERE host_id = ?")
+                .bind(host_id)
+                .fetch_all(&self.reader)
+                .await?,
+        )
+    }
+
+    /// Every data pool across every host. Used by `basisctl pool list`
+    /// without `--host`.
+    pub async fn list_all_host_pools(&self) -> Result<Vec<HostPoolRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, HostPoolRow>("SELECT * FROM host_pools ORDER BY host_id, pool")
+                .fetch_all(&self.reader)
+                .await?,
+        )
+    }
+
+    /// Live reservation counts grouped by every metric label so the
+    /// metrics refresh path doesn't reach into the pool directly.
+    /// One source of truth for the aggregation shape.
+    pub async fn pool_reservation_counts(
+        &self,
+    ) -> Result<Vec<PoolReservationCount>, DbError> {
+        Ok(sqlx::query_as::<_, PoolReservationCount>(
+            "SELECT host_id, pool, device_id, cluster_id, purpose, state, \
+                    COUNT(*) AS count \
+             FROM pool_disk_assignment \
+             GROUP BY host_id, pool, device_id, cluster_id, purpose, state",
+        )
+        .fetch_all(&self.reader)
+        .await?)
+    }
+
+    /// Outbox depth grouped by host + state.
+    pub async fn pending_command_counts(
+        &self,
+    ) -> Result<Vec<PendingCommandCount>, DbError> {
+        Ok(sqlx::query_as::<_, PendingCommandCount>(
+            "SELECT host_id, state, COUNT(*) AS count \
+             FROM pending_command GROUP BY host_id, state",
+        )
+        .fetch_all(&self.reader)
+        .await?)
+    }
+
+    /// All reservations on `(host, pool, device)` grouped by cluster.
+    /// Surfaced in `PoolStatus.devices[].reservations` for audit.
+    pub async fn cluster_counts_on_device(
+        &self,
+        host_id: &str,
+        pool: &str,
+        device_id: &str,
+    ) -> Result<Vec<(String, i64)>, DbError> {
+        Ok(sqlx::query_as::<_, (String, i64)>(
+            "SELECT cluster_id, COUNT(*) FROM pool_disk_assignment \
+             WHERE host_id = ? AND pool = ? AND device_id = ? \
+             GROUP BY cluster_id ORDER BY cluster_id",
+        )
+        .bind(host_id)
+        .bind(pool)
+        .bind(device_id)
+        .fetch_all(&self.reader)
+        .await?)
+    }
+
+    /// Every device of one (host, pool). Ordered by `device_id` so the
+    /// scheduler's deterministic tie-break (lowest-id) is stable across
+    /// invocations.
+    pub async fn list_pool_devices(
+        &self,
+        host_id: &str,
+        pool: &str,
+    ) -> Result<Vec<HostPoolDeviceRow>, DbError> {
+        Ok(sqlx::query_as::<_, HostPoolDeviceRow>(
+            "SELECT * FROM host_pool_devices \
+             WHERE host_id = ? AND pool = ? ORDER BY device_id",
+        )
+        .bind(host_id)
+        .bind(pool)
+        .fetch_all(&self.reader)
+        .await?)
+    }
+
+    /// One-shot snapshot of every device's scheduling state, scoped
+    /// per host. Absence == `enabled`. Returned as a map for cheap
+    /// lookup during scheduling.
+    pub async fn host_drain_markers(
+        &self,
+        host_id: &str,
+    ) -> Result<std::collections::HashMap<(String, String), DeviceSchedulingStateRow>, DbError>
+    {
+        let rows: Vec<DeviceSchedulingStateRow> = sqlx::query_as(
+            "SELECT * FROM device_scheduling_state WHERE host_id = ?",
+        )
+        .bind(host_id)
+        .fetch_all(&self.reader)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ((r.pool.clone(), r.device_id.clone()), r))
+            .collect())
+    }
+
+    /// Set or clear a drain marker. `state` must be one of `enabled`
+    /// or `draining`; `enabled` removes the row (absence is the
+    /// default), `draining` upserts it. Single mutation site so the
+    /// vocabulary lives in exactly one place.
+    pub async fn set_device_scheduling_state(
+        &self,
+        host_id: &str,
+        pool: &str,
+        device_id: &str,
+        state: &str,
+        reason: Option<&str>,
+    ) -> Result<(), DbError> {
+        let now = basis_common::time::now_rfc3339();
+        match state {
+            "enabled" => {
+                sqlx::query(
+                    "DELETE FROM device_scheduling_state \
+                     WHERE host_id = ? AND pool = ? AND device_id = ?",
+                )
+                .bind(host_id)
+                .bind(pool)
+                .bind(device_id)
+                .execute(&self.writer)
+                .await?;
+            }
+            "disabled" => {
+                sqlx::query(
+                    "INSERT INTO device_scheduling_state \
+                     (host_id, pool, device_id, state, reason, updated_at) \
+                     VALUES (?, ?, ?, 'draining', ?, ?) \
+                     ON CONFLICT(host_id, pool, device_id) DO UPDATE SET \
+                     state = excluded.state, reason = excluded.reason, \
+                     updated_at = excluded.updated_at",
+                )
+                .bind(host_id)
+                .bind(pool)
+                .bind(device_id)
+                .bind(reason)
+                .bind(&now)
+                .execute(&self.writer)
+                .await?;
+            }
+            other => {
+                return Err(DbError::Malformed(format!(
+                    "invalid scheduling state {other:?}; expected enabled|disabled"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every REPLICATED `pool_disk_assignment` row on a host. The
+    /// scheduler builds same-cluster failure-domain occupancy from
+    /// these rows.
+    pub async fn list_host_replicated_assignments(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<HostReplicatedAssignmentRow>, DbError> {
+        Ok(sqlx::query_as::<_, HostReplicatedAssignmentRow>(
+            "SELECT pool, device_id, cluster_id FROM pool_disk_assignment \
+             WHERE host_id = ? AND purpose = 'replicated'",
+        )
+        .bind(host_id)
+        .fetch_all(&self.reader)
+        .await?)
+    }
+
+    /// Number of OSD assignments already on a `(cluster, host, device)`
+    /// — the failure-domain anti-affinity probe. Returns 0 for
+    /// non-OSD purposes (no anti-affinity applies).
+    pub async fn replicated_assignments_on_device(
+        &self,
+        cluster_id: &str,
+        host_id: &str,
+        device_id: &str,
+    ) -> Result<i64, DbError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pool_disk_assignment \
+             WHERE cluster_id = ? AND host_id = ? AND device_id = ? AND purpose = 'replicated'",
+        )
+        .bind(cluster_id)
+        .bind(host_id)
+        .bind(device_id)
+        .fetch_one(&self.reader)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Number of distinct OSDs already on a `(cluster, host)` — used
+    /// by the host-spread rank step. Counts matching rows; one
+    /// assignment per disk so this is also the OSD count.
+    pub async fn replicated_assignments_on_host(
+        &self,
+        cluster_id: &str,
+        host_id: &str,
+    ) -> Result<i64, DbError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pool_disk_assignment \
+             WHERE cluster_id = ? AND host_id = ? AND purpose = 'replicated'",
+        )
+        .bind(cluster_id)
+        .bind(host_id)
+        .fetch_one(&self.reader)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Insert a `pool_disk_assignment` row in `pending` state. Called
+    /// inside the same transaction that inserts the VM, so a
+    /// scheduler-side reservation is committed atomically with the
+    /// VM record. The agent flips the row to `committed` via
+    /// [`Self::commit_disk_assignment`] once the disk is `Ready`.
+    pub async fn reserve_disk_assignment(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        assignment_id: &str,
+        host_id: &str,
+        pool: &str,
+        device_id: &str,
+        vm_id: &str,
+        disk_index: u32,
+        cluster_id: &str,
+        purpose: &str,
+        min_size_gib: u64,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO pool_disk_assignment \
+             (assignment_id, host_id, pool, device_id, vm_id, disk_index, \
+              cluster_id, purpose, min_size_gib, actual_size_gib, state) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending')",
+        )
+        .bind(assignment_id)
+        .bind(host_id)
+        .bind(pool)
+        .bind(device_id)
+        .bind(vm_id)
+        .bind(disk_index as i64)
+        .bind(cluster_id)
+        .bind(purpose)
+        .bind(min_size_gib as i64)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Release every assignment for a VM. Called on VM delete so the
+    /// `pool_disk_assignment` rows don't outlive the workload.
+    pub async fn release_disk_assignments(&self, vm_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM pool_disk_assignment WHERE vm_id = ?")
+            .bind(vm_id)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
+    /// Enqueue a controller→agent command in the outbox. The payload
+    /// is a prost-encoded [`basis_proto::ControllerCommand`]; it
+    /// outlives the in-memory `agent.command_tx` channel so a
+    /// controller crash mid-send can reissue the same logical command
+    /// and the agent's idempotency check (by `assignment_id` /
+    /// `vm_id`) recognizes the retry.
+    pub async fn enqueue_pending_command(
+        &self,
+        host_id: &str,
+        vm_id: &str,
+        payload: &[u8],
+    ) -> Result<i64, DbError> {
+        let now = basis_common::time::now_rfc3339();
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO pending_command (host_id, vm_id, payload, state, created_at, updated_at) \
+             VALUES (?, ?, ?, 'pending', ?, ?) RETURNING id",
+        )
+        .bind(host_id)
+        .bind(vm_id)
+        .bind(payload)
+        .bind(&now)
+        .bind(&now)
+        .fetch_one(&self.writer)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// FIFO-ordered drain of every `pending` command for a host. The
+    /// dispatcher flips each row to `sent` via [`Self::mark_command_sent`]
+    /// after the network write succeeds.
+    pub async fn list_pending_commands(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<(i64, Vec<u8>)>, DbError> {
+        Ok(sqlx::query_as::<_, (i64, Vec<u8>)>(
+            "SELECT id, payload FROM pending_command \
+             WHERE host_id = ? AND state = 'pending' ORDER BY id ASC",
+        )
+        .bind(host_id)
+        .fetch_all(&self.reader)
+        .await?)
+    }
+
+    /// Flip an outbox row to `sent`. Called once the agent stream
+    /// accepted the payload — not once the agent acked.
+    pub async fn mark_command_sent(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE pending_command SET state = 'sent', updated_at = ? WHERE id = ?",
+        )
+        .bind(basis_common::time::now_rfc3339())
+        .bind(id)
+        .execute(&self.writer)
+        .await?;
+        Ok(())
+    }
+
+    /// Acknowledged: drop every outbox row for the VM. Called from
+    /// the agent's terminal ack path (`Running`/`Failed` for a
+    /// CreateVm; tombstone ack for a teardown). Idempotent.
+    pub async fn ack_pending_commands_for_vm(&self, vm_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM pending_command WHERE vm_id = ?")
+            .bind(vm_id)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
+    /// Commit an agent-reported disk assignment to durable state.
+    /// Updates both `pool_disk_assignment.state=committed` and the
+    /// owning `VmRow.storage_disks` JSON entry's `actual_size_gib` /
+    /// `device_path`. Idempotent — the agent re-reports the same
+    /// assignment on stream reconnect after restart.
+    ///
+    /// Both writes happen in one transaction so a crash mid-commit
+    /// leaves both fields stale together (and the next agent
+    /// re-report fixes both at once) rather than half-applied.
+    pub async fn commit_disk_assignment(
+        &self,
+        host_id: &str,
+        assignment: &basis_proto::DiskAssignment,
+    ) -> Result<(), DbError> {
+        let mut tx = self.writer.begin().await?;
+
+        sqlx::query(
+            "UPDATE pool_disk_assignment \
+             SET state = 'committed', actual_size_gib = ? \
+             WHERE assignment_id = ? AND host_id = ?",
+        )
+        .bind(assignment.actual_size_gib as i64)
+        .bind(&assignment.assignment_id)
+        .bind(host_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Patch the matching disk_index entry in the VmRow's JSON.
+        // sqlite's `json_replace` mutates one entry by JSON path —
+        // single-statement update keeps the row write atomic.
+        let path_actual = format!("$[{}].actual_size_gib", assignment.disk_index);
+        let path_dev = format!("$[{}].device_path", assignment.disk_index);
+        let path_assignment = format!("$[{}].assignment_id", assignment.disk_index);
+        let path_pool = format!("$[{}].pool", assignment.disk_index);
+        let path_device_id = format!("$[{}].device_id", assignment.disk_index);
+        sqlx::query(
+            "UPDATE vms \
+             SET storage_disks = json_set(storage_disks, \
+                                          ?, ?, \
+                                          ?, ?, \
+                                          ?, ?, \
+                                          ?, ?, \
+                                          ?, ?) \
+             WHERE id = ?",
+        )
+        .bind(&path_actual)
+        .bind(assignment.actual_size_gib as i64)
+        .bind(&path_dev)
+        .bind(&assignment.device_path)
+        .bind(&path_assignment)
+        .bind(&assignment.assignment_id)
+        .bind(&path_pool)
+        .bind(&assignment.pool)
+        .bind(&path_device_id)
+        .bind(&assignment.device_id)
+        .bind(&assignment.vm_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct HostRow {
@@ -1822,29 +2530,93 @@ pub struct VmRow {
     pub state: i64,
     pub cpu: i64,
     pub memory_mib: i64,
-    /// Rootfs LV size in GiB. The data-disk footprint is the sum of
-    /// [`Self::extra_disk_gibs`].
+    /// Rootfs LV size in GiB. Data-disk footprint is the sum of
+    /// [`Self::storage_disks`] entries.
     pub disk_gib: i64,
-    /// Per-extra-disk sizes, JSON-encoded `Vec<u32>` of gibibytes.
-    /// Authoritative source of per-disk breakdown; the host-usage
-    /// rollup sums via `json_each` so there's no denormalised total
-    /// to drift from this.
-    pub extra_disk_gibs: String,
+    /// Per-disk request + assignment, JSON-encoded `Vec<StoredDisk>`
+    /// (see [`StoredDisk`]). Carries the controller-allocated
+    /// `assignment_id`, the resolved (pool, device_id), the requested
+    /// `min_size_gib`, and the agent-acked `actual_size_gib` once the
+    /// disk is `Ready`. One source of truth for per-VM storage state.
+    pub storage_disks: String,
     pub image: String,
     pub error_message: String,
     pub created_at: String,
     pub updated_at: String,
 }
 
+/// One per-disk entry persisted on a `VmRow`. The shape is wide
+/// enough to cover the request (`min_size_gib`, `purpose`), the
+/// scheduler's resolution (`pool`, `device_id`, `assignment_id`), and
+/// the agent's eventual ack (`actual_size_gib`, `device_path`). All
+/// three states co-exist on one row; an `Option` indicates the field
+/// hasn't been populated yet.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredDisk {
+    pub disk_index: u32,
+    pub min_size_gib: u64,
+    /// String form of `DiskPurpose` proto enum. `"replicated"` |
+    /// `"generic-data"`. Stored as a string for human readability and
+    /// because the SQLite column is text-typed for GROUP BY queries.
+    pub purpose: String,
+    /// Set once the scheduler resolves the disk's selector to a pool.
+    /// `None` for the brief window between row insert and scheduler
+    /// commit (which happens in the same DB transaction).
+    pub pool: Option<String>,
+    /// Set once the scheduler picks a specific device within the pool.
+    pub device_id: Option<String>,
+    /// Set when the assignment is committed to `pool_disk_assignment`.
+    pub assignment_id: Option<String>,
+    /// Agent-reported actual size after allocate. Equals
+    /// `min_size_gib` for `lvm-linear`, may exceed it for `raw-disk`
+    /// (whole device) and `nvme-namespace` (rounded to controller
+    /// granularity).
+    pub actual_size_gib: Option<u64>,
+    /// Block device path the backend allocated. Surfaced to operators
+    /// via `basisctl get machine` for incident diagnosis.
+    pub device_path: Option<String>,
+}
+
 impl VmRow {
-    pub fn extra_disks(&self) -> serde_json::Result<Vec<u32>> {
-        serde_json::from_str(&self.extra_disk_gibs)
+    pub fn parsed_storage_disks(&self) -> serde_json::Result<Vec<StoredDisk>> {
+        serde_json::from_str(&self.storage_disks)
     }
 
-    /// Sum of [`Self::extra_disk_gibs`], in GiB. Computed on demand;
+    /// Sum of `min_size_gib` across every disk. Computed on demand;
     /// no DB column duplicates this.
-    pub fn extra_disks_sum_gib(&self) -> serde_json::Result<i64> {
-        Ok(self.extra_disks()?.into_iter().map(|g| g as i64).sum())
+    pub fn storage_disks_sum_gib(&self) -> serde_json::Result<i64> {
+        Ok(self
+            .parsed_storage_disks()?
+            .into_iter()
+            .map(|d| d.min_size_gib as i64)
+            .sum())
+    }
+
+    /// Live disk assignments in `basis_proto::DiskAssignment` form for
+    /// `Machine.storage_disks` rendering. Disks the agent hasn't acked
+    /// yet (no `assignment_id`/`actual_size_gib`) are skipped — they
+    /// don't yet describe a real placement. Operators see the
+    /// scheduler's intent on the VmRow's stored entries via separate
+    /// `basisctl pool show` queries.
+    pub fn parsed_disk_assignments(&self) -> serde_json::Result<Vec<basis_proto::DiskAssignment>> {
+        Ok(self
+            .parsed_storage_disks()?
+            .into_iter()
+            .filter_map(|d| {
+                let assignment_id = d.assignment_id?;
+                let pool = d.pool?;
+                let device_id = d.device_id?;
+                Some(basis_proto::DiskAssignment {
+                    assignment_id,
+                    vm_id: self.id.clone(),
+                    disk_index: d.disk_index,
+                    pool,
+                    device_id,
+                    actual_size_gib: d.actual_size_gib.unwrap_or(d.min_size_gib),
+                    device_path: d.device_path.unwrap_or_default(),
+                })
+            })
+            .collect())
     }
 }
 
@@ -2192,7 +2964,7 @@ mod tests {
             cpu: 4,
             memory_mib: 8192,
             disk_gib: 100,
-            extra_disk_gibs: "[]".to_string(),
+            storage_disks: "[]".to_string(),
             image: "test:latest".to_string(),
             error_message: String::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2332,7 +3104,7 @@ mod tests {
 
         let ip = db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
         let vm_ip = db.allocate_cluster_vm_ip(&cluster, "v1").await.unwrap();
-        db.insert_vm(&make_vm("v1", "h1", "c1", &vm_ip), &[])
+        db.insert_vm(&make_vm("v1", "h1", "c1", &vm_ip), &[], &[])
             .await
             .unwrap();
 
@@ -2380,7 +3152,7 @@ mod tests {
         // First VM lands → row ACTIVE.
         let original_ip = db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
         let vm1_ip = db.allocate_cluster_vm_ip(&cluster, "v1").await.unwrap();
-        db.insert_vm(&make_vm("v1", "h1", "c1", &vm1_ip), &[])
+        db.insert_vm(&make_vm("v1", "h1", "c1", &vm1_ip), &[], &[])
             .await
             .unwrap();
 
@@ -2483,7 +3255,7 @@ mod tests {
         // Each host transitions to ACTIVE for the cluster on first
         // VM placement — that's when it joins the BUM destination set.
         let vm_ip_1 = db.allocate_cluster_vm_ip(&cluster, "v1").await.unwrap();
-        db.insert_vm(&make_vm("v1", "h1", "c1", &vm_ip_1), &[])
+        db.insert_vm(&make_vm("v1", "h1", "c1", &vm_ip_1), &[], &[])
             .await
             .unwrap();
         db.ensure_host_cluster_active(&cluster, "h1").await.unwrap();
@@ -2493,7 +3265,7 @@ mod tests {
         );
 
         let vm_ip_2 = db.allocate_cluster_vm_ip(&cluster, "v2").await.unwrap();
-        db.insert_vm(&make_vm("v2", "h2", "c1", &vm_ip_2), &[])
+        db.insert_vm(&make_vm("v2", "h2", "c1", &vm_ip_2), &[], &[])
             .await
             .unwrap();
         db.ensure_host_cluster_active(&cluster, "h2").await.unwrap();
@@ -2543,13 +3315,13 @@ mod tests {
 
         let mut v1 = make_vm("v1", "h1", "c1", "10.0.0.9");
         v1.cpu = 10;
-        db.insert_vm(&v1, &[]).await.unwrap();
+        db.insert_vm(&v1, &[], &[]).await.unwrap();
 
         // Host has 16 cpu, 10 in use → 6 free. A second 10-cpu VM
         // can't fit; the commit-time gate must reject it.
         let mut v2 = make_vm("v2", "h1", "c1", "10.0.0.10");
         v2.cpu = 10;
-        match db.insert_vm(&v2, &[]).await {
+        match db.insert_vm(&v2, &[], &[]).await {
             Err(DbError::CapacityRaced(h)) => assert_eq!(h, "h1"),
             other => panic!("expected CapacityRaced, got {other:?}"),
         }
@@ -2576,12 +3348,12 @@ mod tests {
             nvlink_group: 1,
         };
 
-        db.insert_vm(&make_vm("v1", "h1", "c1", "10.0.0.9"), &[gpu("v1")])
+        db.insert_vm(&make_vm("v1", "h1", "c1", "10.0.0.9"), &[gpu("v1")], &[])
             .await
             .unwrap();
 
         match db
-            .insert_vm(&make_vm("v2", "h1", "c1", "10.0.0.10"), &[gpu("v2")])
+            .insert_vm(&make_vm("v2", "h1", "c1", "10.0.0.10"), &[gpu("v2")], &[])
             .await
         {
             Err(DbError::CapacityRaced(h)) => assert_eq!(h, "h1"),
@@ -2608,7 +3380,7 @@ mod tests {
         db.mark_host_unhealthy("h1").await.unwrap();
 
         let vm = make_vm("v1", "h1", "c1", "10.0.0.9");
-        match db.insert_vm(&vm, &[]).await {
+        match db.insert_vm(&vm, &[], &[]).await {
             Err(DbError::HostUnavailable(h)) => assert_eq!(h, "h1"),
             other => panic!("expected HostUnavailable, got {other:?}"),
         }
@@ -2630,7 +3402,7 @@ mod tests {
             iommu_group: "12".to_string(),
             nvlink_group: 1,
         };
-        db.insert_vm(&make_vm("v1", "h1", "c1", "10.0.0.9"), &[gpu])
+        db.insert_vm(&make_vm("v1", "h1", "c1", "10.0.0.9"), &[gpu], &[])
             .await
             .unwrap();
         // Ack-driven teardown drops the vm row + cascades vm_gpus
@@ -2651,7 +3423,7 @@ mod tests {
             iommu_group: "12".to_string(),
             nvlink_group: 1,
         };
-        db.insert_vm(&make_vm("v2", "h1", "c1", "10.0.0.10"), &[gpu2])
+        db.insert_vm(&make_vm("v2", "h1", "c1", "10.0.0.10"), &[gpu2], &[])
             .await
             .unwrap();
     }
@@ -2668,8 +3440,30 @@ mod tests {
         v1.cpu = 4;
         v1.memory_mib = 8192;
         v1.disk_gib = 100;
-        v1.extra_disk_gibs = "[30, 20]".to_string();
-        db.insert_vm(&v1, &[]).await.unwrap();
+        v1.storage_disks = serde_json::to_string(&vec![
+            StoredDisk {
+                disk_index: 0,
+                min_size_gib: 30,
+                purpose: "generic-data".into(),
+                pool: None,
+                device_id: None,
+                assignment_id: None,
+                actual_size_gib: None,
+                device_path: None,
+            },
+            StoredDisk {
+                disk_index: 1,
+                min_size_gib: 20,
+                purpose: "generic-data".into(),
+                pool: None,
+                device_id: None,
+                assignment_id: None,
+                actual_size_gib: None,
+                device_path: None,
+            },
+        ])
+        .unwrap();
+        db.insert_vm(&v1, &[], &[]).await.unwrap();
 
         let snapshot = db.host_usage_snapshot().await.unwrap();
         let u = snapshot.get("h1").expect("host in snapshot");
@@ -2678,7 +3472,7 @@ mod tests {
         assert_eq!(u.used_rootfs_gib, 100, "rootfs usage = vms.disk_gib only");
         assert_eq!(
             u.used_data_gib, 50,
-            "data usage = sum of extras (json_each over extra_disk_gibs)"
+            "data usage = sum of storage_disks min_size_gib via json_each"
         );
         assert!(u.assigned_pci.is_empty());
         assert_eq!(

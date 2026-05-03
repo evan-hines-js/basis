@@ -280,18 +280,6 @@ spec:
                         format: uint32
                         minimum: 0.0
                         type: integer
-                      extraDiskGibs:
-                        description: |-
-                          Raw data disks (GiB each) to attach alongside the rootfs. Basis
-                          hands them to the guest unformatted; an in-cluster CSI driver
-                          (Rook, Longhorn, Mayastor, OpenEBS LocalPV, …) claims and
-                          manages them. Order is stable; the N'th entry becomes
-                          `/dev/vd{c,d,...}` in the guest.
-                        items:
-                          format: uint32
-                          minimum: 0.0
-                          type: integer
-                        type: array
                       gpuConstraints:
                         nullable: true
                         properties:
@@ -314,10 +302,10 @@ spec:
                         type: integer
                       placement:
                         description: |-
-                          Optional placement constraints. `requires` is a hard filter
-                          (CreateMachine fails if no host matches); `prefers` is a soft
-                          score added to the scheduler's tiebreak. Default empty: pick
-                          any host that fits, same as today.
+                          Optional **host** placement (against host labels). `requires`
+                          is a hard filter (CreateMachine fails if no host matches);
+                          `prefers` is a soft score. Per-disk pool placement lives on
+                          each `storageDisks[].selector`.
                         properties:
                           prefers:
                             items:
@@ -357,6 +345,70 @@ spec:
                           is `providerID` (not `providerId`) to match the CAPI contract.
                         nullable: true
                         type: string
+                      storageDisks:
+                        description: |-
+                          Per-disk storage requests. Each disk picks a pool by label
+                          selector and declares its workload `purpose` (`rookOsd`
+                          activates hierarchical same-cluster anti-affinity;
+                          `genericData` skips it). Order is stable; the N'th entry
+                          becomes `/dev/vd{c,d,...}` in the guest. Basis hands them
+                          unformatted; an in-cluster CSI driver (Rook, Longhorn,
+                          Mayastor, OpenEBS LocalPV, …) claims and manages them.
+                        items:
+                          description: One requested data disk on a `BasisMachine`.
+                          properties:
+                            minSizeGib:
+                              format: uint64
+                              minimum: 0.0
+                              type: integer
+                            purpose:
+                              description: |-
+                                Workload role. `rookOsd` activates hierarchical same-cluster
+                                anti-affinity. `genericData` doesn't.
+                              enum:
+                              - genericData
+                              - replicated
+                              type: string
+                            selector:
+                              description: Pool label selector. Empty = match any pool with capacity.
+                              properties:
+                                prefers:
+                                  items:
+                                    properties:
+                                      key:
+                                        type: string
+                                      value:
+                                        type: string
+                                      weight:
+                                        default: 0
+                                        format: uint32
+                                        minimum: 0.0
+                                        type: integer
+                                    required:
+                                    - key
+                                    - value
+                                    type: object
+                                  type: array
+                                requires:
+                                  items:
+                                    properties:
+                                      key:
+                                        type: string
+                                      values:
+                                        items:
+                                          type: string
+                                        type: array
+                                    required:
+                                    - key
+                                    - values
+                                    type: object
+                                  type: array
+                              type: object
+                          required:
+                          - minSizeGib
+                          - purpose
+                          type: object
+                        type: array
                     required:
                     - cpu
                     - diskGib
@@ -423,18 +475,6 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
-              extraDiskGibs:
-                description: |-
-                  Raw data disks (GiB each) to attach alongside the rootfs. Basis
-                  hands them to the guest unformatted; an in-cluster CSI driver
-                  (Rook, Longhorn, Mayastor, OpenEBS LocalPV, …) claims and
-                  manages them. Order is stable; the N'th entry becomes
-                  `/dev/vd{c,d,...}` in the guest.
-                items:
-                  format: uint32
-                  minimum: 0.0
-                  type: integer
-                type: array
               gpuConstraints:
                 nullable: true
                 properties:
@@ -457,10 +497,10 @@ spec:
                 type: integer
               placement:
                 description: |-
-                  Optional placement constraints. `requires` is a hard filter
-                  (CreateMachine fails if no host matches); `prefers` is a soft
-                  score added to the scheduler's tiebreak. Default empty: pick
-                  any host that fits, same as today.
+                  Optional **host** placement (against host labels). `requires`
+                  is a hard filter (CreateMachine fails if no host matches);
+                  `prefers` is a soft score. Per-disk pool placement lives on
+                  each `storageDisks[].selector`.
                 properties:
                   prefers:
                     items:
@@ -500,6 +540,70 @@ spec:
                   is `providerID` (not `providerId`) to match the CAPI contract.
                 nullable: true
                 type: string
+              storageDisks:
+                description: |-
+                  Per-disk storage requests. Each disk picks a pool by label
+                  selector and declares its workload `purpose` (`rookOsd`
+                  activates hierarchical same-cluster anti-affinity;
+                  `genericData` skips it). Order is stable; the N'th entry
+                  becomes `/dev/vd{c,d,...}` in the guest. Basis hands them
+                  unformatted; an in-cluster CSI driver (Rook, Longhorn,
+                  Mayastor, OpenEBS LocalPV, …) claims and manages them.
+                items:
+                  description: One requested data disk on a `BasisMachine`.
+                  properties:
+                    minSizeGib:
+                      format: uint64
+                      minimum: 0.0
+                      type: integer
+                    purpose:
+                      description: |-
+                        Workload role. `rookOsd` activates hierarchical same-cluster
+                        anti-affinity. `genericData` doesn't.
+                      enum:
+                      - genericData
+                      - replicated
+                      type: string
+                    selector:
+                      description: Pool label selector. Empty = match any pool with capacity.
+                      properties:
+                        prefers:
+                          items:
+                            properties:
+                              key:
+                                type: string
+                              value:
+                                type: string
+                              weight:
+                                default: 0
+                                format: uint32
+                                minimum: 0.0
+                                type: integer
+                            required:
+                            - key
+                            - value
+                            type: object
+                          type: array
+                        requires:
+                          items:
+                            properties:
+                              key:
+                                type: string
+                              values:
+                                items:
+                                  type: string
+                                type: array
+                            required:
+                            - key
+                            - values
+                            type: object
+                          type: array
+                      type: object
+                  required:
+                  - minSizeGib
+                  - purpose
+                  type: object
+                type: array
             required:
             - cpu
             - diskGib

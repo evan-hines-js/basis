@@ -55,32 +55,61 @@ basis_lvm_chunk_size: 256K
 # where previously-freed data must not leak across VMs.
 basis_lvm_zero_allocation: false
 
-# Block devices (or file-backed loopbacks) that compose the basis-data
-# VG — the plain VG that holds VM extra-disk LVs (raw block exposed to
-# the guest for in-cluster CSI drivers: Rook OSDs, Longhorn replicas,
-# Mayastor pools, OpenEBS LocalPV, …). Kept distinct from the rootfs
+# Storage pools the agent exposes to the controller. Each pool is a
+# labeled grouping of physical devices the scheduler can pick from
+# when placing per-VM data disks (raw block exposed to the guest for
+# in-cluster CSI drivers: Rook OSDs, Longhorn replicas, Mayastor
+# pools, OpenEBS LocalPV, …).
+#
+# The pool is the operator abstraction; the device is the failure
+# domain. The scheduler matches per-disk label selectors against
+# `labels`, then picks among the pool's devices to spread replicas
+# across drives.
+#
+# One VG per device by design — basis-prereqs runs `pvcreate` +
+# `vgcreate` per entry, so an LV cannot span devices and the failure-
+# domain guarantee is a property of the layout, not a runtime
+# constraint.
+#
+# Each device's `id` is the stable `/dev/disk/by-id/...` basename;
+# `vg` is the VG basis-prereqs creates on it. `device` is the actual
+# block device path used for pvcreate (resolved by basis-prereqs from
+# `id`'s by-id symlink, or written explicitly when using a loopback).
+#
+# Empty list is legal — a worker host that doesn't carry storage
+# workloads doesn't need any pools. Kept distinct from the rootfs
 # thin pool because bluestore-style consumers on dm-thin double-book
 # allocation, fragment I/O, break TRIM passthrough, and share a blast
-# radius with VM rootfs. See crates/basis-agent/src/lvm.rs and
-# docs/storage-pools.md.
+# radius with VM rootfs.
 #
-# Each entry is either:
-#   * a string path to a real block device (production):
-#       /dev/nvme1n1
-#   * a {file, size} dict — basis-prereqs truncates the file, binds it
-#     via losetup, and installs a systemd unit that re-binds on reboot:
-#       { file: /var/lib/basis/basis-data.img, size: 200G }
+# Example (homelab, two enterprise SSDs in one bulk pool):
+#   basis_storage_pools:
+#     - name: bulk
+#       backend: lvm-linear
+#       labels: { tier: bulk, medium: sata }
+#       devices:
+#         - id: ata-INTEL_SSDSC2BX800G4_aaaa
+#           device: /dev/disk/by-id/ata-INTEL_SSDSC2BX800G4_aaaa
+#           vg: basis-bulk-aaaa
+#           sizeGib: 745
+#         - id: ata-INTEL_SSDSC2BX800G4_bbbb
+#           device: /dev/disk/by-id/ata-INTEL_SSDSC2BX800G4_bbbb
+#           vg: basis-bulk-bbbb
+#           sizeGib: 745
 #
-# Production inventories list dedicated NVMes / partitions. E2E /
-# CI inventories on shared hardware list a file-backed loopback so the
-# dual-pool architecture is honored without dedicating physical disks.
-# Mixing forms in one list is allowed but unusual.
-#
-# Empty list fails the role at apply time. The agent refuses to start
-# without basis-data and that's intentional — there is no silent
-# fallback to the rootfs pool.
-basis_lvm_data_devices: []  # REQUIRED, see comment above
-basis_lvm_data_vg: basis-data
+# Loopback for E2E / CI on shared hardware (file-backed device):
+#   basis_storage_pools:
+#     - name: bulk
+#       backend: lvm-linear
+#       labels: { tier: bulk }
+#       devices:
+#         - id: basis-bulk-loop0
+#           loopback:
+#             file: /var/lib/basis/basis-bulk.img
+#             size: 200G
+#           vg: basis-bulk-loop0
+#           sizeGib: 200
+basis_storage_pools: []
 
 # Controller bind + well-known server SAN. `basis_controller_san` must
 # match the SAN we put on the controller's server cert AND the value the

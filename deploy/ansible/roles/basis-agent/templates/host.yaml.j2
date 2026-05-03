@@ -16,8 +16,25 @@ spec:
     rootfs:
       vg: {{ basis_lvm_vg }}
       thinPool: {{ basis_lvm_thinpool }}
-    data:
-      vg: {{ basis_lvm_data_vg }}
+{% if basis_storage_pools %}
+    pools:
+{% for pool in basis_storage_pools %}
+      - name: {{ pool.name }}
+        backend: {{ pool.backend | default('lvm-linear') }}
+{% if pool.labels %}
+        labels:
+{% for k, v in (pool.labels | dictsort) %}
+          {{ k }}: {{ v }}
+{% endfor %}
+{% endif %}
+        devices:
+{% for d in pool.devices %}
+          - id: {{ d.id }}
+            vg: {{ d.vg }}
+            sizeGib: {{ d.sizeGib }}
+{% endfor %}
+{% endfor %}
+{% endif %}
   tls:
     cert: {{ basis_tls_dir }}/agent.crt
     key: {{ basis_tls_dir }}/agent.key

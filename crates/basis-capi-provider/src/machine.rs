@@ -244,8 +244,17 @@ async fn apply(
                 .gpu_constraints
                 .as_ref()
                 .map(|c| c.min_group_size),
-            extra_disk_gibs: machine.spec.extra_disk_gibs.clone(),
-            placement: placement_spec_to_proto(&machine.spec.placement),
+            storage_disks: machine
+                .spec
+                .storage_disks
+                .iter()
+                .map(|d| basis_proto::StorageDisk {
+                    min_size_gib: d.min_size_gib,
+                    selector: label_selector_to_proto(&d.selector),
+                    purpose: d.purpose.as_proto() as i32,
+                })
+                .collect(),
+            placement: label_selector_to_proto(&machine.spec.placement),
         })
         .await?;
 
@@ -611,17 +620,16 @@ async fn find_bootstrap_secret(
         ))
 }
 
-/// Map the CRD's PlacementSpec to the proto sent to basis-controller.
-/// Returns `None` for an empty spec so the wire form stays minimal —
-/// the proto field is optional, and the server treats absent the same
-/// as both lists empty.
-fn placement_spec_to_proto(
-    spec: &crate::crds::PlacementSpec,
-) -> Option<basis_proto::PlacementSpec> {
+/// Map a CRD `LabelSelectorSpec` to the proto wire form. One
+/// converter for both host placement and per-disk pool placement —
+/// the wire `LabelSelector` is the same shape for both.
+fn label_selector_to_proto(
+    spec: &crate::crds::LabelSelectorSpec,
+) -> Option<basis_proto::LabelSelector> {
     if spec.requires.is_empty() && spec.prefers.is_empty() {
         return None;
     }
-    Some(basis_proto::PlacementSpec {
+    Some(basis_proto::LabelSelector {
         requires: spec
             .requires
             .iter()
