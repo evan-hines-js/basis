@@ -1511,11 +1511,7 @@ impl Db {
 
         for d in disks {
             let assignment_id = format!("{}-{}", vm.id, d.disk_index);
-            let purpose = match d.purpose {
-                basis_proto::DiskPurpose::Replicated => "replicated",
-                basis_proto::DiskPurpose::GenericData => "generic-data",
-                basis_proto::DiskPurpose::Unspecified => "unspecified",
-            };
+            let purpose = d.purpose.as_db_str();
             sqlx::query(
                 "INSERT INTO pool_disk_assignment \
                  (assignment_id, host_id, pool, device_id, vm_id, disk_index, \
@@ -1991,15 +1987,12 @@ impl StorageCapacityBytes {
 pub const GIB: i64 = 1 << 30;
 
 /// String form of `DevicePhysicalHealth` as stored in
-/// `host_pool_devices.physical`. Single conversion site so the column
-/// vocabulary doesn't drift between writer and reader queries.
+/// `host_pool_devices.physical`. Falls back to `Unspecified` for an
+/// unknown enum integer so a corrupted column never aborts a write.
 fn physical_health_str(p: i32) -> &'static str {
-    match basis_proto::DevicePhysicalHealth::try_from(p) {
-        Ok(basis_proto::DevicePhysicalHealth::DeviceHealthReady) => "Ready",
-        Ok(basis_proto::DevicePhysicalHealth::DeviceHealthDegraded) => "Degraded",
-        Ok(basis_proto::DevicePhysicalHealth::DeviceHealthMissing) => "Missing",
-        _ => "Unspecified",
-    }
+    basis_proto::DevicePhysicalHealth::try_from(p)
+        .unwrap_or(basis_proto::DevicePhysicalHealth::DeviceHealthUnspecified)
+        .as_db_str()
 }
 
 /// One row of `host_pools` — the per-pool view the scheduler reads
@@ -2110,9 +2103,7 @@ impl Db {
     /// Live reservation counts grouped by every metric label so the
     /// metrics refresh path doesn't reach into the pool directly.
     /// One source of truth for the aggregation shape.
-    pub async fn pool_reservation_counts(
-        &self,
-    ) -> Result<Vec<PoolReservationCount>, DbError> {
+    pub async fn pool_reservation_counts(&self) -> Result<Vec<PoolReservationCount>, DbError> {
         Ok(sqlx::query_as::<_, PoolReservationCount>(
             "SELECT host_id, pool, device_id, cluster_id, purpose, state, \
                     COUNT(*) AS count \
@@ -2124,9 +2115,7 @@ impl Db {
     }
 
     /// Outbox depth grouped by host + state.
-    pub async fn pending_command_counts(
-        &self,
-    ) -> Result<Vec<PendingCommandCount>, DbError> {
+    pub async fn pending_command_counts(&self) -> Result<Vec<PendingCommandCount>, DbError> {
         Ok(sqlx::query_as::<_, PendingCommandCount>(
             "SELECT host_id, state, COUNT(*) AS count \
              FROM pending_command GROUP BY host_id, state",
@@ -2181,12 +2170,11 @@ impl Db {
         host_id: &str,
     ) -> Result<std::collections::HashMap<(String, String), DeviceSchedulingStateRow>, DbError>
     {
-        let rows: Vec<DeviceSchedulingStateRow> = sqlx::query_as(
-            "SELECT * FROM device_scheduling_state WHERE host_id = ?",
-        )
-        .bind(host_id)
-        .fetch_all(&self.reader)
-        .await?;
+        let rows: Vec<DeviceSchedulingStateRow> =
+            sqlx::query_as("SELECT * FROM device_scheduling_state WHERE host_id = ?")
+                .bind(host_id)
+                .fetch_all(&self.reader)
+                .await?;
         Ok(rows
             .into_iter()
             .map(|r| ((r.pool.clone(), r.device_id.clone()), r))
@@ -2260,94 +2248,6 @@ impl Db {
         .await?)
     }
 
-    /// Number of OSD assignments already on a `(cluster, host, device)`
-    /// — the failure-domain anti-affinity probe. Returns 0 for
-    /// non-OSD purposes (no anti-affinity applies).
-    pub async fn replicated_assignments_on_device(
-        &self,
-        cluster_id: &str,
-        host_id: &str,
-        device_id: &str,
-    ) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM pool_disk_assignment \
-             WHERE cluster_id = ? AND host_id = ? AND device_id = ? AND purpose = 'replicated'",
-        )
-        .bind(cluster_id)
-        .bind(host_id)
-        .bind(device_id)
-        .fetch_one(&self.reader)
-        .await?;
-        Ok(row.0)
-    }
-
-    /// Number of distinct OSDs already on a `(cluster, host)` — used
-    /// by the host-spread rank step. Counts matching rows; one
-    /// assignment per disk so this is also the OSD count.
-    pub async fn replicated_assignments_on_host(
-        &self,
-        cluster_id: &str,
-        host_id: &str,
-    ) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM pool_disk_assignment \
-             WHERE cluster_id = ? AND host_id = ? AND purpose = 'replicated'",
-        )
-        .bind(cluster_id)
-        .bind(host_id)
-        .fetch_one(&self.reader)
-        .await?;
-        Ok(row.0)
-    }
-
-    /// Insert a `pool_disk_assignment` row in `pending` state. Called
-    /// inside the same transaction that inserts the VM, so a
-    /// scheduler-side reservation is committed atomically with the
-    /// VM record. The agent flips the row to `committed` via
-    /// [`Self::commit_disk_assignment`] once the disk is `Ready`.
-    pub async fn reserve_disk_assignment(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        assignment_id: &str,
-        host_id: &str,
-        pool: &str,
-        device_id: &str,
-        vm_id: &str,
-        disk_index: u32,
-        cluster_id: &str,
-        purpose: &str,
-        min_size_gib: u64,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO pool_disk_assignment \
-             (assignment_id, host_id, pool, device_id, vm_id, disk_index, \
-              cluster_id, purpose, min_size_gib, actual_size_gib, state) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending')",
-        )
-        .bind(assignment_id)
-        .bind(host_id)
-        .bind(pool)
-        .bind(device_id)
-        .bind(vm_id)
-        .bind(disk_index as i64)
-        .bind(cluster_id)
-        .bind(purpose)
-        .bind(min_size_gib as i64)
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
-    }
-
-    /// Release every assignment for a VM. Called on VM delete so the
-    /// `pool_disk_assignment` rows don't outlive the workload.
-    pub async fn release_disk_assignments(&self, vm_id: &str) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM pool_disk_assignment WHERE vm_id = ?")
-            .bind(vm_id)
-            .execute(&self.writer)
-            .await?;
-        Ok(())
-    }
-
     /// Enqueue a controller→agent command in the outbox. The payload
     /// is a prost-encoded [`basis_proto::ControllerCommand`]; it
     /// outlives the in-memory `agent.command_tx` channel so a
@@ -2394,13 +2294,11 @@ impl Db {
     /// Flip an outbox row to `sent`. Called once the agent stream
     /// accepted the payload — not once the agent acked.
     pub async fn mark_command_sent(&self, id: i64) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE pending_command SET state = 'sent', updated_at = ? WHERE id = ?",
-        )
-        .bind(basis_common::time::now_rfc3339())
-        .bind(id)
-        .execute(&self.writer)
-        .await?;
+        sqlx::query("UPDATE pending_command SET state = 'sent', updated_at = ? WHERE id = ?")
+            .bind(basis_common::time::now_rfc3339())
+            .bind(id)
+            .execute(&self.writer)
+            .await?;
         Ok(())
     }
 

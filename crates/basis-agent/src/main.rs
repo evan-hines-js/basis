@@ -505,11 +505,7 @@ fn storage_capacity_to_proto(c: &StorageCapacity) -> basis_proto::StorageCapacit
 fn pool_capacity_to_proto(p: &basis_agent::lvm::PoolCapacity) -> basis_proto::PoolCapacity {
     basis_proto::PoolCapacity {
         pool: p.pool.clone(),
-        backend: match p.backend {
-            basis_agent::config::PoolBackend::LvmLinear => "lvm-linear".into(),
-            basis_agent::config::PoolBackend::RawDisk => "raw-disk".into(),
-            basis_agent::config::PoolBackend::NvmeNamespace => "nvme-namespace".into(),
-        },
+        backend: p.backend.as_str().to_string(),
         labels: p
             .labels
             .iter()
@@ -892,17 +888,16 @@ async fn send_terminal_vm_state(
 
 fn spawn_create(cmd: CreateVmCommand, rt: TaskContext, sender: mpsc::Sender<AgentMessage>) {
     tokio::spawn(async move {
-        let result = handlers::create_vm(
-            &cmd,
-            rt.image_mgr.as_ref(),
-            &rt.vm_mgr,
-            rt.net_mgr.as_ref(),
-            &rt.agent_db,
-            rt.storage.as_ref(),
-            rt.metrics.as_ref(),
-            &sender,
-        )
-        .await;
+        let ctx = handlers::VmHandlerCtx {
+            image_mgr: rt.image_mgr.as_ref(),
+            vm_mgr: &rt.vm_mgr,
+            net_mgr: rt.net_mgr.as_ref(),
+            agent_db: &rt.agent_db,
+            storage: rt.storage.as_ref(),
+            metrics: rt.metrics.as_ref(),
+            sender: &sender,
+        };
+        let result = handlers::create_vm(&cmd, &ctx).await;
 
         let (state, err, transient) = match result {
             Ok(()) => (MachineState::Running, String::new(), false),

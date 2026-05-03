@@ -1,55 +1,49 @@
 ---
-# 10.0.0.97: PVE host.
+# poweredge-lg (10.0.0.97).
 #
-# Rootfs thin pool (basis VG): /dev/sdf — Crucial BX500 1TB SATA SSD
-# (consumer; no PLP; small SLC cache → throughput collapses to
-# 50–80 MB/s once the cache fills under sustained writes). Sits in
-# PVE's `data` VG but the storage.cfg pins that VG to a different
-# node — idle here, claimed by basis.
+# Rootfs thin pool (basis VG): /dev/sdf2 — Crucial BX500 1TB SATA SSD,
+# tail of the disk after a 500 GiB sdf1 carved out for PVE's `data`
+# thin pool (PBS / build VM / template). Consumer-grade, no PLP.
+# That's only acceptable because the homelab runs 1 CP replica
+# pinned to node-2 (PLP rootfs); workers landing here keep etcd off
+# the consumer disk. basis VG is created manually by
+# scripts/dev/storage-reorg-node1.sh; basis-prereqs materializes the
+# thin pool inside it.
 #
-# Data pools: one `bulk` pool with two devices (each gets its own
-# VG per the one-VG-per-device rule):
-#   * /dev/pve/basis-data — 120 GiB thick LV in the OS disk's `pve` VG,
-#     carved out of the freed extents after destroying the unused
-#     `pve-data` thinpool that PVE auto-provisioned but we never used.
-#   * /dev/sdb4 — ~261 GiB partition spanning the previously
-#     unallocated tail of sdb (sdb3 ends at ~185 GiB on a 447 GiB disk).
-# The four 200 GB SATA SSDs (sda/sdc/sdd/sde) host an active PVE
-# zpool (`ent-zfspool` with the build VM's root disks), so they stay
-# untouched.
-#
-# First-apply prep (run once on the host):
-#   vgremove -y data && wipefs -a /dev/sdf
-#   sed -i.bak '/^lvmthin: local-lvm$/,/^$/d' /etc/pve/storage.cfg
-#   lvremove -y pve/data
-#   lvcreate --yes -n basis-data -L 120G pve
-#   sgdisk -n 4:0:0 /dev/sdb && partx -a /dev/sdb
-#   sed -i.bak 's/^\s*# scan_lvs = 0$/\tscan_lvs = 1/' /etc/lvm/lvm.conf
+# Data pool: one `fast` pool with all four PLP enterprise SSDs
+# (sda/sdc/sdd/sde, ~744 GiB raw). One VG per device, per the
+# one-VG-per-device rule. Previously these were pooled in PVE's
+# `ent-zfspool`; freed by storage-reorg-node1.sh.
 basis_lvm_devices:
-  - /dev/sdf
+  - /dev/sdf2
 
 basis_storage_pools:
-  - name: bulk
+  - name: fast
     backend: lvm-linear
     labels:
-      tier: bulk
+      tier: fast
       medium: sata
     devices:
-      # 120 GiB LV inside pve VG; addressed by its DM path since
-      # there's no by-id symlink for an LV.
-      - id: pve-basis-data
-        device: /dev/pve/basis-data
-        vg: basis-bulk-pve
-        sizeGib: 120
-      - id: sdb4
-        device: /dev/sdb4
-        vg: basis-bulk-sdb4
-        sizeGib: 261
+      - id: sda
+        device: /dev/sda
+        vg: basis-fast-sda
+        sizeGib: 186
+      - id: sdc
+        device: /dev/sdc
+        vg: basis-fast-sdc
+        sizeGib: 186
+      - id: sdd
+        device: /dev/sdd
+        vg: basis-fast-sdd
+        sizeGib: 186
+      - id: sde
+        device: /dev/sde
+        vg: basis-fast-sde
+        sizeGib: 186
 
-# Consumer SATA SSD (BX500) — fine for low-write-volume workers but
-# tail latency under sustained writes is much worse than the Intel
-# enterprise SAS SSDs on node-2 (no PLP, small SLC cache). CP with
-# `prefers: tier=fast` falls back here if no fast host is up; workers
-# with `requires: tier=slow` land here exclusively.
+# Host label characterizes rootfs class for VM placement: `bulk`
+# means etcd-class workloads should not land here. The data-pool
+# label (`tier: fast` above) is what dataDisk selectors match
+# against, so workers can still use this host's PLP capacity.
 basis_host_labels:
-  tier: slow
+  tier: bulk

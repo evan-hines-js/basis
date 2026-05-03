@@ -1135,8 +1135,6 @@ impl BasisApiService {
         let decision = self.pick_host(req).await.map_err(|s| {
             if s.code() == tonic::Code::ResourceExhausted {
                 PlaceError::NoCapacity(s)
-            } else if s.code() == tonic::Code::FailedPrecondition {
-                PlaceError::Internal(s)
             } else {
                 PlaceError::Internal(s)
             }
@@ -1161,11 +1159,7 @@ impl BasisApiService {
             .map(|p| crate::db::StoredDisk {
                 disk_index: p.disk_index,
                 min_size_gib: p.min_size_gib,
-                purpose: match p.purpose {
-                    basis_proto::DiskPurpose::Replicated => "replicated".into(),
-                    basis_proto::DiskPurpose::GenericData => "generic-data".into(),
-                    basis_proto::DiskPurpose::Unspecified => "unspecified".into(),
-                },
+                purpose: p.purpose.as_db_str().to_string(),
                 pool: Some(p.pool.clone()),
                 device_id: Some(p.device_id.clone()),
                 assignment_id: Some(format!("{vm_id}-{}", p.disk_index)),
@@ -1860,7 +1854,8 @@ impl basis_server::Basis for BasisApiService {
         let payload = {
             use prost::Message;
             let mut buf = Vec::with_capacity(cmd.encoded_len());
-            cmd.encode(&mut buf).expect("encoding ControllerCommand to vec is infallible");
+            cmd.encode(&mut buf)
+                .expect("encoding ControllerCommand to vec is infallible");
             buf
         };
         let outbox_id = match self
@@ -2057,7 +2052,11 @@ impl basis_server::Basis for BasisApiService {
         require_capi_caller(&request)?;
         let req = request.into_inner();
         let pool_rows = if req.host_id.is_empty() {
-            self.shared.db.list_all_host_pools().await.map_err(db_status)?
+            self.shared
+                .db
+                .list_all_host_pools()
+                .await
+                .map_err(db_status)?
         } else {
             self.shared
                 .db
@@ -2084,13 +2083,11 @@ impl basis_server::Basis for BasisApiService {
             let mut device_statuses = Vec::with_capacity(devices.len());
             let (mut ready, mut unhealthy) = (0u32, 0u32);
             for d in &devices {
-                let physical = match d.physical.as_str() {
-                    "Ready" => basis_proto::DevicePhysicalHealth::DeviceHealthReady,
-                    "Degraded" => basis_proto::DevicePhysicalHealth::DeviceHealthDegraded,
-                    "Missing" => basis_proto::DevicePhysicalHealth::DeviceHealthMissing,
-                    _ => basis_proto::DevicePhysicalHealth::DeviceHealthUnspecified,
-                };
-                if matches!(physical, basis_proto::DevicePhysicalHealth::DeviceHealthReady) {
+                let physical = basis_proto::DevicePhysicalHealth::from_db_str(&d.physical);
+                if matches!(
+                    physical,
+                    basis_proto::DevicePhysicalHealth::DeviceHealthReady
+                ) {
                     ready += 1;
                 } else {
                     unhealthy += 1;
@@ -2111,9 +2108,7 @@ impl basis_server::Basis for BasisApiService {
                     scheduling_state: drain
                         .map(|d| d.state.clone())
                         .unwrap_or_else(|| "enabled".to_string()),
-                    scheduling_reason: drain
-                        .and_then(|d| d.reason.clone())
-                        .unwrap_or_default(),
+                    scheduling_reason: drain.and_then(|d| d.reason.clone()).unwrap_or_default(),
                     reservations: counts
                         .into_iter()
                         .map(|(c, n)| basis_proto::ClusterReservationCount {
@@ -2132,7 +2127,11 @@ impl basis_server::Basis for BasisApiService {
             } else {
                 basis_proto::PoolHealthState::PoolHealthDegraded
             };
-            let labels = pool.parsed_labels().unwrap_or_default().into_iter().collect();
+            let labels = pool
+                .parsed_labels()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             out.push(basis_proto::PoolStatus {
                 host_id: pool.host_id,
                 pool: pool.pool,
@@ -2592,11 +2591,7 @@ async fn handle_agent_message(
                 // because failure flows through `cleanup_failed_vm`,
                 // which deletes the VM row entirely; a stale outbox
                 // row pointing at a deleted vm_id is dead state.
-                if let Err(e) = shared
-                    .db
-                    .ack_pending_commands_for_vm(&report.vm_id)
-                    .await
-                {
+                if let Err(e) = shared.db.ack_pending_commands_for_vm(&report.vm_id).await {
                     warn!(
                         vm_id = %report.vm_id, error = %e,
                         "failed to drop outbox rows after terminal VM state; non-fatal"
@@ -2635,7 +2630,10 @@ async fn handle_agent_message(
             // reconnect after restart so the controller resyncs
             // without a separate poll.
             let Some(assignment) = report.assignment else {
-                warn!(host_id, "DiskAssignmentReport with no assignment field; ignoring");
+                warn!(
+                    host_id,
+                    "DiskAssignmentReport with no assignment field; ignoring"
+                );
                 return Ok(());
             };
             if let Err(e) = shared.db.commit_disk_assignment(host_id, &assignment).await {
@@ -2711,14 +2709,12 @@ fn vm_to_machine(vm: &VmRow, gpus: &[GpuAssignment]) -> Result<Machine, Status> 
     // operators where each data disk landed (host, pool, device,
     // actual size). The VmRow carries this as JSON populated by
     // agent-reported `DiskAssignment` messages.
-    let storage_disks = vm
-        .parsed_disk_assignments()
-        .map_err(|e| {
-            Status::data_loss(format!(
-                "vms.storage_disks on vm '{}' failed to parse: {e}",
-                vm.id,
-            ))
-        })?;
+    let storage_disks = vm.parsed_disk_assignments().map_err(|e| {
+        Status::data_loss(format!(
+            "vms.storage_disks on vm '{}' failed to parse: {e}",
+            vm.id,
+        ))
+    })?;
 
     Ok(Machine {
         id: vm.id.clone(),

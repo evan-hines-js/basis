@@ -28,8 +28,8 @@ use std::time::Instant;
 
 use basis_common::time::now_rfc3339;
 use basis_proto::{
-    agent_message, AgentMessage, CommandedDisk, CreateVmCommand, DiskAssignment,
-    DiskAssignmentReport, MachineState, ReportVmStateRequest,
+    agent_message, AgentMessage, CreateVmCommand, DiskAssignment, DiskAssignmentReport,
+    MachineState, ReportVmStateRequest,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -43,22 +43,26 @@ use crate::network::NetworkManager;
 use crate::vm;
 use crate::vm::{unit_name_for_vm, BootArtifacts, VmManager};
 
-pub async fn create_vm(
-    cmd: &CreateVmCommand,
-    image_mgr: &ImageManager,
-    vm_mgr: &Arc<VmManager>,
-    net_mgr: &NetworkManager,
-    agent_db: &AgentDb,
-    storage: &Storage,
-    metrics: &Metrics,
-    sender: &mpsc::Sender<AgentMessage>,
-) -> anyhow::Result<()> {
-    vm_mgr.mark_pending(&cmd.vm_id).await;
-    let result = create_vm_inner(
-        cmd, image_mgr, vm_mgr, net_mgr, agent_db, storage, metrics, sender,
-    )
-    .await;
-    vm_mgr.clear_pending(&cmd.vm_id).await;
+/// Borrowed bundle of every per-agent runtime handle the VM
+/// lifecycle paths read. Replaces the long argument lists threaded
+/// through `create_vm` / `create_vm_inner` / `delete_vm` — the same
+/// seven handles always come along, so passing them as one ctx
+/// removes a class of "I forgot to plumb X through the new path"
+/// regressions.
+pub struct VmHandlerCtx<'a> {
+    pub image_mgr: &'a ImageManager,
+    pub vm_mgr: &'a Arc<VmManager>,
+    pub net_mgr: &'a NetworkManager,
+    pub agent_db: &'a AgentDb,
+    pub storage: &'a Storage,
+    pub metrics: &'a Metrics,
+    pub sender: &'a mpsc::Sender<AgentMessage>,
+}
+
+pub async fn create_vm(cmd: &CreateVmCommand, ctx: &VmHandlerCtx<'_>) -> anyhow::Result<()> {
+    ctx.vm_mgr.mark_pending(&cmd.vm_id).await;
+    let result = create_vm_inner(cmd, ctx).await;
+    ctx.vm_mgr.clear_pending(&cmd.vm_id).await;
 
     match result {
         Ok(()) => {
@@ -71,35 +75,27 @@ pub async fn create_vm(
                 error = %e,
                 "create_vm failed; rolling back partial state"
             );
-            let _ = delete_vm(&cmd.vm_id, vm_mgr, net_mgr, agent_db, storage).await;
+            let _ = delete_vm(
+                &cmd.vm_id,
+                ctx.vm_mgr,
+                ctx.net_mgr,
+                ctx.agent_db,
+                ctx.storage,
+            )
+            .await;
             Err(e)
         }
     }
 }
 
-/// Per-disk pre-allocate guardrails (invariants 1–5). Backend's
-/// `allocate` enforces 6–7 once we get past these.
-fn validate_commanded_disk(storage: &Storage, disk: &CommandedDisk) -> anyhow::Result<()> {
-    let pool = storage
-        .pool(&disk.pool)
-        .ok_or_else(|| anyhow::anyhow!("invariant #1: unknown pool {:?}", disk.pool))?;
-    // Invariant #3 is currently a tautology — only one backend kind
-    // exists in v1 — but the check stays so adding M2/M3 doesn't
-    // silently reuse stale agent code.
-    let _ = pool.backend().backend_kind();
-    Ok(())
-}
-
-async fn create_vm_inner(
-    cmd: &CreateVmCommand,
-    image_mgr: &ImageManager,
-    vm_mgr: &Arc<VmManager>,
-    net_mgr: &NetworkManager,
-    agent_db: &AgentDb,
-    storage: &Storage,
-    metrics: &Metrics,
-    sender: &mpsc::Sender<AgentMessage>,
-) -> anyhow::Result<()> {
+async fn create_vm_inner(cmd: &CreateVmCommand, ctx: &VmHandlerCtx<'_>) -> anyhow::Result<()> {
+    let image_mgr = ctx.image_mgr;
+    let vm_mgr = ctx.vm_mgr;
+    let net_mgr = ctx.net_mgr;
+    let agent_db = ctx.agent_db;
+    let storage = ctx.storage;
+    let metrics = ctx.metrics;
+    let sender = ctx.sender;
     let vm_dir = vm_mgr.vms_dir.join(&cmd.vm_id);
     std::fs::create_dir_all(&vm_dir)?;
 
@@ -118,45 +114,41 @@ async fn create_vm_inner(
         );
     }
 
-    // Pre-allocate validation: every commanded disk must satisfy
-    // invariants #1–#5 before any hardware op. We refuse the whole
-    // command if any disk fails — partial allocation is harder to
-    // unwind than full rejection.
+    // Pre-allocate validation: refuse the whole command if any
+    // commanded disk targets an unknown pool or unhealthy device.
+    // Partial allocation is harder to unwind than full rejection.
     for disk in &cmd.storage_disks {
-        validate_commanded_disk(storage, disk)?;
-        // Capacity + health are checked at allocate-time inside the
-        // backend (devices() result), so we don't snapshot here —
-        // staleness would just lead to a backend-level rejection.
-        if let Some(pool) = storage.pool(&disk.pool) {
-            let devices = pool.backend().devices().await?;
-            let dev = devices
-                .iter()
-                .find(|d| d.id == disk.device_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invariant #2: device {:?} not in pool {:?}",
-                        disk.device_id,
-                        disk.pool
-                    )
-                })?;
-            if !matches!(dev.physical, DevicePhysicalHealth::Ready) {
-                anyhow::bail!(
-                    "invariant #5: device {:?} in pool {:?} is {:?} ({})",
-                    dev.id,
-                    disk.pool,
-                    dev.physical,
-                    dev.physical_reason
-                );
-            }
-            if dev.free_gib < disk.min_size_gib {
-                anyhow::bail!(
-                    "invariant #4: device {:?} in pool {:?} has {} GiB free, disk needs {} GiB",
-                    dev.id,
-                    disk.pool,
-                    dev.free_gib,
-                    disk.min_size_gib
-                );
-            }
+        let pool = storage
+            .pool(&disk.pool)
+            .ok_or_else(|| anyhow::anyhow!("unknown pool {:?}", disk.pool))?;
+        let devices = pool.backend().devices().await?;
+        let dev = devices
+            .iter()
+            .find(|d| d.id == disk.device_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "device {:?} not a member of pool {:?}",
+                    disk.device_id,
+                    disk.pool
+                )
+            })?;
+        if !matches!(dev.physical, DevicePhysicalHealth::Ready) {
+            anyhow::bail!(
+                "device {:?} in pool {:?} is {:?} ({})",
+                dev.id,
+                disk.pool,
+                dev.physical,
+                dev.physical_reason
+            );
+        }
+        if dev.free_gib < disk.min_size_gib {
+            anyhow::bail!(
+                "device {:?} in pool {:?} has {} GiB free, disk needs {} GiB",
+                dev.id,
+                disk.pool,
+                dev.free_gib,
+                disk.min_size_gib
+            );
         }
     }
 
@@ -195,9 +187,7 @@ async fn create_vm_inner(
     let mut data_disk_paths = Vec::with_capacity(cmd.storage_disks.len());
     let mut local_disks: Vec<LocalStorageDisk> = Vec::with_capacity(cmd.storage_disks.len());
     for disk in &cmd.storage_disks {
-        let pool = storage
-            .pool(&disk.pool)
-            .expect("validated above");
+        let pool = storage.pool(&disk.pool).expect("validated above");
         let purpose = basis_proto::DiskPurpose::try_from(disk.purpose).map_err(|_| {
             anyhow::anyhow!(
                 "invalid DiskPurpose enum value {} on commanded disk {}",
@@ -221,12 +211,7 @@ async fn create_vm_inner(
             device_id: disk.device_id.clone(),
             disk_index: disk.disk_index,
             size_gib: alloc.actual_size_gib,
-            purpose: match purpose {
-                basis_proto::DiskPurpose::Replicated => "replicated",
-                basis_proto::DiskPurpose::GenericData => "generic-data",
-                basis_proto::DiskPurpose::Unspecified => "unspecified",
-            }
-            .to_string(),
+            purpose: purpose.as_db_str().to_string(),
             device_path: alloc.path.to_string_lossy().into_owned(),
         });
 

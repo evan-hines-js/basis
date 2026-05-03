@@ -96,9 +96,7 @@ enum PoolCmd {
     },
     /// Re-enable a previously disabled device. Placement resumes once
     /// the device is also physically `Ready`.
-    Enable {
-        target: String,
-    },
+    Enable { target: String },
 }
 
 #[tokio::main]
@@ -141,8 +139,8 @@ fn parse_host_pool_device(s: &str) -> Result<(String, String, String)> {
 async fn pool_list(client: &BasisClient, host: Option<String>) -> Result<()> {
     let pools = client.list_pools(host.unwrap_or_default()).await?;
     println!(
-        "{:24} {:16} {:14} {:>10} {:>10}  {}",
-        "HOST", "POOL", "BACKEND", "FREE_GIB", "TOTAL_GIB", "LABELS"
+        "{:24} {:16} {:14} {:>10} {:>10}  LABELS",
+        "HOST", "POOL", "BACKEND", "FREE_GIB", "TOTAL_GIB"
     );
     for p in pools {
         let labels = p
@@ -199,7 +197,11 @@ async fn pool_show(client: &BasisClient, target: &str) -> Result<()> {
             d.free_bytes / (1 << 30),
             d.total_bytes / (1 << 30),
             physical,
-            if d.physical_reason.is_empty() { "" } else { " (" },
+            if d.physical_reason.is_empty() {
+                ""
+            } else {
+                " ("
+            },
             if d.physical_reason.is_empty() {
                 String::new()
             } else {
@@ -251,14 +253,16 @@ async fn pool_health(client: &BasisClient) -> Result<()> {
     Ok(())
 }
 
-async fn pool_disable(
-    client: &BasisClient,
-    target: &str,
-    reason: Option<String>,
-) -> Result<()> {
+async fn pool_disable(client: &BasisClient, target: &str, reason: Option<String>) -> Result<()> {
     let (host, pool, device) = parse_host_pool_device(target)?;
     client
-        .set_device_scheduling_state(host, pool, device, "disabled".into(), reason.unwrap_or_default())
+        .set_device_scheduling_state(
+            host,
+            pool,
+            device,
+            "disabled".into(),
+            reason.unwrap_or_default(),
+        )
         .await?;
     println!("ok");
     Ok(())

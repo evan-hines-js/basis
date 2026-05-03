@@ -246,10 +246,18 @@ async fn apply(
                 crate::workload::apply_bgp_crds(&workload, &docs).await?;
             }
             None => {
+                // CAPI writes <cluster>-kubeconfig only after kubeadm
+                // finishes (~60s). The controller doesn't watch this
+                // Secret, so we poll until it appears. Without the
+                // short requeue here, the BGP CRD apply waits for the
+                // 300s steady-state requeue and the cluster's LB-IP
+                // /32 advertisement is held off ~4 minutes longer than
+                // it needs to be.
                 info!(
                     cluster = %name,
                     "kubeconfig Secret not present yet; deferring BGP CRD apply"
                 );
+                return Ok(Action::requeue(Duration::from_secs(15)));
             }
         }
     }

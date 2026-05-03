@@ -128,7 +128,11 @@ pub struct ScheduleRequest {
 
 impl From<&CreateMachineRequest> for ScheduleRequest {
     fn from(req: &CreateMachineRequest) -> Self {
-        let data_gib: u32 = req.storage_disks.iter().map(|d| d.min_size_gib as u32).sum();
+        let data_gib: u32 = req
+            .storage_disks
+            .iter()
+            .map(|d| d.min_size_gib as u32)
+            .sum();
         Self {
             cluster_id: req.cluster_id.clone(),
             cpu: req.cpu,
@@ -345,11 +349,7 @@ pub fn pick_disk_placements(
                         tie_breaker,
                     },
                 };
-                if best
-                    .as_ref()
-                    .map(|b| cand.score > b.score)
-                    .unwrap_or(true)
-                {
+                if best.as_ref().map(|b| cand.score > b.score).unwrap_or(true) {
                     best = Some(cand);
                 }
             }
@@ -482,10 +482,10 @@ impl Available {
 ///   (Ceph CRUSH, Longhorn replica scheduler, …); basis only nudges
 ///   placement away from obvious co-location when there's free choice.
 /// - `gpu_score`: higher = better topology fit (NVLink affinity).
-/// - `negative_cluster_mates`: generic same-cluster spread, applies
-///   to every VM.
 /// - `prefers_score`: per-Machine soft preference against host
 ///   labels.
+/// - `negative_cluster_mates`: generic same-cluster spread, applies
+///   to every VM.
 /// - `negative_rank`: per-host operator preference.
 /// - `negative_remaining_after`: tie-of-last-resort, smallest
 ///   remaining wins (best-fit bin-pack).
@@ -496,8 +496,8 @@ impl Available {
 struct CandidateScore {
     negative_cluster_replicated_mates: i64,
     gpu_score: i32,
-    negative_cluster_mates: i64,
     prefers_score: u32,
+    negative_cluster_mates: i64,
     negative_rank: i64,
     negative_remaining_after: i64,
 }
@@ -620,8 +620,8 @@ pub fn schedule(
             score: CandidateScore {
                 negative_cluster_replicated_mates: -replicated_mates,
                 gpu_score,
-                negative_cluster_mates: -(cluster_mates as i64),
                 prefers_score: req.placement.score(&host.labels),
+                negative_cluster_mates: -(cluster_mates as i64),
                 negative_rank: -host.rank,
                 negative_remaining_after: -(avail.remaining_after(req) as i64),
             },
@@ -870,7 +870,8 @@ mod tests {
             make_host("h1", 8, 16384, 500, &[]),
             make_host("h2", 4, 8192, 200, &[]),
         ];
-        let (host_id, gpus) = schedule_no_disks(&hosts, &empty(), &basic_req(0, 0), STRICT).unwrap();
+        let (host_id, gpus) =
+            schedule_no_disks(&hosts, &empty(), &basic_req(0, 0), STRICT).unwrap();
         // h2 is a tighter fit (best-fit bin-packing prefers closest to full)
         assert_eq!(host_id, "h2");
         assert!(gpus.is_empty());
@@ -895,7 +896,8 @@ mod tests {
     fn test_schedule_with_gpus() {
         let gpus = vec![gpu("0000:41:00.0", 1), gpu("0000:42:00.0", 1)];
         let hosts = vec![make_host("h1", 16, 65536, 1000, &gpus)];
-        let (host_id, selected) = schedule_no_disks(&hosts, &empty(), &basic_req(2, 2), STRICT).unwrap();
+        let (host_id, selected) =
+            schedule_no_disks(&hosts, &empty(), &basic_req(2, 2), STRICT).unwrap();
         assert_eq!(host_id, "h1");
         assert_eq!(selected.len(), 2);
     }
@@ -1113,7 +1115,8 @@ mod tests {
             make_host("spread", 16, 65536, 1000, &gpus_spread),
             make_host("together", 16, 65536, 1000, &gpus_together),
         ];
-        let (host_id, selected) = schedule_no_disks(&hosts, &empty(), &basic_req(2, 0), STRICT).unwrap();
+        let (host_id, selected) =
+            schedule_no_disks(&hosts, &empty(), &basic_req(2, 0), STRICT).unwrap();
         assert_eq!(host_id, "together");
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].nvlink_group, selected[1].nvlink_group);
@@ -1416,15 +1419,8 @@ mod tests {
         let mut osd_count_by_host: HashMap<String, i64> = HashMap::new();
         for i in 0..3 {
             let req = replicated_disk_req("cluster-a", "fast", 100);
-            let d = super::schedule(
-                &hosts,
-                &empty(),
-                &storage,
-                &osd_count_by_host,
-                &req,
-                STRICT,
-            )
-            .expect("placement");
+            let d = super::schedule(&hosts, &empty(), &storage, &osd_count_by_host, &req, STRICT)
+                .expect("placement");
             assert!(
                 placed_hosts.insert(d.host_id.clone()),
                 "OSD #{i} landed on a host that already has a same-cluster OSD: {}",
@@ -1460,8 +1456,15 @@ mod tests {
         let osd_count_by_host = HashMap::new();
 
         let req_a = replicated_disk_req("cluster-a", "fast", 100);
-        let d_a = super::schedule(&hosts, &empty(), &storage, &osd_count_by_host, &req_a, STRICT)
-            .expect("cluster-a placement");
+        let d_a = super::schedule(
+            &hosts,
+            &empty(),
+            &storage,
+            &osd_count_by_host,
+            &req_a,
+            STRICT,
+        )
+        .expect("cluster-a placement");
         // Mark the device as holding cluster-a's OSD.
         for p in &mut storage.get_mut("h1").unwrap().pools {
             for dev in &mut p.devices {
@@ -1473,8 +1476,15 @@ mod tests {
         // cluster-b must be allowed onto the same device — different
         // replication scheme.
         let req_b = replicated_disk_req("cluster-b", "fast", 100);
-        let d_b = super::schedule(&hosts, &empty(), &storage, &osd_count_by_host, &req_b, STRICT)
-            .expect("cluster-b placement");
+        let d_b = super::schedule(
+            &hosts,
+            &empty(),
+            &storage,
+            &osd_count_by_host,
+            &req_b,
+            STRICT,
+        )
+        .expect("cluster-b placement");
         assert_eq!(d_b.host_id, "h1");
     }
 
@@ -1501,15 +1511,8 @@ mod tests {
         let mut placed = Vec::new();
         for _ in 0..3 {
             let req = replicated_disk_req("cluster-a", "fast", 100);
-            let d = super::schedule(
-                &hosts,
-                &empty(),
-                &storage,
-                &osd_count_by_host,
-                &req,
-                STRICT,
-            )
-            .expect("3-on-2 must succeed (placement is preference-only)");
+            let d = super::schedule(&hosts, &empty(), &storage, &osd_count_by_host, &req, STRICT)
+                .expect("3-on-2 must succeed (placement is preference-only)");
             placed.push(d.host_id.clone());
             *osd_count_by_host.entry(d.host_id.clone()).or_insert(0) += 1;
             // Mirror the agent's eventual replicated_clusters update,
@@ -1555,15 +1558,8 @@ mod tests {
         let mut devs = Vec::new();
         for _ in 0..6 {
             let req = replicated_disk_req("cluster-a", "fast", 100);
-            let d = super::schedule(
-                &hosts,
-                &empty(),
-                &storage,
-                &osd_count_by_host,
-                &req,
-                STRICT,
-            )
-            .expect("must place; preference-only");
+            let d = super::schedule(&hosts, &empty(), &storage, &osd_count_by_host, &req, STRICT)
+                .expect("must place; preference-only");
             devs.push(d.disks[0].device_id.clone());
             *osd_count_by_host.entry(d.host_id.clone()).or_insert(0) += 1;
             let view = storage.get_mut("h1").unwrap();
@@ -1631,5 +1627,4 @@ mod tests {
             .expect_err("disabled device → no placement");
         assert!(matches!(err, SchedulerError::NoCapacity(_)));
     }
-
 }

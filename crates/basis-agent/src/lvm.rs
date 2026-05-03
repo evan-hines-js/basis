@@ -170,10 +170,7 @@ pub enum LvmError {
         "lvm backend busy on {role}: could not acquire permit within {timeout:?} — \
          arrival rate exceeds service rate, shed load or retry"
     )]
-    Busy {
-        role: String,
-        timeout: Duration,
-    },
+    Busy { role: String, timeout: Duration },
 }
 
 pub type Result<T> = std::result::Result<T, LvmError>;
@@ -246,6 +243,13 @@ impl DevicePhysicalHealth {
             Self::Missing => basis_proto::DevicePhysicalHealth::DeviceHealthMissing,
         }
     }
+
+    /// String form for metric labels. Same vocabulary as
+    /// `basis_proto::DevicePhysicalHealth::as_db_str` so dashboards
+    /// joining controller and agent metrics see one set of labels.
+    pub fn as_str(self) -> &'static str {
+        self.as_proto().as_db_str()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -308,7 +312,7 @@ pub struct LostReservation {
 }
 
 #[async_trait]
-pub trait DiskBackend: Send + Sync + std::any::Any {
+pub trait DiskBackend: Send + Sync {
     /// Allocate on a specific commanded device. Returns the actual
     /// allocated size (which MAY exceed `min_size_gib` for raw-disk and
     /// nvme-namespace) and the path to hand to cloud-hypervisor.
@@ -339,9 +343,10 @@ pub trait DiskBackend: Send + Sync + std::any::Any {
     /// Backend type, for telemetry.
     fn backend_kind(&self) -> PoolBackend;
 
-    /// Erase to `Any` so `Storage::list_managed_vm_ids` can downcast to
-    /// the concrete backend when it needs to enumerate VGs.
-    fn as_any(&self) -> &dyn std::any::Any;
+    /// Every vm_id this backend has an on-disk artifact for. Used by
+    /// the orphan sweep to find VMs whose DB row is gone but whose
+    /// LV (or namespace, or raw-disk reservation) lingers.
+    async fn managed_vm_ids(&self) -> Result<HashSet<String>>;
 }
 
 // --- One pool: name + Box<dyn DiskBackend> ---------------------------
@@ -432,7 +437,10 @@ impl Storage {
 
     /// Path to the golden image LV for `image_hash` in the rootfs VG.
     pub fn image_lv_path(&self, image_hash: &str) -> PathBuf {
-        PathBuf::from(format!("/dev/{}/{IMAGE_LV_PREFIX}{image_hash}", self.rootfs.vg))
+        PathBuf::from(format!(
+            "/dev/{}/{IMAGE_LV_PREFIX}{image_hash}",
+            self.rootfs.vg
+        ))
     }
 
     /// Path to a VM's rootfs LV in the rootfs VG.
@@ -491,7 +499,10 @@ impl Storage {
         let lv_path = self.vm_lv_path(vm_id);
 
         if lv_attr(vg, &lv_name).await?.is_some() {
-            warn!(vm_id, "VM rootfs LV already exists; removing for clean recreate");
+            warn!(
+                vm_id,
+                "VM rootfs LV already exists; removing for clean recreate"
+            );
             lvremove(vg, &lv_name).await?;
         }
 
@@ -630,33 +641,21 @@ impl Storage {
         Ok(out)
     }
 
-    /// Every vm_id with at least one LV on this host — rootfs LV in
-    /// the rootfs VG, or any data disk LV in any pool's VG.
+    /// Every vm_id with at least one on-disk artifact on this host —
+    /// rootfs snapshot, data LV, or any future-backend equivalent.
+    /// Called by the orphan sweep to find VMs whose DB row is gone
+    /// but whose hardware footprint hasn't been reclaimed.
     pub async fn list_managed_vm_ids(&self) -> Result<HashSet<String>> {
         let mut ids = HashSet::new();
-        let rootfs_lvs = run_cmd(
-            "lvs",
-            &["--noheadings", "-o", "lv_name", &self.rootfs.vg],
-        )
-        .await?;
+        let rootfs_lvs =
+            run_cmd("lvs", &["--noheadings", "-o", "lv_name", &self.rootfs.vg]).await?;
         for line in rootfs_lvs.lines() {
-            let name = line.trim();
-            if let Some(id) = name.strip_prefix(VM_LV_PREFIX) {
+            if let Some(id) = line.trim().strip_prefix(VM_LV_PREFIX) {
                 ids.insert(id.to_string());
             }
         }
         for pool in self.pools.values() {
-            if let Some(lvm) = pool.backend.as_any().downcast_ref::<LvmLinearBackend>() {
-                for vg in lvm.vgs() {
-                    let lvs = run_cmd("lvs", &["--noheadings", "-o", "lv_name", vg]).await?;
-                    for line in lvs.lines() {
-                        let name = line.trim();
-                        if let Some((vm_id, _)) = parse_data_disk_lv_name(name) {
-                            ids.insert(vm_id);
-                        }
-                    }
-                }
-            }
+            ids.extend(pool.backend.managed_vm_ids().await?);
         }
         Ok(ids)
     }
@@ -693,7 +692,14 @@ impl LvmLinearBackend {
         let device_vgs = spec
             .devices
             .iter()
-            .map(|d| (d.id.clone(), d.vg.clone().expect("vg required for lvm-linear; verified by config::StorageSpec::validate")))
+            .map(|d| {
+                (
+                    d.id.clone(),
+                    d.vg.clone().expect(
+                        "vg required for lvm-linear; verified by config::StorageSpec::validate",
+                    ),
+                )
+            })
             .collect();
         Self {
             gate: VgGate::new(format!("pool={}", spec.name)),
@@ -728,10 +734,7 @@ impl LvmLinearBackend {
     /// Idempotency check: is there already a Ready/Creating reservation
     /// for this assignment? Returns the row when matched so the caller
     /// can resolve the existing allocation without re-running lvcreate.
-    async fn lookup_assignment(
-        &self,
-        assignment_id: &str,
-    ) -> Result<Option<LvmReservationRow>> {
+    async fn lookup_assignment(&self, assignment_id: &str) -> Result<Option<LvmReservationRow>> {
         Ok(sqlx::query_as::<_, LvmReservationRow>(
             "SELECT assignment_id, pool, device_id, vg, lv_name, vm_id, \
              disk_index, size_gib, state \
@@ -741,7 +744,6 @@ impl LvmLinearBackend {
         .fetch_optional(&self.db)
         .await?)
     }
-
 }
 
 #[async_trait]
@@ -900,7 +902,12 @@ impl DiskBackend for LvmLinearBackend {
                 .as_deref()
                 .expect("vg required for lvm-linear; verified at config load");
             let (physical, physical_reason, total, free) = match vg_capacity(vg).await {
-                Ok(cap) => (DevicePhysicalHealth::Ready, String::new(), cap.total, cap.free),
+                Ok(cap) => (
+                    DevicePhysicalHealth::Ready,
+                    String::new(),
+                    cap.total,
+                    cap.free,
+                ),
                 Err(LvmError::VgMissing(_)) => (
                     DevicePhysicalHealth::Missing,
                     format!("vg {vg} not present"),
@@ -1053,8 +1060,17 @@ impl DiskBackend for LvmLinearBackend {
         PoolBackend::LvmLinear
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    async fn managed_vm_ids(&self) -> Result<HashSet<String>> {
+        let mut ids = HashSet::new();
+        for vg in self.vgs() {
+            let lvs = run_cmd("lvs", &["--noheadings", "-o", "lv_name", vg]).await?;
+            for line in lvs.lines() {
+                if let Some((vm_id, _)) = parse_data_disk_lv_name(line.trim()) {
+                    ids.insert(vm_id);
+                }
+            }
+        }
+        Ok(ids)
     }
 }
 
@@ -1165,7 +1181,11 @@ async fn check_vg_one_pv(vg: &str) -> Result<()> {
         &["--noheadings", "--separator=|", "-o", "pv_name", vg],
     )
     .await?;
-    let pvs: Vec<&str> = out.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+    let pvs: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if pvs.len() != 1 {
         return Err(LvmError::VgPvCountWrong {
             vg: vg.to_string(),

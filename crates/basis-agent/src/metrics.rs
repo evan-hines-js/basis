@@ -446,18 +446,8 @@ pub fn refresh_storage_gauges(metrics: &Metrics, capacity: &crate::lvm::StorageC
     metrics.pool_capacity_bytes.reset();
     metrics.device_capacity_bytes.reset();
     metrics.device_physical_state.reset();
-    let backend_str = |b: crate::config::PoolBackend| match b {
-        crate::config::PoolBackend::LvmLinear => "lvm-linear",
-        crate::config::PoolBackend::RawDisk => "raw-disk",
-        crate::config::PoolBackend::NvmeNamespace => "nvme-namespace",
-    };
-    let physical_str = |p: crate::lvm::DevicePhysicalHealth| match p {
-        crate::lvm::DevicePhysicalHealth::Ready => "Ready",
-        crate::lvm::DevicePhysicalHealth::Degraded => "Degraded",
-        crate::lvm::DevicePhysicalHealth::Missing => "Missing",
-    };
     for pool in &capacity.pools {
-        let backend = backend_str(pool.backend);
+        let backend = pool.backend.as_str();
         let labels = [
             ("configured", pool.configured_total_bytes as i64),
             ("ready", pool.ready_total_bytes as i64),
@@ -486,7 +476,7 @@ pub fn refresh_storage_gauges(metrics: &Metrics, capacity: &crate::lvm::StorageC
             ] {
                 metrics
                     .device_physical_state
-                    .with_label_values(&[&pool.pool, &d.id, physical_str(state)])
+                    .with_label_values(&[&pool.pool, &d.id, state.as_str()])
                     .set(if d.physical == state { 1 } else { 0 });
             }
         }

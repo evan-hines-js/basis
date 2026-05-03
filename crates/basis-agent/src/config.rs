@@ -165,6 +165,20 @@ pub enum PoolBackend {
     NvmeNamespace,
 }
 
+impl PoolBackend {
+    /// Kebab-case wire form. Matches `#[serde(rename_all =
+    /// "kebab-case")]` so the Prometheus label value, the proto
+    /// `PoolCapacity.backend` field, and `host.yaml`'s `backend:`
+    /// key all use the same vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LvmLinear => "lvm-linear",
+            Self::RawDisk => "raw-disk",
+            Self::NvmeNamespace => "nvme-namespace",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolDeviceSpec {
@@ -342,7 +356,10 @@ spec:
             host.spec.storage.pools[0].labels.get("tier"),
             Some(&"bulk".to_string())
         );
-        assert_eq!(host.spec.storage.pools[1].devices[0].vg.as_deref(), Some("basis-fast-dddd"));
+        assert_eq!(
+            host.spec.storage.pools[1].devices[0].vg.as_deref(),
+            Some("basis-fast-dddd")
+        );
     }
 
     #[test]

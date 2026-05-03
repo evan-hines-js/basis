@@ -332,8 +332,12 @@ mod tests {
     #[tokio::test]
     async fn cached_image_upsert() {
         let db = test_db().await;
-        db.record_cached_image("img:v1", "/p/a", 1, "t1").await.unwrap();
-        db.record_cached_image("img:v1", "/p/b", 2, "t2").await.unwrap();
+        db.record_cached_image("img:v1", "/p/a", 1, "t1")
+            .await
+            .unwrap();
+        db.record_cached_image("img:v1", "/p/b", 2, "t2")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

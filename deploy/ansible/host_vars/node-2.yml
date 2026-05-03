@@ -1,27 +1,17 @@
 ---
 # poweredge-md (10.0.0.206).
 #
-# Rootfs thin pool (basis VG): four 186 GB enterprise SSDs (sdb-sde),
-# previously held `ent-zfspool`, now a single LVM-thin pool. The OS
-# lives on sda (pve-root); sdf/sdg are not part of the pool.
+# Rootfs thin pool (basis VG): sdb + sdc — 2× 186 GiB enterprise PLP
+# SSDs spanned in one VG (~373 GiB). The other two PLP drives (sdd,
+# sde) are split out as one-VG-per-device fast-pool members. The OS
+# lives on sda (pve VG); sdf is a 4 TB bulk drive (currently unused
+# by basis); sdg is a removable USB stick.
 #
-# Data pools: one `fast` pool backed by `/dev/pve/basis-data`, a
-# thick LV carved out of the OS disk's `pve` VG after destroying the
-# unused `pve-data` thinpool. Gives ~320 GiB of data capacity, sized
-# to fit a 250 GiB-class worker dataDisk plus headroom. Sparse
-# loopback was a temporary fixture that capped data placement at
-# 120 GiB.
-#
-# First-apply prep (run once on the host):
-#   zpool destroy ent-zfspool
-#   wipefs -a /dev/sdb /dev/sdc /dev/sdd /dev/sde
-#   lvremove -y pve/data
-#   lvcreate -n basis-data -L 320G pve
+# Data pool: one `fast` pool with two PLP devices (one VG per device,
+# per the one-VG-per-device rule). ~373 GiB raw across two devices.
 basis_lvm_devices:
   - /dev/sdb
   - /dev/sdc
-  - /dev/sdd
-  - /dev/sde
 
 basis_storage_pools:
   - name: fast
@@ -30,18 +20,20 @@ basis_storage_pools:
       tier: fast
       medium: sas
     devices:
-      - id: pve-basis-data
-        device: /dev/pve/basis-data
-        vg: basis-fast-pve
-        sizeGib: 320
+      - id: sdd
+        device: /dev/sdd
+        vg: basis-fast-sdd
+        sizeGib: 186
+      - id: sde
+        device: /dev/sde
+        vg: basis-fast-sde
+        sizeGib: 186
 
 # Network config (cluster_supernet, pools, default_external_service_ips)
 # lives in group_vars/all.yml — it's a cell-wide concern, not per-host.
-# Only override here for fields that genuinely vary across hosts in
-# the same cell (none today).
 
-# Enterprise SSDs with PLP — the right tier for control planes.
-# Workers go to `tier: slow` hosts (the NUC) and only fall back here
-# if their requires is satisfied (which it isn't by default).
+# Rootfs lives on enterprise PLP SSDs — the right surface for the
+# CP's etcd. Workers prefer `tier: bulk` (node-1) and only land here
+# if node-1 has no capacity.
 basis_host_labels:
   tier: fast
