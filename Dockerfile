@@ -13,9 +13,7 @@ FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
-    libssl-dev \
     protobuf-compiler \
-    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -26,12 +24,8 @@ RUN --mount=type=cache,target=/build/target \
     cargo build --release -p basis-capi-provider && \
     cp target/release/basis-capi-provider /usr/local/bin/basis-capi-provider
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /usr/local/bin/basis-capi-provider /usr/local/bin/basis-capi-provider
 
-USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/basis-capi-provider"]
